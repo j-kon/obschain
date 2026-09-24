@@ -186,6 +186,7 @@ mod tests {
                 n: i,
                 script_pubkey_type: Some("v0_p2wpkh".to_string()),
                 address: None,
+                scriptpubkey_hex: None,
             });
         }
         let total_out = outputs.iter().map(|o| o.value_sats).sum();

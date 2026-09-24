@@ -135,6 +135,8 @@ Key environment variables:
 | `OBSCHAIN_LARGE_TX_THRESHOLD_SATS` | `10000000000` | Large transfer detector threshold (100 BTC) |
 | `OBSCHAIN_LONG_BLOCK_INTERVAL_SECONDS` | `1800` | Block interval alert threshold (30 minutes) |
 | `OBSCHAIN_EVENT_STORE_LIMIT` | `10000` | Maximum recent events in circular memory store |
+| `OBSCHAIN_ACTIVITY_STORE_LIMIT` | `10000` | Maximum recent incident activities in circular memory store |
+| `OBSCHAIN_INCIDENT_FOLLOW_DEPTH` | `3` | Maximum hop depth for tracking UTXO descendants (bounded 1-5) |
 | `OBSCHAIN_MOCK_FEED` | `false` | Run live ingestion (`false`) or mock demo data (`true`) |
 
 ### Running ObsChain
@@ -150,7 +152,7 @@ The server binds to `http://127.0.0.1:8080` by default and immediately initiates
 ## API & WebSocket Endpoints
 
 - `GET /health` - Service health status
-- `GET /api/v1/status` - Live network telemetry, tip height, active sources, and detector metrics
+- `GET /api/v1/status` - Live network telemetry, tip height, active sources, detector metrics, and watch engine metrics
 - `GET /api/v1/events` - Paginated list of real detected on-chain anomalies
 - `GET /api/v1/events/:id` - Detailed observation payload for a specific event
 - `GET /api/v1/incidents` - Active and historical security incident dossiers
@@ -158,18 +160,32 @@ The server binds to `http://127.0.0.1:8080` by default and immediately initiates
 - `GET /api/v1/incidents/:id/timeline` - Chronological incident milestones with evidence and transaction references
 - `GET /api/v1/incidents/:id/evidence` - Evidence items with strict provenance classification
 - `GET /api/v1/incidents/:id/graph` - Forensic relationship graph (nodes & typed edges) for interactive UI visualization
-- `GET /api/v1/ws` - **ObsChain Live Stream WebSocket**: Broadcasts newly detected `ChainEvent`s to frontends in real-time
+- `GET /api/v1/incidents/:id/activity` - Incident-specific activity feed (filterable by `activity_type`, `correlation_strength`, `min_confidence`, `limit`)
+- `GET /api/v1/incidents/:id/watch-targets` - Public metadata for active watch targets associated with an incident (internal parameters redacted)
+- `GET /api/v1/incident-activity` - Global cross-incident activity feed
+- `GET /api/v1/ws` - **ObsChain Live Stream WebSocket**: Broadcasts newly detected `ChainEvent`s, `IncidentActivity`, and `IncidentAlert` in real-time
 
 ### Connecting to the Live WebSocket Feed
 
-Connect any WebSocket client to `ws://localhost:8080/api/v1/ws`:
+Connect any WebSocket client to `ws://localhost:8080/api/v1/ws`.
+
+The stream broadcasts tagged JSON envelopes:
+- `chain_event`: General network anomaly event (also backwards-compatible with flat `ChainEvent` fields).
+- `incident_activity`: Verified correlation with a monitored security incident.
+- `incident_alert`: High-priority alert triggered by significant incident-linked movement.
 
 ```javascript
 const ws = new WebSocket("ws://localhost:8080/api/v1/ws");
 
 ws.onmessage = (event) => {
-  const chainEvent = JSON.parse(event.data);
-  console.log("Observed event:", chainEvent.event_type, chainEvent.title);
+  const msg = JSON.parse(event.data);
+  if (msg.type === "incident_activity" || msg.type === "incident_alert") {
+    console.log("Incident alert:", msg.type, msg.data.case_id, msg.data.title);
+  } else {
+    // Chain event (supports both msg.data and legacy flat properties)
+    const chainEvent = msg.data || msg;
+    console.log("Observed event:", chainEvent.event_type, chainEvent.title);
+  }
 };
 ```
 

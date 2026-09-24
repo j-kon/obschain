@@ -50,6 +50,19 @@ pub struct TxOutputObservation {
     pub n: u32,
     pub script_pubkey_type: Option<String>,
     pub address: Option<String>,
+    #[serde(default)]
+    pub scriptpubkey_hex: Option<String>,
+}
+
+impl TxOutputObservation {
+    pub fn is_op_return(&self) -> bool {
+        self.script_pubkey_type.as_deref() == Some("op_return")
+            || self
+                .scriptpubkey_hex
+                .as_deref()
+                .map(|s| s.starts_with("6a") || s.starts_with("6A"))
+                .unwrap_or(false)
+    }
 }
 
 /// Represents an observed Bitcoin transaction.

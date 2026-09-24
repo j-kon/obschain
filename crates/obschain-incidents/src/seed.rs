@@ -591,6 +591,70 @@ pub fn create_liquid_2026_incident() -> Incident {
         .expect("Liquid 2026 incident must satisfy all domain invariants")
 }
 
+/// Canonical watch targets for the Liquid Network 2026 incident.
+pub fn canonical_liquid_watch_targets() -> Vec<obschain_core::WatchTarget> {
+    let case_uuid = Uuid::parse_str(LIQUID_INCIDENT_UUID).expect("Valid static UUID");
+    vec![
+        // 1. Peg-out transaction outpoint (payout vout 0)
+        obschain_core::WatchTarget::new_outpoint(
+            case_uuid,
+            LIQUID_CASE_ID,
+            "8db751a650ae2f12006b7e8c69a75e4df360e8afd6b9e05ae0b9fa6458a7b140",
+            0,
+            ProvenanceClassification::OnChainVerified,
+            "Bitcoin Mainnet Ledger",
+            Some("Liquid Peg-Out Exploit Output (vout 0)".to_string()),
+        ),
+        // 2. Return transaction outpoint (vout 0, 3,400 BTC returned to federation)
+        obschain_core::WatchTarget::new_outpoint(
+            case_uuid,
+            LIQUID_CASE_ID,
+            "a6d697a25266ce3c78774fd1d75f896b7af522ada209b0f6228ea497bc49a46d",
+            0,
+            ProvenanceClassification::OnChainVerified,
+            "Bitcoin Mainnet Ledger",
+            Some("Liquid Return to Federation Multisig (vout 0)".to_string()),
+        ),
+        // 3. Return transaction outpoint (vout 1, change/unresolved ~596.02 BTC)
+        obschain_core::WatchTarget::new_outpoint(
+            case_uuid,
+            LIQUID_CASE_ID,
+            "a6d697a25266ce3c78774fd1d75f896b7af522ada209b0f6228ea497bc49a46d",
+            1,
+            ProvenanceClassification::OnChainVerified,
+            "Bitcoin Mainnet Ledger",
+            Some("Liquid Return Residual / Change Output (vout 1)".to_string()),
+        ),
+        // 4. On-chain communication message transaction
+        obschain_core::WatchTarget::new_transaction(
+            case_uuid,
+            LIQUID_CASE_ID,
+            "c103de95817b43f2df635ec6f35ff126ca26a7c6d20570c4b01866b2b3e69a19",
+            ProvenanceClassification::OnChainVerified,
+            "Bitcoin Mainnet Ledger",
+            Some("Actor On-Chain Message Tx ('we are whitehats')".to_string()),
+        ),
+        // 5. Officially disclosed federation recovery address
+        obschain_core::WatchTarget::new_address(
+            case_uuid,
+            LIQUID_CASE_ID,
+            "bc1qliquidfedreturnaddress965950m0000000000000",
+            ProvenanceClassification::OfficiallyAttributed,
+            "Blockstream Technical Assessment",
+            Some("Liquid Federation Disclosed Recovery Address".to_string()),
+        ),
+        // 6. Heuristic intermediary cluster address
+        obschain_core::WatchTarget::new_address(
+            case_uuid,
+            LIQUID_CASE_ID,
+            "bc1qexploitintermediarycluster0000000000000000",
+            ProvenanceClassification::Heuristic,
+            "Heuristic Cluster Analysis",
+            Some("Intermediary Exploit Routing Cluster".to_string()),
+        ),
+    ]
+}
+
 /// Raw embedded JSON representation of the Liquid Network 2026 incident dossier.
 pub const LIQUID_2026_JSON: &str = include_str!("../data/liquid-2026.json");
 

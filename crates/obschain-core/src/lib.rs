@@ -5,6 +5,7 @@ pub mod fee;
 pub mod incident;
 pub mod observation;
 pub mod source;
+pub mod watch;
 
 pub use amount::{
     btc_str_to_sats, calculate_satoshi_days, safe_btc_f64_to_sats, satoshi_days_to_btc_days,
@@ -29,3 +30,7 @@ pub use observation::{
     TransactionReplacement, TxInputObservation, TxOutputObservation,
 };
 pub use source::ObservationSource;
+pub use watch::{
+    ActivityStatus, CorrelationStrength, IncidentActivity, IncidentActivityType, IncidentAlert,
+    PublicWatchTarget, WatchTarget, WatchTargetKind,
+};

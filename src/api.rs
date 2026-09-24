@@ -14,9 +14,15 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Utc};
-use obschain_core::ChainEvent;
+use obschain_core::{
+    ActivityStatus, ChainEvent, IncidentActivity, IncidentAlert, PublicWatchTarget,
+};
 use obschain_detectors::Detector;
-use obschain_storage::{EventRepository, InMemoryStorage, IncidentRepository};
+use obschain_intelligence::IncidentWatchEngine;
+use obschain_storage::{
+    EventRepository, InMemoryStorage, IncidentActivityRepository, IncidentRepository,
+    WatchTargetRepository,
+};
 use serde::{Deserialize, Serialize};
 use tower_http::{
     cors::{Any, CorsLayer},
@@ -42,6 +48,8 @@ pub struct PipelineMetrics {
     pub cache_misses: Arc<AtomicU64>,
     pub events_generated: Arc<AtomicU64>,
     pub events_deduplicated: Arc<AtomicU64>,
+    pub incident_activities_detected: Arc<AtomicU64>,
+    pub incident_alerts_emitted: Arc<AtomicU64>,
 }
 
 impl PipelineMetrics {
@@ -55,6 +63,8 @@ impl PipelineMetrics {
             cache_misses: self.cache_misses.load(Ordering::Relaxed),
             events_generated: self.events_generated.load(Ordering::Relaxed),
             events_deduplicated: self.events_deduplicated.load(Ordering::Relaxed),
+            incident_activities_detected: self.incident_activities_detected.load(Ordering::Relaxed),
+            incident_alerts_emitted: self.incident_alerts_emitted.load(Ordering::Relaxed),
         }
     }
 }
@@ -69,6 +79,41 @@ pub struct PipelineMetricsResponse {
     pub cache_misses: u64,
     pub events_generated: u64,
     pub events_deduplicated: u64,
+    pub incident_activities_detected: u64,
+    pub incident_alerts_emitted: u64,
+}
+
+/// Unified tagged WebSocket broadcast message for real-time streaming to connected clients.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WebSocketBroadcast {
+    #[serde(rename = "chain_event")]
+    ChainEvent {
+        data: ChainEvent,
+        #[serde(flatten)]
+        compat: ChainEvent,
+    },
+    #[serde(rename = "incident_activity")]
+    IncidentActivity { data: IncidentActivity },
+    #[serde(rename = "incident_alert")]
+    IncidentAlert { data: IncidentAlert },
+}
+
+impl WebSocketBroadcast {
+    pub fn chain_event(event: ChainEvent) -> Self {
+        Self::ChainEvent {
+            compat: event.clone(),
+            data: event,
+        }
+    }
+
+    pub fn incident_activity(activity: IncidentActivity) -> Self {
+        Self::IncidentActivity { data: activity }
+    }
+
+    pub fn incident_alert(alert: IncidentAlert) -> Self {
+        Self::IncidentAlert { data: alert }
+    }
 }
 
 #[derive(Clone)]
@@ -78,6 +123,8 @@ pub struct AppState {
     pub started_at: DateTime<Utc>,
     pub is_mock_feed: bool,
     pub event_broadcaster: tokio::sync::broadcast::Sender<ChainEvent>,
+    pub ws_broadcaster: tokio::sync::broadcast::Sender<WebSocketBroadcast>,
+    pub watch_engine: Arc<tokio::sync::RwLock<IncidentWatchEngine>>,
     pub tip_height: Arc<AtomicU64>,
     pub events_detected: Arc<AtomicU64>,
     pub sources: Arc<RwLock<SourcesStatus>>,
@@ -90,7 +137,15 @@ impl AppState {
         detectors: Vec<Arc<dyn Detector>>,
         is_mock_feed: bool,
     ) -> (Self, tokio::sync::broadcast::Sender<ChainEvent>) {
-        Self::with_metrics(storage, detectors, is_mock_feed, PipelineMetrics::default())
+        let mut engine = IncidentWatchEngine::from_env();
+        engine.load_targets(obschain_incidents::canonical_liquid_watch_targets());
+        Self::with_metrics_and_watch_engine(
+            storage,
+            detectors,
+            is_mock_feed,
+            PipelineMetrics::default(),
+            Arc::new(tokio::sync::RwLock::new(engine)),
+        )
     }
 
     pub fn with_metrics(
@@ -99,13 +154,44 @@ impl AppState {
         is_mock_feed: bool,
         metrics: PipelineMetrics,
     ) -> (Self, tokio::sync::broadcast::Sender<ChainEvent>) {
+        let mut engine = IncidentWatchEngine::from_env();
+        engine.load_targets(obschain_incidents::canonical_liquid_watch_targets());
+        Self::with_metrics_and_watch_engine(
+            storage,
+            detectors,
+            is_mock_feed,
+            metrics,
+            Arc::new(tokio::sync::RwLock::new(engine)),
+        )
+    }
+
+    pub fn with_metrics_and_watch_engine(
+        storage: InMemoryStorage,
+        detectors: Vec<Arc<dyn Detector>>,
+        is_mock_feed: bool,
+        metrics: PipelineMetrics,
+        watch_engine: Arc<tokio::sync::RwLock<IncidentWatchEngine>>,
+    ) -> (Self, tokio::sync::broadcast::Sender<ChainEvent>) {
         let (tx, _) = tokio::sync::broadcast::channel(1024);
+        let (ws_tx, _) = tokio::sync::broadcast::channel(2048);
+
+        // Forward raw ChainEvents to WebSocket broadcaster
+        let mut event_rx = tx.subscribe();
+        let ws_tx_clone = ws_tx.clone();
+        tokio::spawn(async move {
+            while let Ok(event) = event_rx.recv().await {
+                let _ = ws_tx_clone.send(WebSocketBroadcast::chain_event(event));
+            }
+        });
+
         let state = Self {
             storage,
             detectors,
             started_at: Utc::now(),
             is_mock_feed,
             event_broadcaster: tx.clone(),
+            ws_broadcaster: ws_tx,
+            watch_engine,
             tip_height: Arc::new(AtomicU64::new(0)),
             events_detected: Arc::new(AtomicU64::new(0)),
             sources: Arc::new(RwLock::new(SourcesStatus {
@@ -142,12 +228,23 @@ pub struct StatusResponse {
     pub storage_backend: &'static str,
     pub is_mock_feed: bool,
     pub metrics: PipelineMetricsResponse,
+    pub active_incident_watchers: usize,
+    pub incident_watch_targets: usize,
+    pub incident_activities_detected: u64,
+    pub incident_alerts_emitted: u64,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct PaginationQuery {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IncidentActivityQuery {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub status: Option<ActivityStatus>,
 }
 
 #[derive(Debug, Serialize)]
@@ -182,6 +279,18 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/incidents/{id}/graph",
             get(get_incident_graph_handler),
         )
+        .route(
+            "/api/v1/incidents/{id}/activity",
+            get(get_incident_activity_handler),
+        )
+        .route(
+            "/api/v1/incidents/{id}/watch-targets",
+            get(get_incident_watch_targets_handler),
+        )
+        .route(
+            "/api/v1/incident-activity",
+            get(list_incident_activity_handler),
+        )
         .route("/api/v1/ws", get(ws_handler))
         .layer(TraceLayer::new_for_http())
         // Guard against oversized request DOS (limit to 1MB)
@@ -213,6 +322,16 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
         });
     let tip_height = state.tip_height.load(Ordering::Relaxed);
     let events_detected = state.events_detected.load(Ordering::Relaxed);
+    let active_incident_watchers = 1;
+    let incident_watch_targets = state.watch_engine.read().await.active_target_count();
+    let incident_activities_detected = state
+        .metrics
+        .incident_activities_detected
+        .load(Ordering::Relaxed);
+    let incident_alerts_emitted = state
+        .metrics
+        .incident_alerts_emitted
+        .load(Ordering::Relaxed);
 
     Json(StatusResponse {
         service: "obschain",
@@ -229,6 +348,10 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
         storage_backend: "in-memory (bounded VecDeque)",
         is_mock_feed: state.is_mock_feed,
         metrics: state.metrics.snapshot(),
+        active_incident_watchers,
+        incident_watch_targets,
+        incident_activities_detected,
+        incident_alerts_emitted,
     })
 }
 
@@ -237,7 +360,7 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 }
 
 async fn handle_client_socket(mut socket: WebSocket, state: AppState) {
-    let mut rx = state.event_broadcaster.subscribe();
+    let mut rx = state.ws_broadcaster.subscribe();
     tracing::debug!("ObsChain WebSocket client connected");
 
     loop {
@@ -260,13 +383,13 @@ async fn handle_client_socket(mut socket: WebSocket, state: AppState) {
                     }
                 }
             }
-            event_result = rx.recv() => {
-                match event_result {
-                    Ok(event) => {
-                        let json = match serde_json::to_string(&event) {
+            broadcast_result = rx.recv() => {
+                match broadcast_result {
+                    Ok(msg) => {
+                        let json = match serde_json::to_string(&msg) {
                             Ok(j) => j,
                             Err(e) => {
-                                tracing::error!("Failed to serialize ChainEvent for WebSocket broadcast: {e}");
+                                tracing::error!("Failed to serialize WebSocketBroadcast: {e}");
                                 continue;
                             }
                         };
@@ -276,7 +399,7 @@ async fn handle_client_socket(mut socket: WebSocket, state: AppState) {
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!("Slow WebSocket client lagged, skipped {skipped} events");
+                        tracing::warn!("Slow WebSocket client lagged, skipped {skipped} messages");
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         break;
@@ -337,7 +460,7 @@ async fn get_event_handler(
         None => Err((
             StatusCode::NOT_FOUND,
             Json(ApiErrorResponse {
-                error: format!("ChainEvent with id '{id}' not found"),
+                error: format!("Event {id} not found"),
                 code: 404,
             }),
         )),
@@ -443,4 +566,100 @@ async fn get_incident_graph_handler(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
     let incident = get_incident_or_404(&state, &identifier).await?;
     Ok(Json(incident.graph))
+}
+
+async fn get_incident_activity_handler(
+    State(state): State<AppState>,
+    Path(identifier): Path<String>,
+    Query(query): Query<IncidentActivityQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
+    let incident = get_incident_or_404(&state, &identifier).await?;
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let offset = query.offset.unwrap_or(0);
+
+    let activity = state
+        .storage
+        .list_activities(Some(incident.id), query.status, limit, offset)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorResponse {
+                    error: e.to_string(),
+                    code: 500,
+                }),
+            )
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "incident_id": incident.id,
+        "case_id": incident.case_id,
+        "activity": activity,
+        "count": activity.len(),
+        "limit": limit,
+        "offset": offset,
+    })))
+}
+
+async fn get_incident_watch_targets_handler(
+    State(state): State<AppState>,
+    Path(identifier): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
+    let incident = get_incident_or_404(&state, &identifier).await?;
+
+    let targets = state
+        .storage
+        .list_watch_targets(Some(incident.id), 100, 0)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorResponse {
+                    error: e.to_string(),
+                    code: 500,
+                }),
+            )
+        })?;
+
+    // Safe public metadata conversion: redacts internal/sensitive investigation settings
+    let public_targets: Vec<PublicWatchTarget> = targets
+        .into_iter()
+        .map(|t| t.to_public_metadata())
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "incident_id": incident.id,
+        "case_id": incident.case_id,
+        "watch_targets": public_targets,
+        "count": public_targets.len(),
+    })))
+}
+
+async fn list_incident_activity_handler(
+    State(state): State<AppState>,
+    Query(query): Query<IncidentActivityQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let offset = query.offset.unwrap_or(0);
+
+    let activity = state
+        .storage
+        .list_activities(None, query.status, limit, offset)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorResponse {
+                    error: e.to_string(),
+                    code: 500,
+                }),
+            )
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "activity": activity,
+        "count": activity.len(),
+        "limit": limit,
+        "offset": offset,
+    })))
 }

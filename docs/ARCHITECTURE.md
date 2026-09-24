@@ -142,6 +142,59 @@ Incident intelligence sits cleanly on top of the observation architecture withou
 
 ---
 
+## Live Incident Watch & Chain Correlation Architecture
+
+The Live Incident Watch Engine correlates live Bitcoin blockchain and mempool transactions against monitored incident targets without relying on subjective entity inference or wallet clustering.
+
+```text
+               Enriched Normalized Observations (Blocks & Txs)
+                                     │
+              ┌──────────────────────┴──────────────────────┐
+              ▼                                             ▼
+   ┌──────────────────────┐                     ┌────────────────────────┐
+   │ Anomaly Detectors    │                     │  IncidentWatchEngine   │
+   │ (7 Generic Detectors)│                     │  ├── Outpoint Index    │
+   │ - Dormant, FanOut    │                     │  ├── ScriptPubKey Index│
+   │ - Extreme Fee, RBF   │                     │  ├── Address Index     │
+   │ - Large Tx, Interval │                     │  ├── TxID Index        │
+   │                      │                     │  └── Descendant DAG    │
+   └──────────┬───────────┘                     └───────────┬────────────┘
+              │ ChainEvent                                  │ IncidentActivity / Alert
+              ▼                                             ▼
+   ┌──────────────────────┐                     ┌────────────────────────┐
+   │  Event Deduplicator  │                     │ In-Memory Activity Rep │
+   └──────────┬───────────┘                     └───────────┬────────────┘
+              │                                             │
+              └──────────────────────┬──────────────────────┘
+                                     ▼
+                      ┌─────────────────────────────┐
+                      │ WebSocket Broadcaster       │
+                      │ (/api/v1/ws)                │
+                      │ - type: chain_event         │
+                      │ - type: incident_activity   │
+                      │ - type: incident_alert      │
+                      └─────────────────────────────┘
+```
+
+### 1. In-Memory O(1) Indexing
+The engine maintains four thread-safe lookup tables:
+- **Outpoint Index**: `(txid, vout)` mapping for exact unspent watched outputs.
+- **ScriptPubKey Index**: Hex-encoded script mapping for deterministic script executions.
+- **Address Index**: Standard Bitcoin address string matching (preserving heuristic boundary for heuristic addresses).
+- **TxID Index**: Transaction reference mapping (e.g., OP_RETURN communication transactions).
+
+### 2. Bounded Dynamic Descendant Tracking
+- When a watched UTXO is spent, the engine registers resulting non-OP_RETURN outputs as `DescendantOutpoint` targets.
+- Descendants are tagged with `depth = parent_depth + 1`.
+- Tracking is strictly bounded to `OBSCHAIN_INCIDENT_FOLLOW_DEPTH` (default 3, clamped between 1 and 5).
+- Total tracked descendants are capped in a bounded LRU/FIFO buffer to prevent memory exhaustion attacks.
+
+### 3. Epistemological Decoupling
+- **Recovery Immutability**: On-chain fund movement proves cryptographic transfer, NOT fund recovery. `incident.recovery.recovered_sats` is NEVER modified automatically by the watch engine.
+- **Severity Boundaries**: Heuristic cluster activity alerts are capped at `Medium` severity, preventing false alarm inflation.
+
+---
+
 ## Pipeline Telemetry & Observability
 
 The pipeline tracks key metrics exported in `StatusResponse.metrics`:
@@ -153,3 +206,7 @@ The pipeline tracks key metrics exported in `StatusResponse.metrics`:
 - `cache_misses`: In-memory UTXO cache misses requiring REST fetch
 - `events_generated`: Total unique chain events detected
 - `events_deduplicated`: Replayed or duplicate events dropped by the filter
+- `active_incident_watchers`: Number of active incidents currently under live observation
+- `incident_watch_targets`: Total active watch targets loaded into engine indices
+- `incident_activities_detected`: Total incident correlation activities detected
+- `incident_alerts_emitted`: High-priority incident alerts emitted and broadcasted

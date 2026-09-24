@@ -225,3 +225,187 @@ async fn test_ws_live_broadcast() {
         panic!("Expected text frame from WebSocket");
     }
 }
+
+#[tokio::test]
+async fn test_get_incident_watch_targets() {
+    let app = test_app();
+    let req = Request::builder()
+        .uri("/api/v1/incidents/OC-2026-0001/watch-targets")
+        .body(Body::empty())
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["case_id"], "OC-2026-0001");
+    let targets = json["watch_targets"].as_array().unwrap();
+    assert_eq!(targets.len(), 6);
+
+    // Verify public watch target shape
+    let first = &targets[0];
+    assert!(first["target_type"].is_string());
+    assert!(first["target_summary"].is_string());
+    assert!(first["classification"].is_string());
+    assert_eq!(first["case_id"], "OC-2026-0001");
+    assert!(first["active"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn test_incident_activity_endpoints() {
+    use chrono::Utc;
+    use obschain_core::{
+        ActivityStatus, CorrelationStrength, IncidentActivity, IncidentActivityType,
+        ObservationSource, ProvenanceClassification,
+    };
+    use obschain_storage::IncidentActivityRepository;
+
+    let storage = InMemoryStorage::new_empty(100);
+    let detectors: Vec<Arc<dyn obschain_detectors::Detector>> = vec![];
+    let (state, _) = AppState::new(storage.clone(), detectors, false);
+
+    // Create and save test activity for Liquid incident
+    let liquid_id = Uuid::parse_str("0c202600-0001-0000-0000-000000000001").unwrap();
+    let target_id = Uuid::new_v4();
+    let act = IncidentActivity {
+        id: Uuid::new_v4(),
+        incident_id: liquid_id,
+        case_id: "OC-2026-0001".to_string(),
+        activity_type: IncidentActivityType::WatchedOutpointSpent,
+        observed_at: Utc::now(),
+        trigger_txid: Some("tx_test_activity_001".to_string()),
+        block_height: None,
+        block_hash: None,
+        value_sats: Some(100_000_000),
+        watch_target_id: target_id,
+        confidence: ProvenanceClassification::OnChainVerified,
+        correlation_strength: CorrelationStrength::Direct,
+        status: ActivityStatus::Mempool,
+        source: ObservationSource::new("bitcoin", "websocket", None),
+        evidence: vec![],
+        description: "Test outpoint spent".to_string(),
+        details: None,
+        dedup_key: "act_test_key".to_string(),
+    };
+    storage.save_activity(&act).await.unwrap();
+
+    let app = create_router(state);
+
+    // 1. Test incident-scoped activity endpoint
+    let req1 = Request::builder()
+        .uri("/api/v1/incidents/OC-2026-0001/activity")
+        .body(Body::empty())
+        .unwrap();
+    let res1 = app.clone().oneshot(req1).await.unwrap();
+    assert_eq!(res1.status(), StatusCode::OK);
+    let body1 = axum::body::to_bytes(res1.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json1: serde_json::Value = serde_json::from_slice(&body1).unwrap();
+    assert_eq!(json1["count"], 1);
+    assert_eq!(json1["activity"][0]["trigger_txid"], "tx_test_activity_001");
+
+    // 2. Test global activity endpoint
+    let req2 = Request::builder()
+        .uri("/api/v1/incident-activity")
+        .body(Body::empty())
+        .unwrap();
+    let res2 = app.oneshot(req2).await.unwrap();
+    assert_eq!(res2.status(), StatusCode::OK);
+    let body2 = axum::body::to_bytes(res2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+    assert_eq!(json2["count"], 1);
+    assert_eq!(json2["activity"][0]["trigger_txid"], "tx_test_activity_001");
+}
+
+#[tokio::test]
+async fn test_ws_incident_broadcast() {
+    use chrono::Utc;
+    use futures_util::StreamExt;
+    use obschain::WebSocketBroadcast;
+    use obschain_core::{
+        ActivityStatus, CorrelationStrength, EventSeverity, IncidentActivity, IncidentActivityType,
+        IncidentAlert, ObservationSource, ProvenanceClassification,
+    };
+
+    let storage = InMemoryStorage::new_empty(100);
+    let detectors: Vec<Arc<dyn obschain_detectors::Detector>> = vec![];
+    let (state, _) = AppState::new(storage, detectors, false);
+    let ws_broadcaster = state.ws_broadcaster.clone();
+    let app = create_router(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let ws_url = format!("ws://{}/api/v1/ws", addr);
+    let (ws_stream, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+    let (_, mut read) = ws_stream.split();
+
+    // Broadcast IncidentActivity
+    let act = IncidentActivity {
+        id: Uuid::new_v4(),
+        incident_id: Uuid::new_v4(),
+        case_id: "OC-2026-0001".to_string(),
+        activity_type: IncidentActivityType::WatchedOutpointSpent,
+        observed_at: Utc::now(),
+        trigger_txid: Some("tx_ws_act".to_string()),
+        block_height: None,
+        block_hash: None,
+        value_sats: Some(50_000_000),
+        watch_target_id: Uuid::new_v4(),
+        confidence: ProvenanceClassification::OnChainVerified,
+        correlation_strength: CorrelationStrength::Direct,
+        status: ActivityStatus::Mempool,
+        source: ObservationSource::new("bitcoin", "websocket", None),
+        evidence: vec![],
+        description: "WS Activity Test".to_string(),
+        details: None,
+        dedup_key: "ws_key_1".to_string(),
+    };
+    let _ = ws_broadcaster.send(WebSocketBroadcast::incident_activity(act));
+
+    let msg1 = read.next().await.unwrap().unwrap();
+    if let tokio_tungstenite::tungstenite::Message::Text(txt) = msg1 {
+        let json: serde_json::Value = serde_json::from_str(&txt).unwrap();
+        assert_eq!(json["type"], "incident_activity");
+        assert_eq!(json["data"]["trigger_txid"], "tx_ws_act");
+    } else {
+        panic!("Expected text frame");
+    }
+
+    // Broadcast IncidentAlert
+    let alert = IncidentAlert {
+        id: Uuid::new_v4(),
+        incident_id: Uuid::new_v4(),
+        case_id: "OC-2026-0001".to_string(),
+        incident_title: "Liquid Network Incident".to_string(),
+        activity_id: Uuid::new_v4(),
+        severity: EventSeverity::Critical,
+        title: "[OC-2026-0001] Watched Outpoint Spent".to_string(),
+        summary: "Critical spend observed".to_string(),
+        confidence: ProvenanceClassification::OnChainVerified,
+        correlation_strength: CorrelationStrength::Direct,
+        observed_at: Utc::now(),
+        value_sats: Some(399_602_000_000),
+        trigger_txid: Some("tx_ws_alert".to_string()),
+    };
+    let _ = ws_broadcaster.send(WebSocketBroadcast::incident_alert(alert));
+
+    let msg2 = read.next().await.unwrap().unwrap();
+    if let tokio_tungstenite::tungstenite::Message::Text(txt) = msg2 {
+        let json: serde_json::Value = serde_json::from_str(&txt).unwrap();
+        assert_eq!(json["type"], "incident_alert");
+        assert_eq!(json["data"]["trigger_txid"], "tx_ws_alert");
+        assert_eq!(json["data"]["severity"], "CRITICAL");
+    } else {
+        panic!("Expected text frame");
+    }
+}

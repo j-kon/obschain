@@ -33,3 +33,9 @@ ObsChain processes data from untrusted network sources (peer-to-peer gossip, ext
 - **Graph Topology Integrity**: Graphs are validated at build time to prevent dangling edges or duplicate node IDs, preventing invalid graph structures in client visualizers.
 - **Chronological Monotonicity**: Timelines and updates must strictly maintain chronological ordering.
 
+### 7. Incident Watch Engine & Correlation Security
+- **Public Watch Target Sanitization**: The endpoint `GET /api/v1/incidents/:id/watch-targets` strips all internal investigation configurations, private detection thresholds, and operator notes, returning only safe public metadata (`PublicWatchTarget`).
+- **Bounded Descendant Tracking**: Dynamic descendant tracking enforces `OBSCHAIN_INCIDENT_FOLLOW_DEPTH` (default 3, clamped between 1 and 5) and bounds the maximum number of tracked descendants to prevent memory exhaustion or exponential graph explosion attacks from fan-out spam.
+- **Bounded In-Memory Activity Store**: Incident activity and alert events are buffered in bounded circular ring buffers (`OBSCHAIN_ACTIVITY_STORE_LIMIT`, default 10,000) to protect against memory exhaustion under high-throughput transaction loads.
+- **Epistemological Integrity & Anti-Inflation**: The engine strictly enforces that on-chain movement is not confused with fund recovery (`recovery.recovered_sats` is immutable to on-chain movement detection alone). Heuristic targets are strictly capped at `Medium` severity, preventing automated escalation to `Critical` on probabilistic evidence.
+

@@ -4,7 +4,10 @@ use std::{
 };
 
 use chrono::Utc;
-use obschain_core::{ChainEvent, ConfidenceLevel, EventSeverity, EventType, Incident};
+use obschain_core::{
+    ActivityStatus, ChainEvent, ConfidenceLevel, EventSeverity, EventType, Incident,
+    IncidentActivity, WatchTarget,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -46,13 +49,45 @@ pub trait IncidentRepository: Send + Sync {
     ) -> Result<Option<Incident>, StorageError>;
 }
 
-/// Thread-safe in-memory event and incident store with bounded retention.
-/// Uses a circular VecDeque to bound maximum memory consumption.
+#[async_trait::async_trait]
+pub trait WatchTargetRepository: Send + Sync {
+    async fn save_watch_target(&self, target: &WatchTarget) -> Result<(), StorageError>;
+    async fn list_watch_targets(
+        &self,
+        incident_id: Option<Uuid>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<WatchTarget>, StorageError>;
+    async fn get_watch_target_by_id(&self, id: Uuid) -> Result<Option<WatchTarget>, StorageError>;
+}
+
+#[async_trait::async_trait]
+pub trait IncidentActivityRepository: Send + Sync {
+    async fn save_activity(&self, activity: &IncidentActivity) -> Result<(), StorageError>;
+    async fn list_activities(
+        &self,
+        incident_id: Option<Uuid>,
+        status: Option<ActivityStatus>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<IncidentActivity>, StorageError>;
+    async fn get_activity_by_id(&self, id: Uuid) -> Result<Option<IncidentActivity>, StorageError>;
+    async fn get_activity_by_dedup_key(
+        &self,
+        dedup_key: &str,
+    ) -> Result<Option<IncidentActivity>, StorageError>;
+}
+
+/// Thread-safe in-memory event, incident, watch target, and activity store with bounded retention.
+/// Uses circular VecDeques to bound maximum memory consumption.
 #[derive(Clone)]
 pub struct InMemoryStorage {
     events: Arc<RwLock<VecDeque<ChainEvent>>>,
     incidents: Arc<RwLock<Vec<Incident>>>,
+    watch_targets: Arc<RwLock<Vec<WatchTarget>>>,
+    activities: Arc<RwLock<VecDeque<IncidentActivity>>>,
     max_events: usize,
+    max_activities: usize,
 }
 
 impl Default for InMemoryStorage {
@@ -63,16 +98,26 @@ impl Default for InMemoryStorage {
 
 impl InMemoryStorage {
     pub const DEFAULT_MAX_EVENTS: usize = 10_000;
+    pub const DEFAULT_MAX_ACTIVITIES: usize = 5_000;
 
     pub fn new() -> Self {
-        Self::with_limit(Self::DEFAULT_MAX_EVENTS)
+        Self::with_limits(Self::DEFAULT_MAX_EVENTS, Self::DEFAULT_MAX_ACTIVITIES)
     }
 
     pub fn with_limit(max_events: usize) -> Self {
+        Self::with_limits(max_events, Self::DEFAULT_MAX_ACTIVITIES)
+    }
+
+    pub fn with_limits(max_events: usize, max_activities: usize) -> Self {
         let storage = Self {
             events: Arc::new(RwLock::new(VecDeque::with_capacity(max_events.min(1000)))),
             incidents: Arc::new(RwLock::new(Vec::new())),
+            watch_targets: Arc::new(RwLock::new(Vec::new())),
+            activities: Arc::new(RwLock::new(VecDeque::with_capacity(
+                max_activities.min(1000),
+            ))),
             max_events,
+            max_activities,
         };
         storage.seed_canonical_incidents();
         storage.seed_mock_data();
@@ -83,7 +128,12 @@ impl InMemoryStorage {
         let storage = Self {
             events: Arc::new(RwLock::new(VecDeque::with_capacity(max_events.min(1000)))),
             incidents: Arc::new(RwLock::new(Vec::new())),
+            watch_targets: Arc::new(RwLock::new(Vec::new())),
+            activities: Arc::new(RwLock::new(VecDeque::with_capacity(
+                Self::DEFAULT_MAX_ACTIVITIES.min(1000),
+            ))),
             max_events,
+            max_activities: Self::DEFAULT_MAX_ACTIVITIES,
         };
         storage.seed_canonical_incidents();
         storage
@@ -96,14 +146,40 @@ impl InMemoryStorage {
                 lock.push(liquid_incident);
             }
         }
+
+        let targets = obschain_incidents::canonical_liquid_watch_targets();
+        if let Ok(mut lock) = self.watch_targets.write() {
+            for target in targets {
+                if !lock.iter().any(|t| {
+                    t.id == target.id
+                        || (t.incident_id == target.incident_id && t.kind == target.kind)
+                }) {
+                    lock.push(target);
+                }
+            }
+        }
     }
 
     pub fn event_count(&self) -> usize {
         self.events.read().map(|l| l.len()).unwrap_or(0)
     }
 
+    pub fn activity_count(&self) -> usize {
+        self.activities.read().map(|l| l.len()).unwrap_or(0)
+    }
+
+    pub fn watch_target_count(&self) -> usize {
+        self.watch_targets.read().map(|l| l.len()).unwrap_or(0)
+    }
+
     pub fn clear_events(&self) {
         if let Ok(mut lock) = self.events.write() {
+            lock.clear();
+        }
+    }
+
+    pub fn clear_activities(&self) {
+        if let Ok(mut lock) = self.activities.write() {
             lock.clear();
         }
     }
@@ -285,6 +361,133 @@ impl IncidentRepository for InMemoryStorage {
     }
 }
 
+#[async_trait::async_trait]
+impl WatchTargetRepository for InMemoryStorage {
+    async fn save_watch_target(&self, target: &WatchTarget) -> Result<(), StorageError> {
+        let mut lock = self
+            .watch_targets
+            .write()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        if let Some(pos) = lock.iter().position(|t| t.id == target.id) {
+            lock[pos] = target.clone();
+        } else {
+            lock.push(target.clone());
+        }
+        Ok(())
+    }
+
+    async fn list_watch_targets(
+        &self,
+        incident_id: Option<Uuid>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<WatchTarget>, StorageError> {
+        let lock = self
+            .watch_targets
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let filtered: Vec<WatchTarget> = lock
+            .iter()
+            .filter(|t| {
+                if let Some(inc_id) = incident_id {
+                    t.incident_id == inc_id
+                } else {
+                    true
+                }
+            })
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect();
+        Ok(filtered)
+    }
+
+    async fn get_watch_target_by_id(&self, id: Uuid) -> Result<Option<WatchTarget>, StorageError> {
+        let lock = self
+            .watch_targets
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(lock.iter().find(|t| t.id == id).cloned())
+    }
+}
+
+#[async_trait::async_trait]
+impl IncidentActivityRepository for InMemoryStorage {
+    async fn save_activity(&self, activity: &IncidentActivity) -> Result<(), StorageError> {
+        let mut lock = self
+            .activities
+            .write()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        // Deterministic deduplication or update by dedup_key
+        if let Some(pos) = lock.iter().position(|a| a.dedup_key == activity.dedup_key) {
+            lock[pos] = activity.clone();
+            return Ok(());
+        }
+
+        if lock.len() >= self.max_activities {
+            lock.pop_front();
+        }
+        lock.push_back(activity.clone());
+        Ok(())
+    }
+
+    async fn list_activities(
+        &self,
+        incident_id: Option<Uuid>,
+        status: Option<ActivityStatus>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<IncidentActivity>, StorageError> {
+        let lock = self
+            .activities
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let filtered: Vec<IncidentActivity> = lock
+            .iter()
+            .rev()
+            .filter(|a| {
+                if let Some(inc_id) = incident_id {
+                    if a.incident_id != inc_id {
+                        return false;
+                    }
+                }
+                if let Some(st) = status {
+                    if a.status != st {
+                        return false;
+                    }
+                }
+                true
+            })
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect();
+
+        Ok(filtered)
+    }
+
+    async fn get_activity_by_id(&self, id: Uuid) -> Result<Option<IncidentActivity>, StorageError> {
+        let lock = self
+            .activities
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(lock.iter().find(|a| a.id == id).cloned())
+    }
+
+    async fn get_activity_by_dedup_key(
+        &self,
+        dedup_key: &str,
+    ) -> Result<Option<IncidentActivity>, StorageError> {
+        let lock = self
+            .activities
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(lock.iter().find(|a| a.dedup_key == dedup_key).cloned())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +538,107 @@ mod tests {
         assert_eq!(list[0].title, "Event 5");
         assert_eq!(list[1].title, "Event 4");
         assert_eq!(list[2].title, "Event 3");
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_seeded_watch_targets() {
+        let storage = InMemoryStorage::new_empty(10);
+        let targets = storage.list_watch_targets(None, 50, 0).await.unwrap();
+        // Liquid 2026 canonical targets: 6 seeded targets
+        assert_eq!(targets.len(), 6);
+        assert_eq!(storage.watch_target_count(), 6);
+
+        // Verify finding by ID
+        let first = &targets[0];
+        let found = storage.get_watch_target_by_id(first.id).await.unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().case_id, "OC-2026-0001");
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_activity_dedup_and_bounded_retention() {
+        let storage = InMemoryStorage::with_limits(10, 3);
+        assert_eq!(storage.activity_count(), 0);
+
+        let inc_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+
+        // 1. Create activity 1
+        let act1 = IncidentActivity {
+            id: Uuid::new_v4(),
+            incident_id: inc_id,
+            case_id: "OC-2026-0001".to_string(),
+            activity_type: obschain_core::IncidentActivityType::WatchedOutpointSpent,
+            observed_at: Utc::now(),
+            trigger_txid: Some("tx001".to_string()),
+            block_height: None,
+            block_hash: None,
+            value_sats: Some(100_000),
+            watch_target_id: target_id,
+            confidence: obschain_core::ProvenanceClassification::OnChainVerified,
+            correlation_strength: obschain_core::CorrelationStrength::Direct,
+            status: ActivityStatus::Mempool,
+            source: obschain_core::ObservationSource::mempool_ws("wss://mempool.space/api/v1/ws"),
+            evidence: vec![],
+            description: "Watched outpoint spent in mempool".to_string(),
+            details: None,
+            dedup_key: IncidentActivity::generate_dedup_key(
+                &inc_id,
+                &obschain_core::IncidentActivityType::WatchedOutpointSpent,
+                Some("tx001"),
+                &target_id,
+            ),
+        };
+
+        storage.save_activity(&act1).await.unwrap();
+        assert_eq!(storage.activity_count(), 1);
+
+        // 2. Duplicate activity with same dedup_key but updated status
+        let mut act1_confirmed = act1.clone();
+        act1_confirmed.status = ActivityStatus::Confirmed;
+        act1_confirmed.block_height = Some(888_000);
+
+        storage.save_activity(&act1_confirmed).await.unwrap();
+        // Count should still be 1 (updated, not duplicated)
+        assert_eq!(storage.activity_count(), 1);
+        let retrieved = storage.get_activity_by_id(act1.id).await.unwrap().unwrap();
+        assert_eq!(retrieved.status, ActivityStatus::Confirmed);
+        assert_eq!(retrieved.block_height, Some(888_000));
+
+        // 3. Add more activities to test bounded limit (3)
+        for i in 2..=5 {
+            let act = IncidentActivity {
+                id: Uuid::new_v4(),
+                incident_id: inc_id,
+                case_id: "OC-2026-0001".to_string(),
+                activity_type: obschain_core::IncidentActivityType::WatchedAddressReceived,
+                observed_at: Utc::now(),
+                trigger_txid: Some(format!("tx00{i}")),
+                block_height: None,
+                block_hash: None,
+                value_sats: Some(10_000 * i),
+                watch_target_id: target_id,
+                confidence: obschain_core::ProvenanceClassification::OnChainVerified,
+                correlation_strength: obschain_core::CorrelationStrength::Direct,
+                status: ActivityStatus::Confirmed,
+                source: obschain_core::ObservationSource::mempool_ws(
+                    "wss://mempool.space/api/v1/ws",
+                ),
+                evidence: vec![],
+                description: format!("Activity {i}"),
+                details: None,
+                dedup_key: format!("key-{i}"),
+            };
+            storage.save_activity(&act).await.unwrap();
+        }
+
+        // Bounded capacity must remain at 3
+        assert_eq!(storage.activity_count(), 3);
+        let list = storage.list_activities(None, None, 10, 0).await.unwrap();
+        assert_eq!(list.len(), 3);
+        // Newest first
+        assert_eq!(list[0].description, "Activity 5");
+        assert_eq!(list[1].description, "Activity 4");
+        assert_eq!(list[2].description, "Activity 3");
     }
 }

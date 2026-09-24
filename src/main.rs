@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use obschain::{create_router, AppConfig, AppState, PipelineMetrics};
+use obschain::{create_router, AppConfig, AppState, PipelineMetrics, WebSocketBroadcast};
 use obschain_core::Observation;
 use obschain_detectors::{
     ConsolidationDetector, DetectorEngine, DormantCoinDetector, EventDeduplicator,
@@ -14,7 +14,8 @@ use obschain_ingest::{
     EnricherConfig, MempoolRestClient, MempoolRestConfig, MempoolWebSocketClient,
     TransactionEnricher, UtxoCache,
 };
-use obschain_storage::{EventRepository, InMemoryStorage};
+use obschain_intelligence::IncidentWatchEngine;
+use obschain_storage::{EventRepository, InMemoryStorage, IncidentActivityRepository};
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -136,13 +137,29 @@ async fn main() -> anyhow::Result<()> {
     ];
     let mut engine = DetectorEngine::new(detectors.clone());
 
-    // 5. Setup AppState and Metrics for Axum HTTP and WebSocket API
+    // 5. Setup IncidentWatchEngine, AppState, and Metrics for Axum HTTP and WebSocket API
+    let mut watch_engine = IncidentWatchEngine::from_env();
+    let canonical_targets = obschain_incidents::canonical_liquid_watch_targets();
+    let targets_count = canonical_targets.len();
+    watch_engine.load_targets(canonical_targets);
+    watch_engine.register_incident_title(
+        obschain_incidents::LIQUID_CASE_ID,
+        "Liquid Network Security Incident",
+    );
+    info!(
+        targets_loaded = targets_count,
+        follow_depth = watch_engine.max_descendant_depth(),
+        "IncidentWatchEngine initialized with canonical Liquid targets"
+    );
+    let watch_engine_arc = Arc::new(tokio::sync::RwLock::new(watch_engine));
+
     let metrics = PipelineMetrics::default();
-    let (state, event_broadcaster) = AppState::with_metrics(
+    let (state, event_broadcaster) = AppState::with_metrics_and_watch_engine(
         storage.clone(),
         detectors,
         config.mock_feed,
         metrics.clone(),
+        watch_engine_arc.clone(),
     );
     let app = create_router(state.clone());
 
@@ -266,6 +283,8 @@ async fn main() -> anyhow::Result<()> {
     // 8. Detector pipeline worker: Observation channel -> Enrichment -> Engine -> ChainEvent -> Dedup -> Storage & Broadcast
     let pipeline_storage = storage.clone();
     let pipeline_broadcaster = event_broadcaster.clone();
+    let pipeline_ws_broadcaster = state.ws_broadcaster.clone();
+    let pipeline_watch_engine = watch_engine_arc.clone();
     let pipeline_events_detected = state.events_detected.clone();
     let pipeline_tip_height = state.tip_height.clone();
     let pipeline_metrics = metrics.clone();
@@ -289,6 +308,8 @@ async fn main() -> anyhow::Result<()> {
                         break;
                     };
 
+                    let mut incident_matches = Vec::new();
+
                     match &mut obs {
                         Observation::Block(block) => {
                             pipeline_metrics.blocks_observed.fetch_add(1, Ordering::Relaxed);
@@ -300,6 +321,9 @@ async fn main() -> anyhow::Result<()> {
                                 interval_secs = ?block.interval_seconds,
                                 "New Bitcoin block observed"
                             );
+
+                            let mut engine_lock = pipeline_watch_engine.write().await;
+                            incident_matches = engine_lock.process_block(block);
                         }
                         Observation::Transaction(ref mut tx) => {
                             pipeline_metrics.transactions_observed.fetch_add(1, Ordering::Relaxed);
@@ -322,6 +346,9 @@ async fn main() -> anyhow::Result<()> {
 
                             pipeline_metrics.cache_hits.store(utxo_cache_handle.hits(), Ordering::Relaxed);
                             pipeline_metrics.cache_misses.store(utxo_cache_handle.misses(), Ordering::Relaxed);
+
+                            let mut engine_lock = pipeline_watch_engine.write().await;
+                            incident_matches = engine_lock.process_transaction(tx, tx.block_height, tx.block_hash.as_deref());
                         }
                         Observation::Replacement(repl) => {
                             info!(
@@ -330,6 +357,9 @@ async fn main() -> anyhow::Result<()> {
                                 fee_delta_sats = repl.fee_delta_sats,
                                 "Bitcoin mempool transaction replacement observed"
                             );
+
+                            let mut engine_lock = pipeline_watch_engine.write().await;
+                            incident_matches = engine_lock.process_replacement(repl);
                         }
                         Observation::Mempool(mp) => {
                             tracing::debug!(
@@ -337,6 +367,45 @@ async fn main() -> anyhow::Result<()> {
                                 total_fee_sats = mp.total_fee_sats,
                                 "Mempool backlog stats updated"
                             );
+                        }
+                    }
+
+                    // Process and broadcast any incident watch matches
+                    for (activity, alert_opt) in incident_matches {
+                        info!(
+                            incident_id = %activity.incident_id,
+                            case_id = %activity.case_id,
+                            activity_type = ?activity.activity_type,
+                            correlation = ?activity.correlation_strength,
+                            confidence = ?activity.confidence,
+                            "ObsChain incident activity detected"
+                        );
+
+                        if let Err(e) = pipeline_storage.save_activity(&activity).await {
+                            error!(error = %e, "Failed to persist detected IncidentActivity");
+                        }
+
+                        pipeline_metrics
+                            .incident_activities_detected
+                            .fetch_add(1, Ordering::Relaxed);
+
+                        let _ = pipeline_ws_broadcaster
+                            .send(WebSocketBroadcast::incident_activity(activity.clone()));
+
+                        if let Some(alert) = alert_opt {
+                            info!(
+                                case_id = %alert.case_id,
+                                severity = ?alert.severity,
+                                title = %alert.title,
+                                "ObsChain incident alert emitted"
+                            );
+
+                            pipeline_metrics
+                                .incident_alerts_emitted
+                                .fetch_add(1, Ordering::Relaxed);
+
+                            let _ = pipeline_ws_broadcaster
+                                .send(WebSocketBroadcast::incident_alert(alert));
                         }
                     }
 

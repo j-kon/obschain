@@ -153,6 +153,7 @@ impl MempoolTx {
                     n: n as u32,
                     script_pubkey_type: vout.scriptpubkey_type,
                     address: vout.scriptpubkey_address,
+                    scriptpubkey_hex: vout.scriptpubkey,
                 }
             })
             .collect();
