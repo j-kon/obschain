@@ -113,6 +113,7 @@ mod tests {
             difficulty: Some(105_000_000_000_000.0),
             miner_tag: Some("Foundry USA".to_string()),
             interval_seconds,
+            source: None,
         }
     }
 

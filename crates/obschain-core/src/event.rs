@@ -53,6 +53,8 @@ pub struct ChainEvent {
     pub block_height: Option<u64>,
     pub block_hash: Option<String>,
     pub txid: Option<String>,
+    #[serde(default)]
+    pub source: Option<crate::source::ObservationSource>,
     pub metadata: serde_json::Value,
 }
 
@@ -75,6 +77,7 @@ impl ChainEvent {
             block_height: None,
             block_hash: None,
             txid: None,
+            source: None,
             metadata: serde_json::json!({}),
         }
     }

@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::source::ObservationSource;
+
 /// Represents an observed Bitcoin block.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BlockObservation {
@@ -14,6 +16,8 @@ pub struct BlockObservation {
     pub difficulty: Option<f64>,
     pub miner_tag: Option<String>,
     pub interval_seconds: Option<u64>,
+    #[serde(default)]
+    pub source: Option<ObservationSource>,
 }
 
 /// Represents an input in an observed Bitcoin transaction.
@@ -37,6 +41,7 @@ pub struct TxOutputObservation {
 }
 
 /// Represents an observed Bitcoin transaction.
+/// Strictly uses integer satoshis (u64) for all value representations.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TransactionObservation {
     pub txid: String,
@@ -44,8 +49,10 @@ pub struct TransactionObservation {
     pub block_hash: Option<String>,
     pub block_height: Option<u64>,
     pub fee_sats: u64,
+    pub size: u64,
+    pub weight: u64,
     pub vsize: u64,
-    pub fee_rate_sat_vb: f64,
+    pub fee_rate_sat_vb: Option<f64>,
     pub total_input_sats: u64,
     pub total_output_sats: u64,
     pub input_count: usize,
@@ -53,12 +60,47 @@ pub struct TransactionObservation {
     pub inputs: Vec<TxInputObservation>,
     pub outputs: Vec<TxOutputObservation>,
     pub is_rbf: bool,
+    #[serde(default)]
+    pub confirmed: bool,
+    #[serde(default)]
+    pub source: Option<ObservationSource>,
 }
 
-/// High-level observation payload passed to detectors.
+/// Represents an observation of mempool state and congestion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MempoolObservation {
+    pub count: usize,
+    pub vsize_bytes: u64,
+    pub total_fee_sats: u64,
+    pub min_fee_rate_sat_vb: Option<f64>,
+    pub timestamp: DateTime<Utc>,
+    #[serde(default)]
+    pub source: Option<ObservationSource>,
+}
+
+/// High-level normalized observation payload passed to detectors.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum Observation {
     Block(BlockObservation),
     Transaction(TransactionObservation),
+    Mempool(MempoolObservation),
+}
+
+impl Observation {
+    pub fn source(&self) -> Option<&ObservationSource> {
+        match self {
+            Observation::Block(b) => b.source.as_ref(),
+            Observation::Transaction(t) => t.source.as_ref(),
+            Observation::Mempool(m) => m.source.as_ref(),
+        }
+    }
+
+    pub fn timestamp(&self) -> DateTime<Utc> {
+        match self {
+            Observation::Block(b) => b.timestamp,
+            Observation::Transaction(t) => t.timestamp,
+            Observation::Mempool(m) => m.timestamp,
+        }
+    }
 }

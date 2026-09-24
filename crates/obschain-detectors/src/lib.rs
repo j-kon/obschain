@@ -1,6 +1,8 @@
+pub mod engine;
 pub mod large_tx;
 pub mod long_interval;
 
+pub use engine::DetectorEngine;
 pub use large_tx::LargeTransactionDetector;
 pub use long_interval::LongBlockIntervalDetector;
 use obschain_core::{ChainEvent, Observation};

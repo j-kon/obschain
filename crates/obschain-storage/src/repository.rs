@@ -1,4 +1,7 @@
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, RwLock},
+};
 
 use chrono::Utc;
 use obschain_core::{
@@ -42,12 +45,13 @@ pub trait IncidentRepository: Send + Sync {
     async fn get_incident_by_id(&self, id: Uuid) -> Result<Option<Incident>, StorageError>;
 }
 
-/// Thread-safe in-memory store pre-seeded with verified test/demo cases.
-/// Always available for standalone testing and initial development.
+/// Thread-safe in-memory event and incident store with bounded retention.
+/// Uses a circular VecDeque to bound maximum memory consumption.
 #[derive(Clone)]
 pub struct InMemoryStorage {
-    events: Arc<RwLock<Vec<ChainEvent>>>,
+    events: Arc<RwLock<VecDeque<ChainEvent>>>,
     incidents: Arc<RwLock<Vec<Incident>>>,
+    max_events: usize,
 }
 
 impl Default for InMemoryStorage {
@@ -57,13 +61,38 @@ impl Default for InMemoryStorage {
 }
 
 impl InMemoryStorage {
+    pub const DEFAULT_MAX_EVENTS: usize = 10_000;
+
     pub fn new() -> Self {
+        Self::with_limit(Self::DEFAULT_MAX_EVENTS)
+    }
+
+    pub fn with_limit(max_events: usize) -> Self {
         let storage = Self {
-            events: Arc::new(RwLock::new(Vec::new())),
+            events: Arc::new(RwLock::new(VecDeque::with_capacity(max_events.min(1000)))),
             incidents: Arc::new(RwLock::new(Vec::new())),
+            max_events,
         };
         storage.seed_mock_data();
         storage
+    }
+
+    pub fn new_empty(max_events: usize) -> Self {
+        Self {
+            events: Arc::new(RwLock::new(VecDeque::with_capacity(max_events.min(1000)))),
+            incidents: Arc::new(RwLock::new(Vec::new())),
+            max_events,
+        }
+    }
+
+    pub fn event_count(&self) -> usize {
+        self.events.read().map(|l| l.len()).unwrap_or(0)
+    }
+
+    pub fn clear_events(&self) {
+        if let Ok(mut lock) = self.events.write() {
+            lock.clear();
+        }
     }
 
     fn seed_mock_data(&self) {
@@ -128,9 +157,9 @@ impl InMemoryStorage {
         });
 
         if let Ok(mut lock) = self.events.write() {
-            lock.push(ev1);
-            lock.push(ev2);
-            lock.push(ev3);
+            lock.push_back(ev1);
+            lock.push_back(ev2);
+            lock.push_back(ev3);
         }
 
         // Sample Incident: Exchange Hot Wallet Extraction
@@ -243,7 +272,13 @@ impl EventRepository for InMemoryStorage {
             .events
             .write()
             .map_err(|e| StorageError::Database(e.to_string()))?;
-        lock.push(event.clone());
+
+        // Enforce bounded memory retention
+        if lock.len() >= self.max_events {
+            lock.pop_front();
+        }
+
+        lock.push_back(event.clone());
         Ok(())
     }
 
@@ -315,5 +350,58 @@ impl IncidentRepository for InMemoryStorage {
             .read()
             .map_err(|e| StorageError::Database(e.to_string()))?;
         Ok(lock.iter().find(|i| i.id == id).cloned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_in_memory_event_storage_and_lookup() {
+        let storage = InMemoryStorage::new_empty(10);
+        assert_eq!(storage.event_count(), 0);
+
+        let event = ChainEvent::new(
+            EventType::LargeTransfer,
+            EventSeverity::High,
+            ConfidenceLevel::VerifiedOnChain,
+            "Test Event",
+            "Details",
+        );
+        let id = event.id;
+
+        storage.save_event(&event).await.unwrap();
+        assert_eq!(storage.event_count(), 1);
+
+        let retrieved = storage.get_event_by_id(id).await.unwrap();
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().title, "Test Event");
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_bounded_retention() {
+        let storage = InMemoryStorage::new_empty(3); // Limit to 3 events
+
+        for i in 1..=5 {
+            let event = ChainEvent::new(
+                EventType::LargeTransfer,
+                EventSeverity::Low,
+                ConfidenceLevel::VerifiedOnChain,
+                format!("Event {i}"),
+                "Details",
+            );
+            storage.save_event(&event).await.unwrap();
+        }
+
+        // Bounded capacity must remain at 3
+        assert_eq!(storage.event_count(), 3);
+
+        let list = storage.list_events(10, 0).await.unwrap();
+        assert_eq!(list.len(), 3);
+        // Reverse chronological order: newest (5) first, then 4, then 3
+        assert_eq!(list[0].title, "Event 5");
+        assert_eq!(list[1].title, "Event 4");
+        assert_eq!(list[2].title, "Event 3");
     }
 }

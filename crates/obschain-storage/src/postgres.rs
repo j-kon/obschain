@@ -113,6 +113,7 @@ impl EventRepository for PostgresStorage {
                 block_hash: row.get("block_hash"),
                 txid: row.get("txid"),
                 metadata: row.get("metadata"),
+                source: None,
             });
         }
 
@@ -161,6 +162,7 @@ impl EventRepository for PostgresStorage {
             block_hash: row.get("block_hash"),
             txid: row.get("txid"),
             metadata: row.get("metadata"),
+            source: None,
         }))
     }
 }

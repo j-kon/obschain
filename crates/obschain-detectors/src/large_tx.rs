@@ -105,8 +105,10 @@ mod tests {
             block_hash: None,
             block_height: None,
             fee_sats: 1500,
+            size: 250,
+            weight: 840,
             vsize: 210,
-            fee_rate_sat_vb: 7.14,
+            fee_rate_sat_vb: Some(7.14),
             total_input_sats: output_sats + 1500,
             total_output_sats: output_sats,
             input_count: 1,
@@ -114,6 +116,8 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
             is_rbf: false,
+            confirmed: false,
+            source: None,
         }
     }
 

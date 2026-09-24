@@ -1,13 +1,20 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, RwLock,
+};
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, Query, State,
+    },
     http::StatusCode,
     response::IntoResponse,
     routing::get,
     Json, Router,
 };
 use chrono::{DateTime, Utc};
+use obschain_core::ChainEvent;
 use obschain_detectors::Detector;
 use obschain_storage::{EventRepository, InMemoryStorage, IncidentRepository};
 use serde::{Deserialize, Serialize};
@@ -18,12 +25,48 @@ use tower_http::{
 };
 use uuid::Uuid;
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SourcesStatus {
+    pub mempool_rest: String,
+    pub mempool_websocket: String,
+    pub bitcoin_core: String,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub storage: InMemoryStorage,
     pub detectors: Vec<Arc<dyn Detector>>,
     pub started_at: DateTime<Utc>,
     pub is_mock_feed: bool,
+    pub event_broadcaster: tokio::sync::broadcast::Sender<ChainEvent>,
+    pub tip_height: Arc<AtomicU64>,
+    pub events_detected: Arc<AtomicU64>,
+    pub sources: Arc<RwLock<SourcesStatus>>,
+}
+
+impl AppState {
+    pub fn new(
+        storage: InMemoryStorage,
+        detectors: Vec<Arc<dyn Detector>>,
+        is_mock_feed: bool,
+    ) -> (Self, tokio::sync::broadcast::Sender<ChainEvent>) {
+        let (tx, _) = tokio::sync::broadcast::channel(1024);
+        let state = Self {
+            storage,
+            detectors,
+            started_at: Utc::now(),
+            is_mock_feed,
+            event_broadcaster: tx.clone(),
+            tip_height: Arc::new(AtomicU64::new(0)),
+            events_detected: Arc::new(AtomicU64::new(0)),
+            sources: Arc::new(RwLock::new(SourcesStatus {
+                mempool_rest: "configured".to_string(),
+                mempool_websocket: "disconnected".to_string(),
+                bitcoin_core: "not_configured".to_string(),
+            })),
+        };
+        (state, tx)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -35,16 +78,19 @@ pub struct HealthResponse {
 
 #[derive(Debug, Serialize)]
 pub struct StatusResponse {
+    pub service: &'static str,
+    pub network: &'static str,
     pub status: &'static str,
     pub version: &'static str,
-    pub network: &'static str,
     pub engine: &'static str,
     pub timestamp: DateTime<Utc>,
     pub uptime_seconds: i64,
+    pub sources: SourcesStatus,
+    pub tip_height: u64,
+    pub events_detected: u64,
     pub active_detectors: Vec<&'static str>,
     pub storage_backend: &'static str,
     pub is_mock_feed: bool,
-    pub mock_data_disclaimer: &'static str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,6 +119,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/events/{id}", get(get_event_handler))
         .route("/api/v1/incidents", get(list_incidents_handler))
         .route("/api/v1/incidents/{id}", get(get_incident_handler))
+        .route("/api/v1/ws", get(ws_handler))
         .layer(TraceLayer::new_for_http())
         // Guard against oversized request DOS (limit to 1MB)
         .layer(RequestBodyLimitLayer::new(1024 * 1024))
@@ -92,20 +139,88 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
     let now = Utc::now();
     let uptime = (now - state.started_at).num_seconds();
     let active_detectors = state.detectors.iter().map(|d| d.name()).collect();
+    let sources = state
+        .sources
+        .read()
+        .map(|s| s.clone())
+        .unwrap_or_else(|_| SourcesStatus {
+            mempool_rest: "unknown".to_string(),
+            mempool_websocket: "unknown".to_string(),
+            bitcoin_core: "not_configured".to_string(),
+        });
+    let tip_height = state.tip_height.load(Ordering::Relaxed);
+    let events_detected = state.events_detected.load(Ordering::Relaxed);
 
     Json(StatusResponse {
-        status: "operational",
+        service: "obschain",
+        network: "bitcoin",
+        status: "running",
         version: env!("CARGO_PKG_VERSION"),
-        network: "bitcoin-mainnet",
         engine: "ObsChain Core v0.1.0",
         timestamp: now,
         uptime_seconds: uptime,
+        sources,
+        tip_height,
+        events_detected,
         active_detectors,
-        storage_backend: "in-memory (mock demo seed)",
+        storage_backend: "in-memory (bounded VecDeque)",
         is_mock_feed: state.is_mock_feed,
-        mock_data_disclaimer:
-            "Initial seed data contains simulated/mock events and incidents clearly demarcated.",
     })
+}
+
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_client_socket(socket, state))
+}
+
+async fn handle_client_socket(mut socket: WebSocket, state: AppState) {
+    let mut rx = state.event_broadcaster.subscribe();
+    tracing::debug!("ObsChain WebSocket client connected");
+
+    loop {
+        tokio::select! {
+            client_msg = socket.recv() => {
+                match client_msg {
+                    Some(Ok(Message::Close(_))) | None => {
+                        tracing::debug!("ObsChain WebSocket client disconnected");
+                        break;
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        tracing::debug!("WebSocket client receive error: {e}");
+                        break;
+                    }
+                }
+            }
+            event_result = rx.recv() => {
+                match event_result {
+                    Ok(event) => {
+                        let json = match serde_json::to_string(&event) {
+                            Ok(j) => j,
+                            Err(e) => {
+                                tracing::error!("Failed to serialize ChainEvent for WebSocket broadcast: {e}");
+                                continue;
+                            }
+                        };
+                        if socket.send(Message::Text(json.into())).await.is_err() {
+                            tracing::debug!("ObsChain WebSocket client dropped during send");
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!("Slow WebSocket client lagged, skipped {skipped} events");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn list_events_handler(
