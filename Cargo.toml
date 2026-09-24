@@ -1,0 +1,73 @@
+[workspace]
+members = [
+    ".",
+    "crates/obschain-core",
+    "crates/obschain-ingest",
+    "crates/obschain-detectors",
+    "crates/obschain-incidents",
+    "crates/obschain-intelligence",
+    "crates/obschain-storage",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["ObsChain Contributors"]
+license = "Apache-2.0"
+repository = "https://github.com/j-kon/obschain"
+
+[workspace.dependencies]
+obschain-core = { path = "crates/obschain-core" }
+obschain-ingest = { path = "crates/obschain-ingest" }
+obschain-detectors = { path = "crates/obschain-detectors" }
+obschain-incidents = { path = "crates/obschain-incidents" }
+obschain-intelligence = { path = "crates/obschain-intelligence" }
+obschain-storage = { path = "crates/obschain-storage" }
+
+tokio = { version = "1.43", features = ["full"] }
+axum = { version = "0.8", features = ["macros"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "2.0"
+anyhow = "1.0"
+bitcoin = { version = "0.32", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json", "migrate"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+tower = { version = "0.5", features = ["util", "timeout"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
+
+[package]
+name = "obschain"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+obschain-core = { workspace = true }
+obschain-ingest = { workspace = true }
+obschain-detectors = { workspace = true }
+obschain-incidents = { workspace = true }
+obschain-intelligence = { workspace = true }
+obschain-storage = { workspace = true }
+
+tokio = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }

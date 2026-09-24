@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: obschain-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: obschain
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: obschain-backend
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      OBSCHAIN_HOST: "0.0.0.0"
+      OBSCHAIN_PORT: "8080"
+      DATABASE_URL: "postgres://postgres:postgrespassword@postgres:5432/obschain"
+      MEMPOOL_API_URL: "https://mempool.space/api"
+      MEMPOOL_WS_URL: "wss://mempool.space/api/v1/ws"
+      RUST_LOG: "info,obschain=debug"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

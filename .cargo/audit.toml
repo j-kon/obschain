@@ -1,0 +1,6 @@
+[advisories]
+ignore = [
+    # Marvin timing sidechannel in upstream sqlx-postgres dependency `rsa`.
+    # No fixed version exists upstream as of yet; documented for tracking.
+    "RUSTSEC-2023-0071",
+]
