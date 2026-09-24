@@ -1,3 +1,4 @@
+use chrono::Utc;
 use obschain_core::{
     ChainEvent, ConfidenceLevel, EventSeverity, EventType, Incident, IncidentStatus,
 };
@@ -252,24 +253,45 @@ impl IncidentRepository for PostgresStorage {
             let reported: serde_json::Value = row.get("reported_claims");
             let unverified: serde_json::Value = row.get("unverified_claims");
 
+            let affected_btc: f64 = row.get("total_btc_affected");
+            let recovered_btc: f64 = row.get("total_btc_recovered");
+            let updated_at: chrono::DateTime<Utc> = row.get("last_updated_at");
+            let id: Uuid = row.get("id");
+            let affected_sats = (affected_btc * 100_000_000.0) as u64;
+            let recovered_sats = (recovered_btc * 100_000_000.0) as u64;
+
             list.push(Incident {
-                id: row.get("id"),
+                id,
+                case_id: format!("INC-{}", &id.to_string()[..8]),
                 title: row.get("title"),
                 summary: row.get("summary"),
                 status,
                 severity,
-                total_btc_affected: row.get("total_btc_affected"),
-                total_btc_recovered: row.get("total_btc_recovered"),
+                recovery: obschain_core::RecoverySummary::new(
+                    affected_sats,
+                    recovered_sats,
+                    updated_at,
+                ),
+                total_btc_affected: affected_btc,
+                total_btc_recovered: recovered_btc,
                 first_observed_at: row.get("first_observed_at"),
-                last_updated_at: row.get("last_updated_at"),
+                last_updated_at: updated_at,
+                structured_claims: obschain_core::StructuredClaimsSummary::default(),
+                entities: Vec::new(),
+                transactions: Vec::new(),
+                blocks: Vec::new(),
+                on_chain_messages: Vec::new(),
+                timeline: Vec::new(),
+                evidence: Vec::new(),
+                sources: Vec::new(),
+                technical_findings: Vec::new(),
+                updates: Vec::new(),
+                graph: obschain_core::IncidentGraph::default(),
                 facts: serde_json::from_value(facts).unwrap_or_default(),
                 reported_claims: serde_json::from_value(reported).unwrap_or_default(),
                 unverified_claims: serde_json::from_value(unverified).unwrap_or_default(),
                 associated_txids: Vec::new(),
                 associated_block_heights: Vec::new(),
-                timeline: Vec::new(),
-                evidence: Vec::new(),
-                sources: Vec::new(),
             });
         }
 
@@ -304,25 +326,57 @@ impl IncidentRepository for PostgresStorage {
         let facts: serde_json::Value = row.get("facts");
         let reported: serde_json::Value = row.get("reported_claims");
         let unverified: serde_json::Value = row.get("unverified_claims");
+        let affected_btc: f64 = row.get("total_btc_affected");
+        let recovered_btc: f64 = row.get("total_btc_recovered");
+        let updated_at: chrono::DateTime<Utc> = row.get("last_updated_at");
+        let affected_sats = (affected_btc * 100_000_000.0) as u64;
+        let recovered_sats = (recovered_btc * 100_000_000.0) as u64;
 
         Ok(Some(Incident {
             id: row.get("id"),
+            case_id: format!("INC-{}", &id.to_string()[..8]),
             title: row.get("title"),
             summary: row.get("summary"),
             status,
             severity,
-            total_btc_affected: row.get("total_btc_affected"),
-            total_btc_recovered: row.get("total_btc_recovered"),
+            recovery: obschain_core::RecoverySummary::new(
+                affected_sats,
+                recovered_sats,
+                updated_at,
+            ),
+            total_btc_affected: affected_btc,
+            total_btc_recovered: recovered_btc,
             first_observed_at: row.get("first_observed_at"),
-            last_updated_at: row.get("last_updated_at"),
+            last_updated_at: updated_at,
+            structured_claims: obschain_core::StructuredClaimsSummary::default(),
+            entities: Vec::new(),
+            transactions: Vec::new(),
+            blocks: Vec::new(),
+            on_chain_messages: Vec::new(),
+            timeline: Vec::new(),
+            evidence: Vec::new(),
+            sources: Vec::new(),
+            technical_findings: Vec::new(),
+            updates: Vec::new(),
+            graph: obschain_core::IncidentGraph::default(),
             facts: serde_json::from_value(facts).unwrap_or_default(),
             reported_claims: serde_json::from_value(reported).unwrap_or_default(),
             unverified_claims: serde_json::from_value(unverified).unwrap_or_default(),
             associated_txids: Vec::new(),
             associated_block_heights: Vec::new(),
-            timeline: Vec::new(),
-            evidence: Vec::new(),
-            sources: Vec::new(),
         }))
+    }
+
+    async fn get_incident_by_id_or_case_id(
+        &self,
+        identifier: &str,
+    ) -> Result<Option<Incident>, StorageError> {
+        if let Ok(id) = Uuid::parse_str(identifier) {
+            return self.get_incident_by_id(id).await;
+        }
+        let incidents = self.list_incidents(100, 0).await?;
+        Ok(incidents
+            .into_iter()
+            .find(|i| i.case_id.eq_ignore_ascii_case(identifier)))
     }
 }

@@ -170,6 +170,18 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/events/{id}", get(get_event_handler))
         .route("/api/v1/incidents", get(list_incidents_handler))
         .route("/api/v1/incidents/{id}", get(get_incident_handler))
+        .route(
+            "/api/v1/incidents/{id}/timeline",
+            get(get_incident_timeline_handler),
+        )
+        .route(
+            "/api/v1/incidents/{id}/evidence",
+            get(get_incident_evidence_handler),
+        )
+        .route(
+            "/api/v1/incidents/{id}/graph",
+            get(get_incident_graph_handler),
+        )
         .route("/api/v1/ws", get(ws_handler))
         .layer(TraceLayer::new_for_http())
         // Guard against oversized request DOS (limit to 1MB)
@@ -362,28 +374,73 @@ async fn list_incidents_handler(
     })))
 }
 
-async fn get_incident_handler(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
-    let incident_opt = state.storage.get_incident_by_id(id).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiErrorResponse {
-                error: e.to_string(),
-                code: 500,
-            }),
-        )
-    })?;
+async fn get_incident_or_404(
+    state: &AppState,
+    identifier: &str,
+) -> Result<obschain_core::Incident, (StatusCode, Json<ApiErrorResponse>)> {
+    let incident_opt = state
+        .storage
+        .get_incident_by_id_or_case_id(identifier)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorResponse {
+                    error: e.to_string(),
+                    code: 500,
+                }),
+            )
+        })?;
 
-    match incident_opt {
-        Some(incident) => Ok(Json(incident)),
-        None => Err((
+    incident_opt.ok_or_else(|| {
+        (
             StatusCode::NOT_FOUND,
             Json(ApiErrorResponse {
-                error: format!("Incident with id '{id}' not found"),
+                error: format!("Incident '{identifier}' not found"),
                 code: 404,
             }),
-        )),
-    }
+        )
+    })
+}
+
+async fn get_incident_handler(
+    State(state): State<AppState>,
+    Path(identifier): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
+    let incident = get_incident_or_404(&state, &identifier).await?;
+    Ok(Json(incident))
+}
+
+async fn get_incident_timeline_handler(
+    State(state): State<AppState>,
+    Path(identifier): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
+    let incident = get_incident_or_404(&state, &identifier).await?;
+    Ok(Json(serde_json::json!({
+        "incident_id": incident.id,
+        "case_id": incident.case_id,
+        "timeline": incident.timeline,
+        "count": incident.timeline.len(),
+    })))
+}
+
+async fn get_incident_evidence_handler(
+    State(state): State<AppState>,
+    Path(identifier): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
+    let incident = get_incident_or_404(&state, &identifier).await?;
+    Ok(Json(serde_json::json!({
+        "incident_id": incident.id,
+        "case_id": incident.case_id,
+        "evidence": incident.evidence,
+        "count": incident.evidence.len(),
+    })))
+}
+
+async fn get_incident_graph_handler(
+    State(state): State<AppState>,
+    Path(identifier): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
+    let incident = get_incident_or_404(&state, &identifier).await?;
+    Ok(Json(incident.graph))
 }

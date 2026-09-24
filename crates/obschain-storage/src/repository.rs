@@ -4,10 +4,7 @@ use std::{
 };
 
 use chrono::Utc;
-use obschain_core::{
-    ChainEvent, ConfidenceLevel, EventSeverity, EventType, Evidence, EvidenceType, Incident,
-    IncidentStatus, ProvenanceClassification, Source, TimelineEvent,
-};
+use obschain_core::{ChainEvent, ConfidenceLevel, EventSeverity, EventType, Incident};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -43,6 +40,10 @@ pub trait IncidentRepository: Send + Sync {
         offset: usize,
     ) -> Result<Vec<Incident>, StorageError>;
     async fn get_incident_by_id(&self, id: Uuid) -> Result<Option<Incident>, StorageError>;
+    async fn get_incident_by_id_or_case_id(
+        &self,
+        identifier: &str,
+    ) -> Result<Option<Incident>, StorageError>;
 }
 
 /// Thread-safe in-memory event and incident store with bounded retention.
@@ -73,15 +74,27 @@ impl InMemoryStorage {
             incidents: Arc::new(RwLock::new(Vec::new())),
             max_events,
         };
+        storage.seed_canonical_incidents();
         storage.seed_mock_data();
         storage
     }
 
     pub fn new_empty(max_events: usize) -> Self {
-        Self {
+        let storage = Self {
             events: Arc::new(RwLock::new(VecDeque::with_capacity(max_events.min(1000)))),
             incidents: Arc::new(RwLock::new(Vec::new())),
             max_events,
+        };
+        storage.seed_canonical_incidents();
+        storage
+    }
+
+    pub fn seed_canonical_incidents(&self) {
+        let liquid_incident = obschain_incidents::create_liquid_2026_incident();
+        if let Ok(mut lock) = self.incidents.write() {
+            if !lock.iter().any(|i| i.case_id == liquid_incident.case_id) {
+                lock.push(liquid_incident);
+            }
         }
     }
 
@@ -160,107 +173,6 @@ impl InMemoryStorage {
             lock.push_back(ev1);
             lock.push_back(ev2);
             lock.push_back(ev3);
-        }
-
-        // Sample Incident: Exchange Hot Wallet Extraction
-        let incident_id = Uuid::parse_str("b0000000-0000-0000-0000-000000000001").unwrap();
-        let evidence_id1 = Uuid::parse_str("c0000000-0000-0000-0000-000000000001").unwrap();
-        let evidence_id2 = Uuid::parse_str("c0000000-0000-0000-0000-000000000002").unwrap();
-
-        let incident = Incident {
-            id: incident_id,
-            title: "Simulated Exchange Cold-to-Hot Dispersal Anomaly".to_string(),
-            summary: "Rapid multi-stage dispersal of 1,200 BTC from known reserve clusters into newly created Taproot addresses."
-                .to_string(),
-            status: IncidentStatus::Investigating,
-            severity: EventSeverity::Critical,
-            total_btc_affected: 1200.0,
-            total_btc_recovered: 0.0,
-            first_observed_at: now - chrono::Duration::days(1),
-            last_updated_at: now - chrono::Duration::minutes(40),
-            facts: vec![
-                "Block 884800 confirmed transaction 9f23... transferring 1,200.00 BTC."
-                    .to_string(),
-                "Output scripts utilize P2TR (Taproot key-path spending).".to_string(),
-                "Funds were split into 24 distinct 50 BTC tranches within 3 blocks."
-                    .to_string(),
-            ],
-            reported_claims: vec![
-                "Security advisory reports unauthorized API key compromise at Exchange X."
-                    .to_string(),
-            ],
-            unverified_claims: vec![
-                "Social media claims attributing destination addresses to specific entity are currently unverified heuristic clusters."
-                    .to_string(),
-            ],
-            associated_txids: vec![
-                "9f238b7d415f3e9a117cf6b4887321e06fa78e124efbda7128f522f87a8b30d1".to_string(),
-                "3c914bf6874229dafe11029c4ba598007e2cf1796b341f2e1a3bc89110ab78f2".to_string(),
-            ],
-            associated_block_heights: vec![884800, 884801, 884803],
-            timeline: vec![
-                TimelineEvent {
-                    id: Uuid::new_v4(),
-                    timestamp: now - chrono::Duration::hours(24),
-                    title: "First Dispersal Tx Confirmed".to_string(),
-                    description: "Initial 1,200 BTC split into four 300 BTC intermediate UTXOs."
-                        .to_string(),
-                    evidence_id: Some(evidence_id1),
-                    classification: ProvenanceClassification::OnChainVerified,
-                },
-                TimelineEvent {
-                    id: Uuid::new_v4(),
-                    timestamp: now - chrono::Duration::hours(18),
-                    title: "Security Advisory Published".to_string(),
-                    description: "Exchange published preliminary post-incident notification."
-                        .to_string(),
-                    evidence_id: Some(evidence_id2),
-                    classification: ProvenanceClassification::OfficiallyAttributed,
-                },
-            ],
-            evidence: vec![
-                Evidence {
-                    id: evidence_id1,
-                    incident_id,
-                    evidence_type: EvidenceType::OnChainTransaction,
-                    classification: ProvenanceClassification::OnChainVerified,
-                    description: "Initial dispersal transaction on Bitcoin mainnet".to_string(),
-                    reference:
-                        "9f238b7d415f3e9a117cf6b4887321e06fa78e124efbda7128f522f87a8b30d1"
-                            .to_string(),
-                    raw_data: Some(serde_json::json!({
-                        "is_mock": true,
-                        "confirmations": 144,
-                        "value_btc": 1200.0
-                    })),
-                    created_at: now - chrono::Duration::hours(24),
-                },
-                Evidence {
-                    id: evidence_id2,
-                    incident_id,
-                    evidence_type: EvidenceType::OfficialStatement,
-                    classification: ProvenanceClassification::OfficiallyAttributed,
-                    description: "Cryptographically signed confirmation from affected custodian"
-                        .to_string(),
-                    reference: "https://advisories.example.org/sec-2026-001".to_string(),
-                    raw_data: Some(serde_json::json!({
-                        "is_mock": true,
-                        "signature_type": "secp256k1"
-                    })),
-                    created_at: now - chrono::Duration::hours(18),
-                },
-            ],
-            sources: vec![Source {
-                id: Uuid::new_v4(),
-                name: "ObsChain Bitcoin Node Telemetry".to_string(),
-                url: Some("https://obschain.internal/status".to_string()),
-                reliability_score: 1.0,
-                published_at: Some(now - chrono::Duration::hours(24)),
-            }],
-        };
-
-        if let Ok(mut lock) = self.incidents.write() {
-            lock.push(incident);
         }
     }
 }
@@ -350,6 +262,26 @@ impl IncidentRepository for InMemoryStorage {
             .read()
             .map_err(|e| StorageError::Database(e.to_string()))?;
         Ok(lock.iter().find(|i| i.id == id).cloned())
+    }
+
+    async fn get_incident_by_id_or_case_id(
+        &self,
+        identifier: &str,
+    ) -> Result<Option<Incident>, StorageError> {
+        let lock = self
+            .incidents
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        if let Ok(parsed_uuid) = Uuid::parse_str(identifier) {
+            if let Some(inc) = lock.iter().find(|i| i.id == parsed_uuid) {
+                return Ok(Some(inc.clone()));
+            }
+        }
+        Ok(lock
+            .iter()
+            .find(|i| i.case_id.eq_ignore_ascii_case(identifier))
+            .cloned())
     }
 }
 

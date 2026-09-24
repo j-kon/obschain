@@ -8,6 +8,9 @@ pub enum CoreError {
     #[error("Validation failed: {0}")]
     ValidationError(String),
 
+    #[error("Validation failed: {0}")]
+    Validation(String),
+
     #[error("Provenance integrity violation: {0}")]
     ProvenanceViolation(String),
 

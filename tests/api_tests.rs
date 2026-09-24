@@ -92,6 +92,98 @@ async fn test_list_incidents() {
 
     let res = app.oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let incidents = json["incidents"].as_array().unwrap();
+    assert!(
+        !incidents.is_empty(),
+        "Should return seeded canonical incident"
+    );
+    assert_eq!(incidents[0]["case_id"], "OC-2026-0001");
+}
+
+#[tokio::test]
+async fn test_get_incident_by_case_id_and_uuid() {
+    // 1. By Case ID: OC-2026-0001
+    let app1 = test_app();
+    let req1 = Request::builder()
+        .uri("/api/v1/incidents/OC-2026-0001")
+        .body(Body::empty())
+        .unwrap();
+    let res1 = app1.oneshot(req1).await.unwrap();
+    assert_eq!(res1.status(), StatusCode::OK);
+
+    let body1 = axum::body::to_bytes(res1.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let incident: obschain_core::Incident = serde_json::from_slice(&body1).unwrap();
+    assert_eq!(incident.case_id, "OC-2026-0001");
+    assert_eq!(incident.recovery.affected_sats, 399_602_000_000);
+    assert_eq!(incident.recovery.recovered_sats, 340_000_000_000);
+    assert_eq!(incident.recovery.outstanding_sats, 59_602_000_000);
+
+    // 2. By UUID
+    let app2 = test_app();
+    let req2 = Request::builder()
+        .uri(format!("/api/v1/incidents/{}", incident.id))
+        .body(Body::empty())
+        .unwrap();
+    let res2 = app2.oneshot(req2).await.unwrap();
+    assert_eq!(res2.status(), StatusCode::OK);
+
+    // 3. Not Found
+    let app3 = test_app();
+    let req3 = Request::builder()
+        .uri("/api/v1/incidents/OC-NONEXISTENT")
+        .body(Body::empty())
+        .unwrap();
+    let res3 = app3.oneshot(req3).await.unwrap();
+    assert_eq!(res3.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_get_incident_subresources() {
+    let app = test_app();
+
+    // Timeline sub-resource
+    let req = Request::builder()
+        .uri("/api/v1/incidents/OC-2026-0001/timeline")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["timeline"].as_array().unwrap().len() >= 10);
+
+    // Evidence sub-resource
+    let app2 = test_app();
+    let req2 = Request::builder()
+        .uri("/api/v1/incidents/OC-2026-0001/evidence")
+        .body(Body::empty())
+        .unwrap();
+    let res2 = app2.oneshot(req2).await.unwrap();
+    assert_eq!(res2.status(), StatusCode::OK);
+
+    // Graph sub-resource
+    let app3 = test_app();
+    let req3 = Request::builder()
+        .uri("/api/v1/incidents/OC-2026-0001/graph")
+        .body(Body::empty())
+        .unwrap();
+    let res3 = app3.oneshot(req3).await.unwrap();
+    assert_eq!(res3.status(), StatusCode::OK);
+    let graph_body = axum::body::to_bytes(res3.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let graph: obschain_core::IncidentGraph = serde_json::from_slice(&graph_body).unwrap();
+    assert!(!graph.nodes.is_empty());
+    assert!(!graph.edges.is_empty());
 }
 
 #[tokio::test]

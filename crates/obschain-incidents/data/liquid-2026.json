@@ -1,0 +1,742 @@
+{
+  "id": "0c202600-0001-0000-0000-000000000001",
+  "case_id": "OC-2026-0001",
+  "title": "Liquid Network Security Incident",
+  "summary": "Consensus-critical range-proof verification cache flaw in Elements software resulting in unauthorized creation of unbacked L-BTC and extraction of Bitcoin mainnet reserves via peg-out, followed by partial fund return.",
+  "status": "MONITORING",
+  "severity": "CRITICAL",
+  "recovery": {
+    "affected_sats": 399602000000,
+    "recovered_sats": 340000000000,
+    "outstanding_sats": 59602000000,
+    "as_of_timestamp": "2026-09-23T00:00:00Z",
+    "source": "Blockstream Official Assessment (23 September 2026)",
+    "is_estimate": false
+  },
+  "first_observed_at": "2026-09-06T13:53:00Z",
+  "last_updated_at": "2026-09-23T00:00:00Z",
+  "structured_claims": {
+    "verified_on_chain": [
+      "Liquid exploit transaction f24a4b179b5cc7e88b25a763911f7cbdf2bf45d1d1b5ab611e94461cef0a183f confirmed in Liquid block 4,050,336 accepted unbacked L-BTC outputs.",
+      "Bitcoin peg-out transaction 8db751a650ae2f12006b7e8c69a75e4df360e8afd6b9e05ae0b9fa6458a7b140 confirmed in Bitcoin block 965,783 releasing 3,996.02 BTC from federation reserves.",
+      "Bitcoin return transaction a6d697a25266ce3c78774fd1d75f896b7af522ada209b0f6228ea497bc49a46d confirmed in Bitcoin block 965,950 returning 3,400.00 BTC to federation address.",
+      "On-chain message 'we are whitehats. contact us on chain.' confirmed in Bitcoin block 965,818 (txid c103de95817b43f2df635ec6f35ff126ca26a7c6d20570c4b01866b2b3e69a19).",
+      "On-chain response 'Please contact security@blockstream.com.' confirmed in Bitcoin block 965,822 (txid 91271efcbb5ab29abfc38ae635f0644e3ba042aad56f92d40136e1dde4742fe8)."
+    ],
+    "officially_attributed": [
+      "Blockstream assessment attributes exploit to range proof verification cache key collision in Elements software.",
+      "SideSwap confirmed no private key or Peg-out Authorization Key (PAK) compromise occurred.",
+      "Liquid federation bridge nodes were halted at September 6, 2026 18:26 UTC to contain further withdrawals.",
+      "Elements PR #1600 merged to implement length-framed CHashWriter cache key serialization and -norangeproofcache option."
+    ],
+    "reported": [
+      "Security research firms reported peak affected assets of approximately $320M USD at market prices during the exploit.",
+      "Blockstream official assessment reported approximately 602 BTC remained outstanding as of September 23, 2026."
+    ],
+    "heuristic": [
+      "Analysis of intermediate peg-out outputs indicates multi-hop forwarding behavior typical of automated liquidity aggregation."
+    ],
+    "unknown": [
+      "Real-world identity and legal jurisdiction of the exploit actor.",
+      "Whether the actor's self-identification as 'white hat' represents genuine ethical intent or strategic negotiation posturing.",
+      "Final resolution or recovery status of remaining ~602 BTC beyond the September 23 assessment cutoff."
+    ]
+  },
+  "entities": [
+    {
+      "id": "479b25d1-892c-4cd8-abe2-83d9d5727548",
+      "name": "Liquid Federation",
+      "entity_type": "Federation",
+      "description": "Decentralized federation maintaining the Liquid Network 2-way peg wallet",
+      "attribution_confidence": "OFFICIALLY_ATTRIBUTED"
+    },
+    {
+      "id": "5a538b11-eff3-47d4-acce-da04684ac592",
+      "name": "Blockstream",
+      "entity_type": "Core Maintainer",
+      "description": "Core technical maintainer of Elements and coordinator of Liquid bridge remediation",
+      "attribution_confidence": "OFFICIALLY_ATTRIBUTED"
+    },
+    {
+      "id": "27fd6295-9e16-4ab4-928c-04fa9dd35009",
+      "name": "SideSwap",
+      "entity_type": "Routing Service",
+      "description": "Swap and peg-out service whose automated infrastructure was utilized during withdrawal",
+      "attribution_confidence": "OFFICIALLY_ATTRIBUTED"
+    },
+    {
+      "id": "3d819f38-3254-4002-b344-b3957596cb5d",
+      "name": "Exploit Actor",
+      "entity_type": "Unidentified Actor",
+      "description": "Unidentified entity who exploited rangeproof cache and self-identified as whitehat on-chain",
+      "attribution_confidence": "UNVERIFIED"
+    }
+  ],
+  "transactions": [
+    {
+      "chain": "LIQUID",
+      "txid": "f24a4b179b5cc7e88b25a763911f7cbdf2bf45d1d1b5ab611e94461cef0a183f",
+      "role": "EXPLOIT",
+      "amount_sats": 400000000000,
+      "block_height": 4050336,
+      "block_hash": null,
+      "confirmed_at": "2026-09-06T13:53:00Z",
+      "evidence_id": "0c202600-0001-0002-0000-000000000001",
+      "notes": "Accepted on Liquid sidechain creating unbacked L-BTC"
+    },
+    {
+      "chain": "BITCOIN",
+      "txid": "8db751a650ae2f12006b7e8c69a75e4df360e8afd6b9e05ae0b9fa6458a7b140",
+      "role": "PEG_OUT",
+      "amount_sats": 399602000000,
+      "block_height": 965783,
+      "block_hash": null,
+      "confirmed_at": "2026-09-06T14:28:56Z",
+      "evidence_id": "0c202600-0001-0002-0000-000000000002",
+      "notes": "Federation multisig payout confirming peg-out on Bitcoin mainnet"
+    },
+    {
+      "chain": "BITCOIN",
+      "txid": "c103de95817b43f2df635ec6f35ff126ca26a7c6d20570c4b01866b2b3e69a19",
+      "role": "COMMUNICATION",
+      "amount_sats": null,
+      "block_height": 965818,
+      "block_hash": null,
+      "confirmed_at": "2026-09-06T18:30:10Z",
+      "evidence_id": null,
+      "notes": "On-chain message: 'we are whitehats. contact us on chain.'"
+    },
+    {
+      "chain": "BITCOIN",
+      "txid": "91271efcbb5ab29abfc38ae635f0644e3ba042aad56f92d40136e1dde4742fe8",
+      "role": "COMMUNICATION",
+      "amount_sats": null,
+      "block_height": 965822,
+      "block_hash": null,
+      "confirmed_at": "2026-09-06T19:31:47Z",
+      "evidence_id": null,
+      "notes": "On-chain response: 'Please contact security@blockstream.com.'"
+    },
+    {
+      "chain": "BITCOIN",
+      "txid": "a6d697a25266ce3c78774fd1d75f896b7af522ada209b0f6228ea497bc49a46d",
+      "role": "RETURN",
+      "amount_sats": 340000000000,
+      "block_height": 965950,
+      "block_hash": null,
+      "confirmed_at": "2026-09-07T16:09:00Z",
+      "evidence_id": "0c202600-0001-0002-0000-000000000003",
+      "notes": "3,400.00 BTC returned to federation peg address"
+    }
+  ],
+  "blocks": [
+    {
+      "chain": "LIQUID",
+      "height": 4050336,
+      "hash": "liquid-block-4050336",
+      "timestamp": "2026-09-06T13:53:00Z",
+      "tx_count": 1,
+      "evidence_id": "0c202600-0001-0002-0000-000000000001"
+    },
+    {
+      "chain": "BITCOIN",
+      "height": 965783,
+      "hash": "btc-block-965783",
+      "timestamp": "2026-09-06T14:28:56Z",
+      "tx_count": 3500,
+      "evidence_id": "0c202600-0001-0002-0000-000000000002"
+    },
+    {
+      "chain": "BITCOIN",
+      "height": 965950,
+      "hash": "btc-block-965950",
+      "timestamp": "2026-09-07T16:09:00Z",
+      "tx_count": 3200,
+      "evidence_id": "0c202600-0001-0002-0000-000000000003"
+    }
+  ],
+  "on_chain_messages": [
+    {
+      "txid": "c103de95817b43f2df635ec6f35ff126ca26a7c6d20570c4b01866b2b3e69a19",
+      "chain": "BITCOIN",
+      "encoding": "OP_RETURN (UTF-8)",
+      "decoded_text": "we are whitehats. contact us on chain.",
+      "raw_hex": "6a25776520617265207768697465686174732e20636f6e74616374207573206f6e20636861696e2e",
+      "confirmed_at": "2026-09-06T18:30:10Z",
+      "block_height": 965818,
+      "attributed_sender": "Self-described white hat actor",
+      "sender_attribution_confidence": "UNVERIFIED"
+    },
+    {
+      "txid": "91271efcbb5ab29abfc38ae635f0644e3ba042aad56f92d40136e1dde4742fe8",
+      "chain": "BITCOIN",
+      "encoding": "OP_RETURN (UTF-8)",
+      "decoded_text": "Please contact security@blockstream.com.",
+      "raw_hex": "6a27506c6561736520636f6e7461637420736563757269747940626c6f636b73747265616d2e636f6d2e",
+      "confirmed_at": "2026-09-06T19:31:47Z",
+      "block_height": 965822,
+      "attributed_sender": "Blockstream Security Team",
+      "sender_attribution_confidence": "OFFICIALLY_ATTRIBUTED"
+    }
+  ],
+  "timeline": [
+    {
+      "id": "2a75a2df-9377-41c4-bd14-2efa5e1ea705",
+      "timestamp": "2026-09-06T13:53:00Z",
+      "title": "Exploit Transaction Accepted on Liquid",
+      "description": "Invalid Liquid transaction f24a4b17... accepted in block 4,050,336 creating ~4,000 unbacked L-BTC.",
+      "category": "EXPLOIT",
+      "source_id": "0c202600-0001-0001-0000-000000000003",
+      "evidence_ids": [
+        "0c202600-0001-0002-0000-000000000001"
+      ],
+      "transaction_txids": [
+        "f24a4b179b5cc7e88b25a763911f7cbdf2bf45d1d1b5ab611e94461cef0a183f"
+      ],
+      "block_heights": [
+        4050336
+      ],
+      "classification": "ON_CHAIN_VERIFIED"
+    },
+    {
+      "id": "423c8a3c-57fd-41d1-acad-244b0a807aec",
+      "timestamp": "2026-09-06T14:00:00Z",
+      "title": "Small Peg-Out Test Executed",
+      "description": "Official report notes preliminary test peg-out executed to verify withdrawal routing.",
+      "category": "ON_CHAIN_MOVEMENT",
+      "source_id": "0c202600-0001-0001-0000-000000000001",
+      "evidence_ids": [],
+      "transaction_txids": [],
+      "block_heights": [],
+      "classification": "OFFICIALLY_ATTRIBUTED"
+    },
+    {
+      "id": "c66ef89f-e99b-457a-9f5a-b3a717a27920",
+      "timestamp": "2026-09-06T14:05:00Z",
+      "title": "Large L-BTC Peg-Out Deposit Processed",
+      "description": "Attacker routed unbacked L-BTC to SideSwap peg-out infrastructure.",
+      "category": "ON_CHAIN_MOVEMENT",
+      "source_id": "0c202600-0001-0001-0000-000000000001",
+      "evidence_ids": [],
+      "transaction_txids": [],
+      "block_heights": [],
+      "classification": "OFFICIALLY_ATTRIBUTED"
+    },
+    {
+      "id": "d776e0ff-3ba1-48d0-9cc1-1b7e79f270f8",
+      "timestamp": "2026-09-06T14:28:56Z",
+      "title": "Federation Release of 3,996.02 BTC Confirmed on Bitcoin",
+      "description": "Bitcoin transaction 8db751a6... confirmed in block 965,783 paying out ~3,996.02 BTC from Liquid reserves.",
+      "category": "ON_CHAIN_MOVEMENT",
+      "source_id": "0c202600-0001-0001-0000-000000000002",
+      "evidence_ids": [
+        "0c202600-0001-0002-0000-000000000002"
+      ],
+      "transaction_txids": [
+        "8db751a650ae2f12006b7e8c69a75e4df360e8afd6b9e05ae0b9fa6458a7b140"
+      ],
+      "block_heights": [
+        965783
+      ],
+      "classification": "ON_CHAIN_VERIFIED"
+    },
+    {
+      "id": "cb4bf24b-dc28-4daa-8623-05a07561e965",
+      "timestamp": "2026-09-06T18:26:00Z",
+      "title": "Liquid Federation Bridge Nodes Halted",
+      "description": "Functionaries paused federation bridge nodes to prevent additional peg-out executions.",
+      "category": "CONTAINMENT",
+      "source_id": "0c202600-0001-0001-0000-000000000001",
+      "evidence_ids": [],
+      "transaction_txids": [],
+      "block_heights": [],
+      "classification": "OFFICIALLY_ATTRIBUTED"
+    },
+    {
+      "id": "f6efb373-ba22-473c-a71c-f66a466cff7d",
+      "timestamp": "2026-09-06T18:30:10Z",
+      "title": "Actor Posts Initial On-Chain Message",
+      "description": "Transaction c103de95... confirmed in block 965,818 containing OP_RETURN 'we are whitehats. contact us on chain.'",
+      "category": "COMMUNICATION",
+      "source_id": "0c202600-0001-0001-0000-000000000002",
+      "evidence_ids": [],
+      "transaction_txids": [
+        "c103de95817b43f2df635ec6f35ff126ca26a7c6d20570c4b01866b2b3e69a19"
+      ],
+      "block_heights": [
+        965818
+      ],
+      "classification": "ON_CHAIN_VERIFIED"
+    },
+    {
+      "id": "0e7c04c0-2335-40ab-84d2-d18d3db85a6b",
+      "timestamp": "2026-09-06T19:31:47Z",
+      "title": "Blockstream Responds On-Chain",
+      "description": "Transaction 91271efc... confirmed in block 965,822 directing actor to contact security@blockstream.com.",
+      "category": "COMMUNICATION",
+      "source_id": "0c202600-0001-0001-0000-000000000002",
+      "evidence_ids": [],
+      "transaction_txids": [
+        "91271efcbb5ab29abfc38ae635f0644e3ba042aad56f92d40136e1dde4742fe8"
+      ],
+      "block_heights": [
+        965822
+      ],
+      "classification": "ON_CHAIN_VERIFIED"
+    },
+    {
+      "id": "0bc61a0b-d364-429a-a71f-666c8e552f9c",
+      "timestamp": "2026-09-06T20:25:00Z",
+      "title": "Public Incident Disclosure",
+      "description": "Blockstream published initial public security advisory acknowledging Liquid reserve exploit.",
+      "category": "DISCLOSURE",
+      "source_id": "0c202600-0001-0001-0000-000000000001",
+      "evidence_ids": [],
+      "transaction_txids": [],
+      "block_heights": [],
+      "classification": "OFFICIALLY_ATTRIBUTED"
+    },
+    {
+      "id": "9e5e1ec5-dcd2-4c5a-816d-672216195ddf",
+      "timestamp": "2026-09-07T01:09:00Z",
+      "title": "Emergency Interim Patch Deployed",
+      "description": "Bridge nodes restarted with range-proof verification cache disabled (-norangeproofcache).",
+      "category": "PATCH",
+      "source_id": "0c202600-0001-0001-0000-000000000001",
+      "evidence_ids": [],
+      "transaction_txids": [],
+      "block_heights": [],
+      "classification": "OFFICIALLY_ATTRIBUTED"
+    },
+    {
+      "id": "4960f4af-2823-4011-b7d7-f7b1ae78d06c",
+      "timestamp": "2026-09-07T16:09:00Z",
+      "title": "3,400 BTC Returned on Bitcoin Mainnet",
+      "description": "Transaction a6d697a2... confirmed in block 965,950 returning 3,400.00 BTC to Liquid federation address.",
+      "category": "RECOVERY",
+      "source_id": "0c202600-0001-0001-0000-000000000002",
+      "evidence_ids": [
+        "0c202600-0001-0002-0000-000000000003"
+      ],
+      "transaction_txids": [
+        "a6d697a25266ce3c78774fd1d75f896b7af522ada209b0f6228ea497bc49a46d"
+      ],
+      "block_heights": [
+        965950
+      ],
+      "classification": "ON_CHAIN_VERIFIED"
+    },
+    {
+      "id": "77a7844a-9351-4548-ae19-966c72245ae1",
+      "timestamp": "2026-09-08T12:00:00Z",
+      "title": "Elements PR #1600 Hardened Fix Merged",
+      "description": "Permanent fix with CHashWriter explicit framing merged into Elements master branch.",
+      "category": "PATCH",
+      "source_id": "0c202600-0001-0001-0000-000000000004",
+      "evidence_ids": [
+        "0c202600-0001-0002-0000-000000000004"
+      ],
+      "transaction_txids": [],
+      "block_heights": [],
+      "classification": "OFFICIALLY_ATTRIBUTED"
+    },
+    {
+      "id": "f4b03e6f-bb2e-417c-9c63-a7c8cc26751a",
+      "timestamp": "2026-09-09T08:00:00Z",
+      "title": "Elements v23.3.4 Formally Released",
+      "description": "Release build made available for all Liquid node operators.",
+      "category": "PATCH",
+      "source_id": "0c202600-0001-0001-0000-000000000004",
+      "evidence_ids": [],
+      "transaction_txids": [],
+      "block_heights": [],
+      "classification": "OFFICIALLY_ATTRIBUTED"
+    },
+    {
+      "id": "a2556fd1-f880-4a67-b18f-a38828bd7a7e",
+      "timestamp": "2026-09-09T18:00:00Z",
+      "title": "Corrected Liquid Sidechain Resumes",
+      "description": "Block production on the Liquid sidechain resumed under consensus validation of v23.3.4.",
+      "category": "NETWORK_RESTART",
+      "source_id": "0c202600-0001-0001-0000-000000000001",
+      "evidence_ids": [],
+      "transaction_txids": [],
+      "block_heights": [],
+      "classification": "OFFICIALLY_ATTRIBUTED"
+    },
+    {
+      "id": "82857181-989b-425a-9304-4d4ca91c54db",
+      "timestamp": "2026-09-10T14:00:00Z",
+      "title": "Transaction Processing Fully Restored",
+      "description": "General transaction processing and standard sidechain operations resumed.",
+      "category": "NETWORK_RESTART",
+      "source_id": "0c202600-0001-0001-0000-000000000001",
+      "evidence_ids": [],
+      "transaction_txids": [],
+      "block_heights": [],
+      "classification": "OFFICIALLY_ATTRIBUTED"
+    }
+  ],
+  "evidence": [
+    {
+      "id": "0c202600-0001-0002-0000-000000000001",
+      "incident_id": "0c202600-0001-0000-0000-000000000001",
+      "evidence_type": "ON_CHAIN_TRANSACTION",
+      "confidence": "ON_CHAIN_VERIFIED",
+      "title": "Liquid Exploit Transaction Confirmed",
+      "description": "Transaction f24a4b179b5cc7e88b25a763911f7cbdf2bf45d1d1b5ab611e94461cef0a183f was accepted in Liquid block 4,050,336, exploiting rangeproof cache ambiguity to mint unbacked L-BTC.",
+      "observed_at": "2026-09-06T13:53:00Z",
+      "source_id": "0c202600-0001-0001-0000-000000000003",
+      "source_reference": "liquid_block_4050336",
+      "txid": "f24a4b179b5cc7e88b25a763911f7cbdf2bf45d1d1b5ab611e94461cef0a183f",
+      "block_hash": null,
+      "block_height": 4050336,
+      "chain": "LIQUID",
+      "verified": true,
+      "raw_data": {
+        "block_height": 4050336,
+        "chain": "liquid",
+        "minted_unbacked_lbtc_approx": 4000
+      },
+      "created_at": "2026-09-06T13:53:00Z",
+      "reference": "Liquid Block 4,050,336",
+      "classification": "ON_CHAIN_VERIFIED"
+    },
+    {
+      "id": "0c202600-0001-0002-0000-000000000002",
+      "incident_id": "0c202600-0001-0000-0000-000000000001",
+      "evidence_type": "ON_CHAIN_TRANSACTION",
+      "confidence": "ON_CHAIN_VERIFIED",
+      "title": "Bitcoin Federation Peg-Out Transaction Confirmed",
+      "description": "Bitcoin transaction 8db751a650ae2f12006b7e8c69a75e4df360e8afd6b9e05ae0b9fa6458a7b140 released 3,996.02 BTC from Liquid federation multi-sig reserve on Bitcoin mainnet.",
+      "observed_at": "2026-09-06T14:28:56Z",
+      "source_id": "0c202600-0001-0001-0000-000000000002",
+      "source_reference": "btc_block_965783",
+      "txid": "8db751a650ae2f12006b7e8c69a75e4df360e8afd6b9e05ae0b9fa6458a7b140",
+      "block_hash": null,
+      "block_height": 965783,
+      "chain": "BITCOIN",
+      "verified": true,
+      "raw_data": {
+        "block_height": 965783,
+        "chain": "bitcoin",
+        "released_sats": 399602000000
+      },
+      "created_at": "2026-09-06T14:28:56Z",
+      "reference": "Bitcoin Block 965,783",
+      "classification": "ON_CHAIN_VERIFIED"
+    },
+    {
+      "id": "0c202600-0001-0002-0000-000000000003",
+      "incident_id": "0c202600-0001-0000-0000-000000000001",
+      "evidence_type": "ON_CHAIN_TRANSACTION",
+      "confidence": "ON_CHAIN_VERIFIED",
+      "title": "Return of 3,400 BTC Confirmed on Bitcoin Mainnet",
+      "description": "Bitcoin transaction a6d697a25266ce3c78774fd1d75f896b7af522ada209b0f6228ea497bc49a46d confirmed in block 965950 returning 3,400.00 BTC to federation-controlled address.",
+      "observed_at": "2026-09-07T16:09:00Z",
+      "source_id": "0c202600-0001-0001-0000-000000000002",
+      "source_reference": "btc_block_965950",
+      "txid": "a6d697a25266ce3c78774fd1d75f896b7af522ada209b0f6228ea497bc49a46d",
+      "block_hash": null,
+      "block_height": 965950,
+      "chain": "BITCOIN",
+      "verified": true,
+      "raw_data": {
+        "block_height": 965950,
+        "chain": "bitcoin",
+        "returned_sats": 340000000000
+      },
+      "created_at": "2026-09-07T16:09:00Z",
+      "reference": "Bitcoin Block 965,950",
+      "classification": "ON_CHAIN_VERIFIED"
+    },
+    {
+      "id": "0c202600-0001-0002-0000-000000000004",
+      "incident_id": "0c202600-0001-0000-0000-000000000001",
+      "evidence_type": "SOURCE_REPOSITORY",
+      "confidence": "OFFICIALLY_ATTRIBUTED",
+      "title": "Elements PR #1600 Security Patch",
+      "description": "Pull request #1600 (commit 9400096) in ElementsProject/elements repository replacing raw byte concatenation with CHashWriter explicit framing in range proof cache.",
+      "observed_at": "2026-09-08T12:00:00Z",
+      "source_id": "0c202600-0001-0001-0000-000000000004",
+      "source_reference": "github_pr_1600",
+      "txid": null,
+      "block_hash": null,
+      "block_height": null,
+      "chain": "LIQUID",
+      "verified": true,
+      "raw_data": {
+        "commit": "9400096",
+        "pr_number": 1600,
+        "repository": "ElementsProject/elements"
+      },
+      "created_at": "2026-09-08T12:00:00Z",
+      "reference": "GitHub PR #1600",
+      "classification": "OFFICIALLY_ATTRIBUTED"
+    }
+  ],
+  "sources": [
+    {
+      "id": "0c202600-0001-0001-0000-000000000001",
+      "publisher": "Blockstream",
+      "title": "Liquid Network Security Incident Assessment",
+      "url": "https://blockstream.com/liquid-network-security-incident-assessment/",
+      "publication_timestamp": "2026-09-23T00:00:00Z",
+      "retrieved_timestamp": "2026-09-23T00:00:00Z",
+      "source_category": "OFFICIAL_TECHNICAL_REPORT",
+      "reliability_score": 0.95,
+      "name": "Blockstream Technical Assessment"
+    },
+    {
+      "id": "0c202600-0001-0001-0000-000000000002",
+      "publisher": "Bitcoin Mainnet",
+      "title": "Bitcoin Blockchain (Mempool & Consensus)",
+      "url": "https://mempool.space",
+      "publication_timestamp": "2026-09-06T13:53:00Z",
+      "retrieved_timestamp": "2026-09-06T13:53:00Z",
+      "source_category": "BITCOIN_BLOCKCHAIN",
+      "reliability_score": 1.0,
+      "name": "Bitcoin Mainnet Ledger"
+    },
+    {
+      "id": "0c202600-0001-0001-0000-000000000003",
+      "publisher": "Liquid Network",
+      "title": "Liquid Network Sidechain Consensus",
+      "url": "https://blockstream.info/liquid",
+      "publication_timestamp": "2026-09-06T13:53:00Z",
+      "retrieved_timestamp": "2026-09-06T13:53:00Z",
+      "source_category": "LIQUID_BLOCKCHAIN",
+      "reliability_score": 1.0,
+      "name": "Liquid Sidechain Ledger"
+    },
+    {
+      "id": "0c202600-0001-0001-0000-000000000004",
+      "publisher": "ElementsProject",
+      "title": "Pull Request #1600: sigcache: harden range proof cache keys",
+      "url": "https://github.com/ElementsProject/elements/pull/1600",
+      "publication_timestamp": "2026-09-08T12:00:00Z",
+      "retrieved_timestamp": "2026-09-23T00:00:00Z",
+      "source_category": "SOURCE_REPOSITORY",
+      "reliability_score": 1.0,
+      "name": "ElementsProject GitHub Repository"
+    }
+  ],
+  "technical_findings": [
+    {
+      "component": "Elements",
+      "area": "Confidential transaction range proof verification cache",
+      "category": "Consensus-critical validation flaw",
+      "summary": "Distinct proof-related input tuples produced the same byte-concatenated cache-key input because fields were concatenated without unambiguous length framing.",
+      "root_cause_details": "The secp256k1 rangeproof verification cache serialized key data by raw concatenation without explicit length prefixes. This permitted crafting input parameters that collided with existing cached verification entries, causing invalid unbacked outputs to be treated as valid.",
+      "fix_summary": "Replaced raw byte concatenation with CHashWriter/SER_GETHASH explicit field framing and introduced the -norangeproofcache option.",
+      "repository_url": "https://github.com/ElementsProject/elements",
+      "pull_request_id": "1600",
+      "commit_hash": "9400096"
+    }
+  ],
+  "updates": [
+    {
+      "id": "08c83ea0-956b-40fc-9c43-77cc05b7b620",
+      "timestamp": "2026-09-23T00:00:00Z",
+      "title": "Official Assessment Published (~602 BTC Outstanding)",
+      "summary": "Blockstream published full post-incident assessment confirming 3,400 BTC returned and ~602 BTC outstanding subject to ongoing recovery.",
+      "source_id": "0c202600-0001-0001-0000-000000000001",
+      "recovery_state": {
+        "affected_sats": 399602000000,
+        "recovered_sats": 340000000000,
+        "outstanding_sats": 59602000000,
+        "as_of_timestamp": "2026-09-23T00:00:00Z",
+        "source": "Blockstream Official Assessment (23 September 2026)",
+        "is_estimate": false
+      }
+    }
+  ],
+  "graph": {
+    "nodes": [
+      {
+        "id": "tx:liquid_exploit",
+        "label": "Liquid Exploit Tx (4,000 L-BTC)",
+        "node_type": "TRANSACTION",
+        "chain": "LIQUID",
+        "metadata": {
+          "txid": "f24a4b179b5cc7e88b25a763911f7cbdf2bf45d1d1b5ab611e94461cef0a183f"
+        }
+      },
+      {
+        "id": "block:liquid_4050336",
+        "label": "Liquid Block #4,050,336",
+        "node_type": "BLOCK",
+        "chain": "LIQUID",
+        "metadata": null
+      },
+      {
+        "id": "tx:btc_pegout",
+        "label": "Bitcoin Peg-Out Tx (~3,996 BTC)",
+        "node_type": "TRANSACTION",
+        "chain": "BITCOIN",
+        "metadata": {
+          "txid": "8db751a650ae2f12006b7e8c69a75e4df360e8afd6b9e05ae0b9fa6458a7b140"
+        }
+      },
+      {
+        "id": "block:btc_965783",
+        "label": "Bitcoin Block #965,783",
+        "node_type": "BLOCK",
+        "chain": "BITCOIN",
+        "metadata": null
+      },
+      {
+        "id": "tx:actor_msg",
+        "label": "Actor Message: 'we are whitehats'",
+        "node_type": "TRANSACTION",
+        "chain": "BITCOIN",
+        "metadata": {
+          "txid": "c103de95817b43f2df635ec6f35ff126ca26a7c6d20570c4b01866b2b3e69a19"
+        }
+      },
+      {
+        "id": "tx:blockstream_reply",
+        "label": "Blockstream Response: 'contact security'",
+        "node_type": "TRANSACTION",
+        "chain": "BITCOIN",
+        "metadata": {
+          "txid": "91271efcbb5ab29abfc38ae635f0644e3ba042aad56f92d40136e1dde4742fe8"
+        }
+      },
+      {
+        "id": "tx:btc_return",
+        "label": "Bitcoin Return Tx (3,400 BTC)",
+        "node_type": "TRANSACTION",
+        "chain": "BITCOIN",
+        "metadata": {
+          "txid": "a6d697a25266ce3c78774fd1d75f896b7af522ada209b0f6228ea497bc49a46d"
+        }
+      },
+      {
+        "id": "block:btc_965950",
+        "label": "Bitcoin Block #965,950",
+        "node_type": "BLOCK",
+        "chain": "BITCOIN",
+        "metadata": null
+      },
+      {
+        "id": "entity:liquid_fed",
+        "label": "Liquid Federation",
+        "node_type": "ENTITY",
+        "chain": null,
+        "metadata": null
+      },
+      {
+        "id": "entity:blockstream",
+        "label": "Blockstream",
+        "node_type": "ENTITY",
+        "chain": null,
+        "metadata": null
+      },
+      {
+        "id": "evidence:elements_pr1600",
+        "label": "Elements PR #1600 Fix",
+        "node_type": "EVIDENCE",
+        "chain": "LIQUID",
+        "metadata": null
+      }
+    ],
+    "edges": [
+      {
+        "source": "tx:liquid_exploit",
+        "target": "block:liquid_4050336",
+        "relationship": "CONFIRMED_IN",
+        "confidence": "ON_CHAIN_VERIFIED"
+      },
+      {
+        "source": "tx:liquid_exploit",
+        "target": "tx:btc_pegout",
+        "relationship": "FORWARDS_TO",
+        "confidence": "OFFICIALLY_ATTRIBUTED"
+      },
+      {
+        "source": "tx:btc_pegout",
+        "target": "block:btc_965783",
+        "relationship": "CONFIRMED_IN",
+        "confidence": "ON_CHAIN_VERIFIED"
+      },
+      {
+        "source": "tx:btc_pegout",
+        "target": "tx:btc_return",
+        "relationship": "RETURNS_TO",
+        "confidence": "ON_CHAIN_VERIFIED"
+      },
+      {
+        "source": "tx:btc_return",
+        "target": "block:btc_965950",
+        "relationship": "CONFIRMED_IN",
+        "confidence": "ON_CHAIN_VERIFIED"
+      },
+      {
+        "source": "tx:actor_msg",
+        "target": "tx:blockstream_reply",
+        "relationship": "REFERENCES",
+        "confidence": "ON_CHAIN_VERIFIED"
+      },
+      {
+        "source": "evidence:elements_pr1600",
+        "target": "tx:liquid_exploit",
+        "relationship": "SUPPORTS",
+        "confidence": "OFFICIALLY_ATTRIBUTED"
+      },
+      {
+        "source": "entity:liquid_fed",
+        "target": "tx:btc_pegout",
+        "relationship": "SPENDS",
+        "confidence": "OFFICIALLY_ATTRIBUTED"
+      },
+      {
+        "source": "tx:btc_return",
+        "target": "entity:liquid_fed",
+        "relationship": "RETURNS_TO",
+        "confidence": "ON_CHAIN_VERIFIED"
+      },
+      {
+        "source": "entity:blockstream",
+        "target": "evidence:elements_pr1600",
+        "relationship": "ATTRIBUTED_TO",
+        "confidence": "OFFICIALLY_ATTRIBUTED"
+      }
+    ]
+  },
+  "total_btc_affected": 3996.02,
+  "total_btc_recovered": 3400.0,
+  "facts": [
+    "Liquid exploit transaction f24a4b179b5cc7e88b25a763911f7cbdf2bf45d1d1b5ab611e94461cef0a183f confirmed in Liquid block 4,050,336 accepted unbacked L-BTC outputs.",
+    "Bitcoin peg-out transaction 8db751a650ae2f12006b7e8c69a75e4df360e8afd6b9e05ae0b9fa6458a7b140 confirmed in Bitcoin block 965,783 releasing 3,996.02 BTC from federation reserves.",
+    "Bitcoin return transaction a6d697a25266ce3c78774fd1d75f896b7af522ada209b0f6228ea497bc49a46d confirmed in Bitcoin block 965,950 returning 3,400.00 BTC to federation address.",
+    "On-chain message 'we are whitehats. contact us on chain.' confirmed in Bitcoin block 965,818 (txid c103de95817b43f2df635ec6f35ff126ca26a7c6d20570c4b01866b2b3e69a19).",
+    "On-chain response 'Please contact security@blockstream.com.' confirmed in Bitcoin block 965,822 (txid 91271efcbb5ab29abfc38ae635f0644e3ba042aad56f92d40136e1dde4742fe8)."
+  ],
+  "reported_claims": [
+    "Blockstream assessment attributes exploit to range proof verification cache key collision in Elements software.",
+    "SideSwap confirmed no private key or Peg-out Authorization Key (PAK) compromise occurred.",
+    "Liquid federation bridge nodes were halted at September 6, 2026 18:26 UTC to contain further withdrawals.",
+    "Elements PR #1600 merged to implement length-framed CHashWriter cache key serialization and -norangeproofcache option.",
+    "Security research firms reported peak affected assets of approximately $320M USD at market prices during the exploit.",
+    "Blockstream official assessment reported approximately 602 BTC remained outstanding as of September 23, 2026."
+  ],
+  "unverified_claims": [
+    "Analysis of intermediate peg-out outputs indicates multi-hop forwarding behavior typical of automated liquidity aggregation.",
+    "Real-world identity and legal jurisdiction of the exploit actor.",
+    "Whether the actor's self-identification as 'white hat' represents genuine ethical intent or strategic negotiation posturing.",
+    "Final resolution or recovery status of remaining ~602 BTC beyond the September 23 assessment cutoff."
+  ],
+  "associated_txids": [
+    "f24a4b179b5cc7e88b25a763911f7cbdf2bf45d1d1b5ab611e94461cef0a183f",
+    "8db751a650ae2f12006b7e8c69a75e4df360e8afd6b9e05ae0b9fa6458a7b140",
+    "c103de95817b43f2df635ec6f35ff126ca26a7c6d20570c4b01866b2b3e69a19",
+    "91271efcbb5ab29abfc38ae635f0644e3ba042aad56f92d40136e1dde4742fe8",
+    "a6d697a25266ce3c78774fd1d75f896b7af522ada209b0f6228ea497bc49a46d"
+  ],
+  "associated_block_heights": [
+    4050336,
+    965783,
+    965950
+  ]
+}

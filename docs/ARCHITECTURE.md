@@ -103,12 +103,41 @@ It observes Bitcoin blocks, transactions, and mempools, enriches transactions wi
 
 ```text
 crates/
-├── obschain-core/          # Domain primitives, observations, events, amount math, incident models
+├── obschain-core/          # Domain primitives, observations, events, amount math, incident models, provenance
 ├── obschain-detectors/     # Detection logic (Dormant, Consolidation, FanOut, ExtremeFee, RBF, etc.)
 ├── obschain-ingest/        # Multi-source ingestion clients, UtxoCache, and TransactionEnricher
-├── obschain-incidents/     # Incident tracking, timeline building, and provenance verification
+├── obschain-incidents/     # Incident intelligence, canonical case seeders, validation invariants, builder
 ├── obschain-intelligence/  # Graph modeling, clustering models, report generator
 └── obschain-storage/       # PostgreSQL / InMemory repository implementations
+
+---
+
+## Incident Intelligence Architecture
+
+Incident intelligence sits cleanly on top of the observation architecture without altering the detector pipeline.
+
+```text
+ ┌─────────────────────────────────────────────────────────────┐
+ │                INCIDENT INTELLIGENCE SUBSYSTEM              │
+ │                                                             │
+ │   ├── Domain Models (Incident, Evidence, Timeline, Sources) │
+ │   ├── Provenance Verification Engine (Validation Invariants)│
+ │   ├── Historical Snapshot State & Append-Only Updates       │
+ │   ├── Safe Fund Tracking (Checked Integer Satoshi Math)     │
+ │   ├── Relationship Graph (Nodes & Neutral Typed Edges)      │
+ │   └── Canonical Seed Cases (e.g. Liquid Network 2026)       │
+ └──────────────────────────────┬──────────────────────────────┘
+                                │ Exposes
+                                ▼
+ ┌─────────────────────────────────────────────────────────────┐
+ │                      INCIDENT API                           │
+ │                                                             │
+ │   ├── GET /api/v1/incidents                                 │
+ │   ├── GET /api/v1/incidents/:id                             │
+ │   ├── GET /api/v1/incidents/:id/timeline                    │
+ │   ├── GET /api/v1/incidents/:id/evidence                    │
+ │   └── GET /api/v1/incidents/:id/graph                       │
+ └─────────────────────────────────────────────────────────────┘
 ```
 
 ---

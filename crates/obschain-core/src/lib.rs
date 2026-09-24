@@ -18,8 +18,11 @@ pub use event::{
 };
 pub use fee::{calculate_fee_rate_sat_vb, calculate_vsize_from_weight};
 pub use incident::{
-    Evidence, EvidenceType, Incident, IncidentStatus, ProvenanceClassification, Source,
-    TimelineEvent,
+    Chain, Evidence, EvidenceType, FundMovement, GraphEdge, GraphEdgeType, GraphNode,
+    GraphNodeType, Incident, IncidentBlock, IncidentEntity, IncidentGraph, IncidentStatus,
+    IncidentTransaction, IncidentUpdate, OnChainMessage, ProvenanceClassification, RecoverySummary,
+    Source, SourceCategory, StructuredClaimsSummary, TechnicalFinding, TimelineCategory,
+    TimelineEntry, TimelineEvent, TransactionRole,
 };
 pub use observation::{
     BlockObservation, MempoolObservation, Observation, SpentOutputContext, TransactionObservation,

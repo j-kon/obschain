@@ -25,3 +25,11 @@ ObsChain processes data from untrusted network sources (peer-to-peer gossip, ext
 
 ### 5. Dependency Audit
 - Automated `cargo audit` in continuous integration to catch vulnerable crates.
+
+### 6. Incident Ingestion & Provenance Security
+- **Identity Forgery Resistance**: Self-attributed claims (such as "we are white hats" messages in OP_RETURN) are programmatically rejected if submitted as `ON_CHAIN_VERIFIED` or `OFFICIALLY_ATTRIBUTED` identity.
+- **SSRF & Source URL Sanitization**: URLs in external sources must use public HTTPS schemes. Arbitrary `file://`, loopback, or private internal network lookups from seed dossiers are blocked.
+- **Checked Integer Arithmetic**: All monetary quantities (`affected_sats`, `recovered_sats`, `outstanding_sats`) use 64-bit unsigned integer arithmetic with checked bounds (`recovered_sats <= affected_sats`). Floating-point balances are prohibited internally.
+- **Graph Topology Integrity**: Graphs are validated at build time to prevent dangling edges or duplicate node IDs, preventing invalid graph structures in client visualizers.
+- **Chronological Monotonicity**: Timelines and updates must strictly maintain chronological ordering.
+

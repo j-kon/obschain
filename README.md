@@ -154,7 +154,10 @@ The server binds to `http://127.0.0.1:8080` by default and immediately initiates
 - `GET /api/v1/events` - Paginated list of real detected on-chain anomalies
 - `GET /api/v1/events/:id` - Detailed observation payload for a specific event
 - `GET /api/v1/incidents` - Active and historical security incident dossiers
-- `GET /api/v1/incidents/:id` - Incident breakdown with evidence and facts
+- `GET /api/v1/incidents/:id` - Complete incident dossier (summary, status, recovery, evidence, timeline, graph) by Case ID (`OC-2026-0001`) or UUID
+- `GET /api/v1/incidents/:id/timeline` - Chronological incident milestones with evidence and transaction references
+- `GET /api/v1/incidents/:id/evidence` - Evidence items with strict provenance classification
+- `GET /api/v1/incidents/:id/graph` - Forensic relationship graph (nodes & typed edges) for interactive UI visualization
 - `GET /api/v1/ws` - **ObsChain Live Stream WebSocket**: Broadcasts newly detected `ChainEvent`s to frontends in real-time
 
 ### Connecting to the Live WebSocket Feed
