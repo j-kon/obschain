@@ -81,16 +81,10 @@ pub struct MempoolWsInfo {
 
 impl MempoolWsInfo {
     pub fn into_observation(self, endpoint: &str) -> MempoolObservation {
-        // Safe conversion of BTC float into integer satoshis without overflow
+        // Safe conversion of external BTC float into integer satoshis with boundary checks
         let total_fee_sats = self
             .total_fee
-            .map(|btc| {
-                if btc.is_finite() && btc >= 0.0 {
-                    (btc * 100_000_000.0).round() as u64
-                } else {
-                    0
-                }
-            })
+            .and_then(|btc| obschain_core::safe_btc_f64_to_sats(btc).ok())
             .unwrap_or(0);
 
         MempoolObservation {
@@ -99,6 +93,61 @@ impl MempoolWsInfo {
             total_fee_sats,
             min_fee_rate_sat_vb: None,
             timestamp: Utc::now(),
+            source: Some(ObservationSource::mempool_ws(endpoint)),
+        }
+    }
+}
+
+/// Ingested transaction replacement / RBF event over WebSocket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MempoolWsRbfTx {
+    pub txid: String,
+    #[serde(default)]
+    pub replaces: Vec<String>,
+    #[serde(default)]
+    pub replaced_txid: Option<String>,
+    #[serde(default)]
+    pub fee: Option<u64>,
+    #[serde(default)]
+    pub old_fee: Option<u64>,
+    #[serde(default)]
+    pub vsize: Option<u64>,
+    #[serde(default)]
+    pub old_vsize: Option<u64>,
+    #[serde(default)]
+    pub value: Option<u64>,
+}
+
+impl MempoolWsRbfTx {
+    pub fn into_observation(self, endpoint: &str) -> obschain_core::TransactionReplacement {
+        let mut replaced = self.replaces;
+        if replaced.is_empty() {
+            if let Some(r) = self.replaced_txid {
+                replaced.push(r);
+            }
+        }
+        let new_fee_sats = self.fee.unwrap_or(0);
+        let old_fee_sats = self.old_fee.unwrap_or(0);
+        let fee_delta_sats = (new_fee_sats as i64) - (old_fee_sats as i64);
+
+        let old_fee_rate = self
+            .old_vsize
+            .and_then(|v| obschain_core::calculate_fee_rate_sat_vb(old_fee_sats, v));
+        let new_fee_rate = self
+            .vsize
+            .and_then(|v| obschain_core::calculate_fee_rate_sat_vb(new_fee_sats, v));
+
+        obschain_core::TransactionReplacement {
+            replaced_txids: replaced,
+            replacement_txid: self.txid,
+            old_fee_sats,
+            new_fee_sats,
+            fee_delta_sats,
+            old_vsize: self.old_vsize,
+            new_vsize: self.vsize,
+            old_fee_rate_sat_vb: old_fee_rate,
+            new_fee_rate_sat_vb: new_fee_rate,
+            observed_at: Utc::now(),
             source: Some(ObservationSource::mempool_ws(endpoint)),
         }
     }
@@ -113,6 +162,10 @@ pub struct MempoolWsEnvelope {
     pub mempool_info: Option<MempoolWsInfo>,
     pub tx: Option<MempoolTx>,
     pub transactions: Option<Vec<MempoolTx>>,
+    #[serde(rename = "rbfTransaction")]
+    pub rbf_transaction: Option<MempoolWsRbfTx>,
+    #[serde(rename = "rbfTransactions")]
+    pub rbf_transactions: Option<Vec<MempoolWsRbfTx>>,
 }
 
 /// Parses a raw text WebSocket frame into zero or more normalized observations.
@@ -141,6 +194,16 @@ pub fn parse_ws_frame(text: &str, endpoint: &str) -> Result<Vec<Observation>, se
     if let Some(txs) = envelope.transactions {
         for tx in txs {
             observations.push(Observation::Transaction(tx.into_observation(endpoint)));
+        }
+    }
+
+    if let Some(rbf) = envelope.rbf_transaction {
+        observations.push(Observation::Replacement(rbf.into_observation(endpoint)));
+    }
+
+    if let Some(rbfs) = envelope.rbf_transactions {
+        for rbf in rbfs {
+            observations.push(Observation::Replacement(rbf.into_observation(endpoint)));
         }
     }
 
@@ -197,10 +260,10 @@ impl MempoolWebSocketClient {
                         continue;
                     }
 
-                    // Subscribe to live blocks, mempool-blocks, stats
+                    // Subscribe to live blocks, mempool-blocks, stats, rbfTransactions
                     let want_msg = serde_json::json!({
                         "action": "want",
-                        "data": ["blocks", "mempool-blocks", "stats"]
+                        "data": ["blocks", "mempool-blocks", "stats", "rbfTransactions"]
                     })
                     .to_string();
 
@@ -398,5 +461,36 @@ mod tests {
         }"#;
         let obs = parse_ws_frame(payload, WS_ENDPOINT).expect("Should ignore unknown fields");
         assert!(obs.is_empty());
+    }
+
+    #[test]
+    fn test_parse_ws_rbf_replacement_frame() {
+        let payload = r#"{
+            "rbfTransaction": {
+                "txid": "new_tx_replace_9999",
+                "replaces": ["old_tx_1111", "old_tx_2222"],
+                "fee": 25000,
+                "old_fee": 15000,
+                "vsize": 150,
+                "old_vsize": 200
+            }
+        }"#;
+
+        let obs = parse_ws_frame(payload, WS_ENDPOINT).expect("Should parse RBF frame");
+        assert_eq!(obs.len(), 1);
+        if let Observation::Replacement(r) = &obs[0] {
+            assert_eq!(r.replacement_txid, "new_tx_replace_9999");
+            assert_eq!(r.replaced_txids.len(), 2);
+            assert_eq!(r.old_fee_sats, 15000);
+            assert_eq!(r.new_fee_sats, 25000);
+            assert_eq!(r.fee_delta_sats, 10000);
+            assert_eq!(r.new_vsize, Some(150));
+            assert_eq!(
+                r.source.as_ref().unwrap().endpoint.as_deref(),
+                Some(WS_ENDPOINT)
+            );
+        } else {
+            panic!("Expected Observation::Replacement");
+        }
     }
 }

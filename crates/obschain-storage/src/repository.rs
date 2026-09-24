@@ -140,9 +140,9 @@ impl InMemoryStorage {
             "miner_tag": "AntPool"
         });
 
-        // Sample Event 3: Fee Spike
+        // Sample Event 3: Extreme Fee
         let mut ev3 = ChainEvent::new(
-            EventType::FeeSpike,
+            EventType::ExtremeFee,
             EventSeverity::Low,
             ConfidenceLevel::VerifiedOnChain,
             "Mempool Fee Spike: Median > 85 sat/vB",

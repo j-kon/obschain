@@ -136,6 +136,7 @@ impl MempoolTx {
                     prev_out_value_sats: prev_val,
                     prev_out_address: vin.prevout.and_then(|p| p.scriptpubkey_address),
                     is_coinbase: vin.is_coinbase,
+                    historical_utxo: None,
                 }
             })
             .collect();

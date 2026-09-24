@@ -85,8 +85,15 @@ mempool.space (REST + WebSocket)
 
 ## Active Detectors
 
+- **`DormantCoinDetector`**: Emits `EventType::DormantCoinsMoved` when Bitcoin UTXOs dormant for 5+ years are spent (`OBSCHAIN_DORMANT_MIN_AGE_DAYS`, default: 1,825 days, `OBSCHAIN_DORMANT_MIN_VALUE_SATS`, default: 1 BTC). Derives age strictly from historical confirmation context (`SpentOutputContext`), calculating Coin Age Destroyed in satoshi-days without floating-point overflow. Classifies outputs into `Dormant`, `VeryOld`, `Ancient`, or `EarlyBitcoin` (<2011 cutoff).
+- **`ConsolidationDetector`**: Emits `EventType::Consolidation` when transactions merge many inputs into few outputs (`OBSCHAIN_CONSOLIDATION_MIN_INPUTS`, default: 20 inputs into <= 5 outputs). Avoids false-positives on batch payouts or CoinJoins.
+- **`FanOutDetector`**: Emits `EventType::FanOut` when transactions distribute funds across an unusually high number of outputs (`OBSCHAIN_FANOUT_MIN_OUTPUTS`, default: 50 outputs).
+- **`ExtremeFeeDetector`**: Emits `EventType::ExtremeFee` when a transaction incurs extreme absolute fees (`OBSCHAIN_EXTREME_FEE_SATS`, default: 0.1 BTC) or extreme fee rates (`OBSCHAIN_EXTREME_FEE_RATE_SAT_VB`, default: 200 sat/vB).
+- **`RbfDetector`**: Emits `EventType::TransactionReplacement` upon observing confirmed transaction replacements in the mempool. Reports fee delta and percentage increase neutrally without assuming malicious intent.
 - **`LargeTransactionDetector`**: Emits `EventType::LargeTransfer` when an on-chain transaction exceeds `OBSCHAIN_LARGE_TX_THRESHOLD_SATS` (default: 10,000,000,000 sats / 100 BTC). Categorizes severity into `Medium`, `High`, or `Critical`.
 - **`LongBlockIntervalDetector`**: Emits `EventType::LongBlockInterval` when elapsed time between sequential blocks exceeds `OBSCHAIN_LONG_BLOCK_INTERVAL_SECONDS` (default: 1800 seconds / 30 minutes). Validates non-monotonic timestamps.
+
+> **Important Boundary**: Anomaly detectors evaluate transaction structure and historical confirmation. They describe observed blockchain mechanics, not wallet identity, entity attribution, or human intent.
 
 ---
 
@@ -113,6 +120,18 @@ Key environment variables:
 | `OBSCHAIN_PORT` | `8080` | API server listen port |
 | `MEMPOOL_API_URL` | `https://mempool.space/api` | Mempool.space REST base endpoint |
 | `MEMPOOL_WS_URL` | `wss://mempool.space/api/v1/ws` | Mempool.space WebSocket stream endpoint |
+| `OBSCHAIN_DORMANT_MIN_AGE_DAYS` | `1825` | Dormant coin detector age threshold (5 years) |
+| `OBSCHAIN_DORMANT_MIN_VALUE_SATS` | `100000000` | Dormant coin minimum value threshold (1 BTC) |
+| `OBSCHAIN_CONSOLIDATION_MIN_INPUTS`| `20` | Consolidation minimum inputs threshold |
+| `OBSCHAIN_CONSOLIDATION_MAX_OUTPUTS`| `5` | Consolidation maximum outputs threshold |
+| `OBSCHAIN_FANOUT_MIN_OUTPUTS` | `50` | Fan-out minimum outputs threshold |
+| `OBSCHAIN_EXTREME_FEE_SATS` | `10000000` | Extreme fee absolute threshold (0.1 BTC) |
+| `OBSCHAIN_EXTREME_FEE_RATE_SAT_VB` | `200.0` | Extreme fee rate threshold (sat/vB) |
+| `OBSCHAIN_UTXO_CACHE_LIMIT` | `50000` | In-memory historical UTXO cache capacity |
+| `OBSCHAIN_UTXO_CACHE_TTL_SECONDS` | `3600` | Historical UTXO cache TTL (1 hour) |
+| `OBSCHAIN_MAX_INPUT_ENRICHMENT` | `500` | Maximum input lookups per transaction |
+| `OBSCHAIN_UTXO_LOOKUP_CONCURRENCY`| `16` | Bounded concurrency for historical HTTP lookups |
+| `OBSCHAIN_DEDUP_CAPACITY` | `10000` | Deterministic event deduplication capacity |
 | `OBSCHAIN_LARGE_TX_THRESHOLD_SATS` | `10000000000` | Large transfer detector threshold (100 BTC) |
 | `OBSCHAIN_LONG_BLOCK_INTERVAL_SECONDS` | `1800` | Block interval alert threshold (30 minutes) |
 | `OBSCHAIN_EVENT_STORE_LIMIT` | `10000` | Maximum recent events in circular memory store |

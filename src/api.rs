@@ -32,6 +32,45 @@ pub struct SourcesStatus {
     pub bitcoin_core: String,
 }
 
+#[derive(Clone, Default)]
+pub struct PipelineMetrics {
+    pub transactions_observed: Arc<AtomicU64>,
+    pub blocks_observed: Arc<AtomicU64>,
+    pub transactions_enriched: Arc<AtomicU64>,
+    pub utxo_lookup_failures: Arc<AtomicU64>,
+    pub cache_hits: Arc<AtomicU64>,
+    pub cache_misses: Arc<AtomicU64>,
+    pub events_generated: Arc<AtomicU64>,
+    pub events_deduplicated: Arc<AtomicU64>,
+}
+
+impl PipelineMetrics {
+    pub fn snapshot(&self) -> PipelineMetricsResponse {
+        PipelineMetricsResponse {
+            transactions_observed: self.transactions_observed.load(Ordering::Relaxed),
+            blocks_observed: self.blocks_observed.load(Ordering::Relaxed),
+            transactions_enriched: self.transactions_enriched.load(Ordering::Relaxed),
+            utxo_lookup_failures: self.utxo_lookup_failures.load(Ordering::Relaxed),
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            cache_misses: self.cache_misses.load(Ordering::Relaxed),
+            events_generated: self.events_generated.load(Ordering::Relaxed),
+            events_deduplicated: self.events_deduplicated.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineMetricsResponse {
+    pub transactions_observed: u64,
+    pub blocks_observed: u64,
+    pub transactions_enriched: u64,
+    pub utxo_lookup_failures: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub events_generated: u64,
+    pub events_deduplicated: u64,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub storage: InMemoryStorage,
@@ -42,6 +81,7 @@ pub struct AppState {
     pub tip_height: Arc<AtomicU64>,
     pub events_detected: Arc<AtomicU64>,
     pub sources: Arc<RwLock<SourcesStatus>>,
+    pub metrics: PipelineMetrics,
 }
 
 impl AppState {
@@ -49,6 +89,15 @@ impl AppState {
         storage: InMemoryStorage,
         detectors: Vec<Arc<dyn Detector>>,
         is_mock_feed: bool,
+    ) -> (Self, tokio::sync::broadcast::Sender<ChainEvent>) {
+        Self::with_metrics(storage, detectors, is_mock_feed, PipelineMetrics::default())
+    }
+
+    pub fn with_metrics(
+        storage: InMemoryStorage,
+        detectors: Vec<Arc<dyn Detector>>,
+        is_mock_feed: bool,
+        metrics: PipelineMetrics,
     ) -> (Self, tokio::sync::broadcast::Sender<ChainEvent>) {
         let (tx, _) = tokio::sync::broadcast::channel(1024);
         let state = Self {
@@ -64,6 +113,7 @@ impl AppState {
                 mempool_websocket: "disconnected".to_string(),
                 bitcoin_core: "not_configured".to_string(),
             })),
+            metrics,
         };
         (state, tx)
     }
@@ -91,6 +141,7 @@ pub struct StatusResponse {
     pub active_detectors: Vec<&'static str>,
     pub storage_backend: &'static str,
     pub is_mock_feed: bool,
+    pub metrics: PipelineMetricsResponse,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,6 +216,7 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
         active_detectors,
         storage_backend: "in-memory (bounded VecDeque)",
         is_mock_feed: state.is_mock_feed,
+        metrics: state.metrics.snapshot(),
     })
 }
 

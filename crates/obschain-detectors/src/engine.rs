@@ -47,12 +47,26 @@ impl DetectorEngine {
 
         let mut events = Vec::new();
         for detector in &self.detectors {
-            let detected = detector.detect(&observation);
-            for mut ev in detected {
-                if ev.source.is_none() {
-                    ev.source = obs_source.clone();
+            let detector_name = detector.name();
+            let detected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                detector.detect(&observation)
+            }));
+
+            match detected {
+                Ok(evs) => {
+                    for mut ev in evs {
+                        if ev.source.is_none() {
+                            ev.source = obs_source.clone();
+                        }
+                        events.push(ev);
+                    }
                 }
-                events.push(ev);
+                Err(_panic_err) => {
+                    tracing::error!(
+                        detector = detector_name,
+                        "Detector panicked during execution; safely isolated without terminating pipeline"
+                    );
+                }
             }
         }
 
@@ -188,5 +202,55 @@ mod tests {
         let events2 = engine.process_observation(Observation::Block(b2));
         assert_eq!(events2.len(), 1);
         assert_eq!(events2[0].event_type, EventType::LongBlockInterval);
+    }
+
+    struct PanickingDetector;
+    impl Detector for PanickingDetector {
+        fn name(&self) -> &'static str {
+            "panicking_detector"
+        }
+        fn description(&self) -> &'static str {
+            "Intentionally panics to test engine isolation"
+        }
+        fn detect(&self, _observation: &Observation) -> Vec<ChainEvent> {
+            panic!("Simulated unexpected detector crash");
+        }
+    }
+
+    #[test]
+    fn test_engine_panicking_detector_is_safely_isolated() {
+        let detectors: Vec<Arc<dyn Detector>> = vec![
+            Arc::new(PanickingDetector),
+            Arc::new(LargeTransactionDetector::with_threshold_sats(
+                100 * 100_000_000,
+            )),
+        ];
+        let mut engine = DetectorEngine::new(detectors);
+
+        let tx = TransactionObservation {
+            txid: "3333333333333333333333333333333333333333333333333333333333333333".to_string(),
+            timestamp: Utc::now(),
+            block_hash: None,
+            block_height: None,
+            fee_sats: 5000,
+            size: 250,
+            weight: 1000,
+            vsize: 250,
+            fee_rate_sat_vb: Some(20.0),
+            total_input_sats: 500 * 100_000_000 + 5000,
+            total_output_sats: 500 * 100_000_000,
+            input_count: 2,
+            output_count: 2,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            is_rbf: false,
+            confirmed: false,
+            source: Some(ObservationSource::mempool_ws("wss://test")),
+        };
+
+        // Engine must not panic, and LargeTransactionDetector must still execute and emit event
+        let events = engine.process_observation(Observation::Transaction(tx));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, EventType::LargeTransfer);
     }
 }

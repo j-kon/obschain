@@ -3,10 +3,17 @@ use std::{
     time::Duration,
 };
 
-use obschain::{create_router, AppConfig, AppState};
+use obschain::{create_router, AppConfig, AppState, PipelineMetrics};
 use obschain_core::Observation;
-use obschain_detectors::{DetectorEngine, LargeTransactionDetector, LongBlockIntervalDetector};
-use obschain_ingest::{MempoolRestClient, MempoolRestConfig, MempoolWebSocketClient};
+use obschain_detectors::{
+    ConsolidationDetector, DetectorEngine, DormantCoinDetector, EventDeduplicator,
+    ExtremeFeeDetector, FanOutDetector, LargeTransactionDetector, LongBlockIntervalDetector,
+    RbfDetector,
+};
+use obschain_ingest::{
+    EnricherConfig, MempoolRestClient, MempoolRestConfig, MempoolWebSocketClient,
+    TransactionEnricher, UtxoCache,
+};
 use obschain_storage::{EventRepository, InMemoryStorage};
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
@@ -33,6 +40,11 @@ async fn main() -> anyhow::Result<()> {
         mempool_ws = %config.mempool_ws_url,
         large_tx_threshold_sats = config.large_tx_threshold_sats,
         long_block_interval_secs = config.long_block_interval_seconds,
+        dormant_min_age_days = config.dormant_min_age_days,
+        dormant_min_value_sats = config.dormant_min_value_sats,
+        consolidation_min_inputs = config.consolidation_min_inputs,
+        fanout_min_outputs = config.fanout_min_outputs,
+        extreme_fee_sats = config.extreme_fee_sats,
         "ObsChain backend initializing live Bitcoin observation engine"
     );
 
@@ -49,23 +61,92 @@ async fn main() -> anyhow::Result<()> {
     // Graceful shutdown coordination channel
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // 2. Setup Detectors and DetectorEngine
+    // 2. Setup Mempool REST client
+    let rest_config = MempoolRestConfig {
+        base_url: config.mempool_api_url.clone(),
+        timeout: Duration::from_secs(10),
+        connect_timeout: Duration::from_secs(5),
+        max_retries: 3,
+        max_response_bytes: 10 * 1024 * 1024,
+    };
+
+    let rest_client = match MempoolRestClient::new(rest_config) {
+        Ok(c) => Some(Arc::new(c)),
+        Err(e) => {
+            warn!(error = %e, "Failed to initialize MempoolRestClient");
+            None
+        }
+    };
+
+    // 3. Setup UTXO cache and bounded enrichment layer
+    let utxo_cache = UtxoCache::new(
+        config.utxo_cache_limit,
+        Duration::from_secs(config.utxo_cache_ttl_seconds),
+    );
+
+    let enricher_config = EnricherConfig {
+        max_input_enrichment: config.max_input_enrichment,
+        lookup_concurrency: config.utxo_lookup_concurrency,
+        request_timeout: Duration::from_secs(5),
+    };
+
+    let enricher = rest_client
+        .as_ref()
+        .map(|rc| TransactionEnricher::new(rc.clone(), utxo_cache.clone(), enricher_config));
+
+    let deduplicator = EventDeduplicator::new(
+        config.dedup_cache_capacity,
+        Duration::from_secs(config.dedup_cache_ttl_seconds),
+    );
+
+    // 4. Setup Detectors and DetectorEngine
     let large_tx_detector = Arc::new(LargeTransactionDetector::with_threshold_sats(
         config.large_tx_threshold_sats,
     ));
     let long_interval_detector = Arc::new(LongBlockIntervalDetector::with_threshold_seconds(
         config.long_block_interval_seconds,
     ));
+    let dormant_detector = Arc::new(DormantCoinDetector::with_thresholds(
+        config.dormant_min_age_days,
+        config.dormant_min_value_sats,
+    ));
+    let consolidation_detector = Arc::new(ConsolidationDetector::with_thresholds(
+        config.consolidation_min_inputs,
+        config.consolidation_max_outputs,
+        config.consolidation_min_value_sats,
+    ));
+    let fanout_detector = Arc::new(FanOutDetector::with_thresholds(
+        config.fanout_min_outputs,
+        config.fanout_min_value_sats,
+    ));
+    let extreme_fee_detector = Arc::new(ExtremeFeeDetector::with_thresholds(
+        config.extreme_fee_sats,
+        config.extreme_fee_rate_sat_vb,
+    ));
+    let rbf_detector = Arc::new(RbfDetector::new());
 
-    let detectors: Vec<Arc<dyn obschain_detectors::Detector>> =
-        vec![large_tx_detector, long_interval_detector];
+    let detectors: Vec<Arc<dyn obschain_detectors::Detector>> = vec![
+        large_tx_detector,
+        long_interval_detector,
+        dormant_detector,
+        consolidation_detector,
+        fanout_detector,
+        extreme_fee_detector,
+        rbf_detector,
+    ];
     let mut engine = DetectorEngine::new(detectors.clone());
 
-    // 3. Setup AppState for Axum HTTP and WebSocket API
-    let (state, event_broadcaster) = AppState::new(storage.clone(), detectors, config.mock_feed);
+    // 5. Setup AppState and Metrics for Axum HTTP and WebSocket API
+    let metrics = PipelineMetrics::default();
+    let (state, event_broadcaster) = AppState::with_metrics(
+        storage.clone(),
+        detectors,
+        config.mock_feed,
+        metrics.clone(),
+    );
     let app = create_router(state.clone());
 
-    // 4. Mempool WebSocket ingestion supervisor
+    // 6. Mempool WebSocket ingestion supervisor
     let ws_client = MempoolWebSocketClient::new(config.mempool_ws_url.clone());
     let ws_connected = ws_client.connected_handle();
     let ws_sources = state.sources.clone();
@@ -100,23 +181,7 @@ async fn main() -> anyhow::Result<()> {
         ws_client.run_supervisor(ws_obs_tx, ws_shutdown_rx).await;
     });
 
-    // 5. Mempool REST poller for tip synchronization and fallback ingestion
-    let rest_config = MempoolRestConfig {
-        base_url: config.mempool_api_url.clone(),
-        timeout: Duration::from_secs(10),
-        connect_timeout: Duration::from_secs(5),
-        max_retries: 3,
-        max_response_bytes: 10 * 1024 * 1024,
-    };
-
-    let rest_client = match MempoolRestClient::new(rest_config) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            warn!(error = %e, "Failed to initialize MempoolRestClient");
-            None
-        }
-    };
-
+    // 7. Mempool REST poller for tip synchronization and fallback ingestion
     if let Some(rest) = rest_client {
         let rest_sources = state.sources.clone();
         let rest_tip = state.tip_height.clone();
@@ -198,11 +263,15 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // 6. Detector pipeline worker: Observation channel -> Normalization -> Engine -> ChainEvent -> Storage & Broadcast
+    // 8. Detector pipeline worker: Observation channel -> Enrichment -> Engine -> ChainEvent -> Dedup -> Storage & Broadcast
     let pipeline_storage = storage.clone();
     let pipeline_broadcaster = event_broadcaster.clone();
     let pipeline_events_detected = state.events_detected.clone();
     let pipeline_tip_height = state.tip_height.clone();
+    let pipeline_metrics = metrics.clone();
+    let enricher_handle = enricher.clone();
+    let dedup_handle = deduplicator.clone();
+    let utxo_cache_handle = utxo_cache.clone();
     let mut pipeline_shutdown = shutdown_rx.clone();
 
     tokio::spawn(async move {
@@ -215,13 +284,14 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 obs_opt = obs_rx.recv() => {
-                    let Some(obs) = obs_opt else {
+                    let Some(mut obs) = obs_opt else {
                         info!("Observation channel closed");
                         break;
                     };
 
-                    match &obs {
+                    match &mut obs {
                         Observation::Block(block) => {
+                            pipeline_metrics.blocks_observed.fetch_add(1, Ordering::Relaxed);
                             pipeline_tip_height.store(block.height, Ordering::Relaxed);
                             info!(
                                 height = block.height,
@@ -231,12 +301,34 @@ async fn main() -> anyhow::Result<()> {
                                 "New Bitcoin block observed"
                             );
                         }
-                        Observation::Transaction(tx) => {
+                        Observation::Transaction(ref mut tx) => {
+                            pipeline_metrics.transactions_observed.fetch_add(1, Ordering::Relaxed);
                             tracing::debug!(
                                 txid = %tx.txid,
                                 total_output_sats = tx.total_output_sats,
                                 fee_sats = tx.fee_sats,
                                 "Bitcoin transaction observed"
+                            );
+
+                            // Historical UTXO enrichment for dormant-coin detection
+                            if let Some(ref enricher) = enricher_handle {
+                                enricher.enrich_transaction(tx).await;
+                                let has_history = tx.inputs.iter().any(|i| i.historical_utxo.is_some());
+                                if has_history {
+                                    pipeline_metrics.transactions_enriched.fetch_add(1, Ordering::Relaxed);
+                                }
+                                pipeline_metrics.utxo_lookup_failures.store(enricher.lookup_failures(), Ordering::Relaxed);
+                            }
+
+                            pipeline_metrics.cache_hits.store(utxo_cache_handle.hits(), Ordering::Relaxed);
+                            pipeline_metrics.cache_misses.store(utxo_cache_handle.misses(), Ordering::Relaxed);
+                        }
+                        Observation::Replacement(repl) => {
+                            info!(
+                                replacement_txid = %repl.replacement_txid,
+                                replaced_count = repl.replaced_txids.len(),
+                                fee_delta_sats = repl.fee_delta_sats,
+                                "Bitcoin mempool transaction replacement observed"
                             );
                         }
                         Observation::Mempool(mp) => {
@@ -249,7 +341,11 @@ async fn main() -> anyhow::Result<()> {
                     }
 
                     let detected_events = engine.process_observation(obs);
-                    for event in detected_events {
+                    let fresh_events = dedup_handle.filter(detected_events);
+                    pipeline_metrics.events_deduplicated.store(dedup_handle.deduplicated_count(), Ordering::Relaxed);
+                    pipeline_metrics.events_generated.fetch_add(fresh_events.len() as u64, Ordering::Relaxed);
+
+                    for event in fresh_events {
                         info!(
                             id = %event.id,
                             event_type = ?event.event_type,
@@ -272,7 +368,32 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // 7. Start Axum server with graceful shutdown
+    // 9. Periodic pipeline telemetry heartbeat logging (every 60s)
+    let heartbeat_metrics = metrics.clone();
+    let mut heartbeat_shutdown = shutdown_rx.clone();
+    tokio::spawn(async move {
+        while !*heartbeat_shutdown.borrow() {
+            tokio::select! {
+                _ = heartbeat_shutdown.changed() => break,
+                _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                    let snap = heartbeat_metrics.snapshot();
+                    info!(
+                        txs_observed = snap.transactions_observed,
+                        blocks_observed = snap.blocks_observed,
+                        txs_enriched = snap.transactions_enriched,
+                        lookup_failures = snap.utxo_lookup_failures,
+                        cache_hits = snap.cache_hits,
+                        cache_misses = snap.cache_misses,
+                        events_generated = snap.events_generated,
+                        events_deduplicated = snap.events_deduplicated,
+                        "ObsChain pipeline telemetry heartbeat"
+                    );
+                }
+            }
+        }
+    });
+
+    // 10. Start Axum server with graceful shutdown
     info!(
         http_addr = %addr,
         "ObsChain HTTP and WebSocket server running on http://{}",
