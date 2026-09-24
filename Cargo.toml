@@ -37,7 +37,7 @@ bitcoin = { version = "0.32", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json", "migrate"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json", "migrate", "macros"] }
 uuid = { version = "1.11", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
@@ -59,6 +59,7 @@ obschain-detectors = { workspace = true }
 obschain-incidents = { workspace = true }
 obschain-intelligence = { workspace = true }
 obschain-storage = { workspace = true }
+sqlx = { workspace = true }
 
 tokio = { workspace = true }
 axum = { workspace = true }

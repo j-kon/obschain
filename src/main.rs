@@ -3,8 +3,11 @@ use std::{
     time::Duration,
 };
 
-use obschain::{create_router, AppConfig, AppState, PipelineMetrics, WebSocketBroadcast};
-use obschain_core::Observation;
+use obschain::{
+    create_router, redact_database_url, AppConfig, AppState, PipelineMetrics, StorageBackendConfig,
+    WebSocketBroadcast,
+};
+use obschain_core::{ChainEvent, IncidentActivity, IncidentAlert, Observation};
 use obschain_detectors::{
     ConsolidationDetector, DetectorEngine, DormantCoinDetector, EventDeduplicator,
     ExtremeFeeDetector, FanOutDetector, LargeTransactionDetector, LongBlockIntervalDetector,
@@ -15,7 +18,10 @@ use obschain_ingest::{
     TransactionEnricher, UtxoCache,
 };
 use obschain_intelligence::IncidentWatchEngine;
-use obschain_storage::{EventRepository, InMemoryStorage, IncidentActivityRepository};
+use obschain_storage::{
+    EventRepository, InMemoryStorage, IncidentActivityRepository, IncidentAlertRepository,
+    PostgresStorage, Storage,
+};
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -37,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
     info!(
         host = %config.host,
         port = %config.port,
+        storage_backend = %config.storage_backend,
         mempool_api = %config.mempool_api_url,
         mempool_ws = %config.mempool_ws_url,
         large_tx_threshold_sats = config.large_tx_threshold_sats,
@@ -49,11 +56,76 @@ async fn main() -> anyhow::Result<()> {
         "ObsChain backend initializing live Bitcoin observation engine"
     );
 
-    // 1. Setup bounded storage and channels
-    let storage = if config.mock_feed {
-        InMemoryStorage::with_limit(config.event_store_limit)
-    } else {
-        InMemoryStorage::new_empty(config.event_store_limit)
+    // 1. Setup storage (in-memory or postgres) and channels
+    let storage: Storage = match config.storage_backend {
+        StorageBackendConfig::Memory => {
+            info!(
+                storage_backend = "memory",
+                limit = config.event_store_limit,
+                "Using in-memory bounded storage backend"
+            );
+            if config.mock_feed {
+                InMemoryStorage::with_limit(config.event_store_limit).into()
+            } else {
+                InMemoryStorage::new_empty(config.event_store_limit).into()
+            }
+        }
+        StorageBackendConfig::Postgres => {
+            let raw_db_url = config.database_url.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "OBSCHAIN_STORAGE_BACKEND is set to 'postgres', but DATABASE_URL environment variable is missing"
+                )
+            })?;
+
+            let redacted_url = redact_database_url(raw_db_url);
+            info!(
+                storage_backend = "postgres",
+                database = %redacted_url,
+                max_connections = config.db_max_connections,
+                min_connections = config.db_min_connections,
+                acquire_timeout_secs = config.db_acquire_timeout_seconds,
+                "Connecting to PostgreSQL database"
+            );
+
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(config.db_max_connections)
+                .min_connections(config.db_min_connections)
+                .acquire_timeout(Duration::from_secs(config.db_acquire_timeout_seconds))
+                .connect(raw_db_url)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to connect to PostgreSQL database (ensure database is running and reachable): {e}"
+                    )
+                })?;
+
+            let pg_storage = PostgresStorage::new(pool);
+
+            info!("Applying pending PostgreSQL database migrations");
+            pg_storage
+                .run_migrations()
+                .await
+                .map_err(|e| anyhow::anyhow!("Database migration failed during startup: {e}"))?;
+            info!(
+                storage_backend = "postgres",
+                database_connected = true,
+                migrations_applied = true,
+                "PostgreSQL schema migrated successfully"
+            );
+
+            info!("Seeding canonical incident intelligence and watch targets idempotently");
+            pg_storage.seed_canonical_incidents().await.map_err(|e| {
+                anyhow::anyhow!("Failed to seed canonical incident into PostgreSQL: {e}")
+            })?;
+            info!("Canonical incident and watch targets seeded successfully");
+
+            pg_storage
+                .initialize_telemetry_counters()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to initialize telemetry counters: {e}"))?;
+
+            pg_storage.into()
+        }
     };
 
     // Bounded observation channel: protects against unbounded memory growth under high tx volume
@@ -381,9 +453,7 @@ async fn main() -> anyhow::Result<()> {
                             "ObsChain incident activity detected"
                         );
 
-                        if let Err(e) = pipeline_storage.save_activity(&activity).await {
-                            error!(error = %e, "Failed to persist detected IncidentActivity");
-                        }
+                        save_activity_with_retry(&pipeline_storage, &activity, &pipeline_metrics).await;
 
                         pipeline_metrics
                             .incident_activities_detected
@@ -399,6 +469,8 @@ async fn main() -> anyhow::Result<()> {
                                 title = %alert.title,
                                 "ObsChain incident alert emitted"
                             );
+
+                            save_alert_with_retry(&pipeline_storage, &alert, &pipeline_metrics).await;
 
                             pipeline_metrics
                                 .incident_alerts_emitted
@@ -423,9 +495,7 @@ async fn main() -> anyhow::Result<()> {
                             "ObsChain anomaly event detected"
                         );
 
-                        if let Err(e) = pipeline_storage.save_event(&event).await {
-                            error!(error = %e, "Failed to persist detected ChainEvent");
-                        }
+                        save_event_with_retry(&pipeline_storage, &event, &pipeline_metrics).await;
 
                         pipeline_events_detected.fetch_add(1, Ordering::Relaxed);
 
@@ -455,6 +525,9 @@ async fn main() -> anyhow::Result<()> {
                         cache_misses = snap.cache_misses,
                         events_generated = snap.events_generated,
                         events_deduplicated = snap.events_deduplicated,
+                        incident_activities = snap.incident_activities_detected,
+                        incident_alerts = snap.incident_alerts_emitted,
+                        storage_write_errors = snap.storage_write_errors,
                         "ObsChain pipeline telemetry heartbeat"
                     );
                 }
@@ -511,4 +584,111 @@ async fn main() -> anyhow::Result<()> {
 
     info!("ObsChain backend shutdown completed cleanly");
     Ok(())
+}
+
+async fn save_activity_with_retry(
+    storage: &Storage,
+    activity: &IncidentActivity,
+    metrics: &PipelineMetrics,
+) {
+    let mut attempts = 0;
+    let max_attempts = 3;
+    let mut delay = Duration::from_millis(50);
+    loop {
+        attempts += 1;
+        match storage.save_activity(activity).await {
+            Ok(()) => return,
+            Err(e) => {
+                if attempts >= max_attempts {
+                    error!(
+                        error = %e,
+                        activity_id = %activity.id,
+                        case_id = %activity.case_id,
+                        attempts = attempts,
+                        "Failed to persist detected IncidentActivity after max retries; continuing operation"
+                    );
+                    metrics.storage_write_errors.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                warn!(
+                    error = %e,
+                    activity_id = %activity.id,
+                    attempt = attempts,
+                    "Transient storage error saving IncidentActivity; retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+        }
+    }
+}
+
+async fn save_alert_with_retry(
+    storage: &Storage,
+    alert: &IncidentAlert,
+    metrics: &PipelineMetrics,
+) {
+    let mut attempts = 0;
+    let max_attempts = 3;
+    let mut delay = Duration::from_millis(50);
+    loop {
+        attempts += 1;
+        match storage.save_alert(alert).await {
+            Ok(()) => return,
+            Err(e) => {
+                if attempts >= max_attempts {
+                    error!(
+                        error = %e,
+                        alert_id = %alert.id,
+                        case_id = %alert.case_id,
+                        attempts = attempts,
+                        "Failed to persist IncidentAlert after max retries; continuing operation"
+                    );
+                    metrics.storage_write_errors.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                warn!(
+                    error = %e,
+                    alert_id = %alert.id,
+                    attempt = attempts,
+                    "Transient storage error saving IncidentAlert; retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+        }
+    }
+}
+
+async fn save_event_with_retry(storage: &Storage, event: &ChainEvent, metrics: &PipelineMetrics) {
+    let mut attempts = 0;
+    let max_attempts = 3;
+    let mut delay = Duration::from_millis(50);
+    loop {
+        attempts += 1;
+        match storage.save_event(event).await {
+            Ok(()) => return,
+            Err(e) => {
+                if attempts >= max_attempts {
+                    error!(
+                        error = %e,
+                        event_id = %event.id,
+                        event_type = ?event.event_type,
+                        attempts = attempts,
+                        "Failed to persist detected ChainEvent after max retries; continuing operation"
+                    );
+                    metrics.storage_write_errors.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                warn!(
+                    error = %e,
+                    event_id = %event.id,
+                    attempt = attempts,
+                    "Transient storage error saving ChainEvent; retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+        }
+    }
 }

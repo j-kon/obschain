@@ -20,8 +20,8 @@ use obschain_core::{
 use obschain_detectors::Detector;
 use obschain_intelligence::IncidentWatchEngine;
 use obschain_storage::{
-    EventRepository, InMemoryStorage, IncidentActivityRepository, IncidentRepository,
-    WatchTargetRepository,
+    EventRepository, IncidentActivityRepository, IncidentAlertRepository, IncidentRepository,
+    Storage, StorageError, WatchTargetRepository,
 };
 use serde::{Deserialize, Serialize};
 use tower_http::{
@@ -50,6 +50,7 @@ pub struct PipelineMetrics {
     pub events_deduplicated: Arc<AtomicU64>,
     pub incident_activities_detected: Arc<AtomicU64>,
     pub incident_alerts_emitted: Arc<AtomicU64>,
+    pub storage_write_errors: Arc<AtomicU64>,
 }
 
 impl PipelineMetrics {
@@ -65,6 +66,7 @@ impl PipelineMetrics {
             events_deduplicated: self.events_deduplicated.load(Ordering::Relaxed),
             incident_activities_detected: self.incident_activities_detected.load(Ordering::Relaxed),
             incident_alerts_emitted: self.incident_alerts_emitted.load(Ordering::Relaxed),
+            storage_write_errors: self.storage_write_errors.load(Ordering::Relaxed),
         }
     }
 }
@@ -81,6 +83,7 @@ pub struct PipelineMetricsResponse {
     pub events_deduplicated: u64,
     pub incident_activities_detected: u64,
     pub incident_alerts_emitted: u64,
+    pub storage_write_errors: u64,
 }
 
 /// Unified tagged WebSocket broadcast message for real-time streaming to connected clients.
@@ -118,7 +121,7 @@ impl WebSocketBroadcast {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub storage: InMemoryStorage,
+    pub storage: Storage,
     pub detectors: Vec<Arc<dyn Detector>>,
     pub started_at: DateTime<Utc>,
     pub is_mock_feed: bool,
@@ -133,14 +136,14 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(
-        storage: InMemoryStorage,
+        storage: impl Into<Storage>,
         detectors: Vec<Arc<dyn Detector>>,
         is_mock_feed: bool,
     ) -> (Self, tokio::sync::broadcast::Sender<ChainEvent>) {
         let mut engine = IncidentWatchEngine::from_env();
         engine.load_targets(obschain_incidents::canonical_liquid_watch_targets());
         Self::with_metrics_and_watch_engine(
-            storage,
+            storage.into(),
             detectors,
             is_mock_feed,
             PipelineMetrics::default(),
@@ -149,7 +152,7 @@ impl AppState {
     }
 
     pub fn with_metrics(
-        storage: InMemoryStorage,
+        storage: impl Into<Storage>,
         detectors: Vec<Arc<dyn Detector>>,
         is_mock_feed: bool,
         metrics: PipelineMetrics,
@@ -157,7 +160,7 @@ impl AppState {
         let mut engine = IncidentWatchEngine::from_env();
         engine.load_targets(obschain_incidents::canonical_liquid_watch_targets());
         Self::with_metrics_and_watch_engine(
-            storage,
+            storage.into(),
             detectors,
             is_mock_feed,
             metrics,
@@ -166,12 +169,13 @@ impl AppState {
     }
 
     pub fn with_metrics_and_watch_engine(
-        storage: InMemoryStorage,
+        storage: impl Into<Storage>,
         detectors: Vec<Arc<dyn Detector>>,
         is_mock_feed: bool,
         metrics: PipelineMetrics,
         watch_engine: Arc<tokio::sync::RwLock<IncidentWatchEngine>>,
     ) -> (Self, tokio::sync::broadcast::Sender<ChainEvent>) {
+        let storage = storage.into();
         let (tx, _) = tokio::sync::broadcast::channel(1024);
         let (ws_tx, _) = tokio::sync::broadcast::channel(2048);
 
@@ -205,14 +209,31 @@ impl AppState {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageHealthResponse {
+    pub backend: &'static str,
+    pub status: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageStatusResponse {
+    pub backend: &'static str,
+    pub status: &'static str,
+    pub events_persisted: usize,
+    pub incidents_persisted: usize,
+    pub incident_activities_persisted: usize,
+    pub watch_targets_loaded: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: &'static str,
     pub timestamp: DateTime<Utc>,
     pub version: &'static str,
+    pub storage: StorageHealthResponse,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub service: &'static str,
     pub network: &'static str,
@@ -226,6 +247,7 @@ pub struct StatusResponse {
     pub events_detected: u64,
     pub active_detectors: Vec<&'static str>,
     pub storage_backend: &'static str,
+    pub storage: StorageStatusResponse,
     pub is_mock_feed: bool,
     pub metrics: PipelineMetricsResponse,
     pub active_incident_watchers: usize,
@@ -247,10 +269,35 @@ pub struct IncidentActivityQuery {
     pub status: Option<ActivityStatus>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize)]
+pub struct IncidentAlertQuery {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ApiErrorResponse {
     pub error: String,
     pub code: u16,
+}
+
+pub fn map_storage_error(e: StorageError) -> (StatusCode, Json<ApiErrorResponse>) {
+    match e {
+        StorageError::Database(msg) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiErrorResponse {
+                error: format!("Storage service unavailable: {msg}"),
+                code: 503,
+            }),
+        ),
+        other => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiErrorResponse {
+                error: other.to_string(),
+                code: 500,
+            }),
+        ),
+    }
 }
 
 pub fn create_router(state: AppState) -> Router {
@@ -288,9 +335,14 @@ pub fn create_router(state: AppState) -> Router {
             get(get_incident_watch_targets_handler),
         )
         .route(
+            "/api/v1/incidents/{id}/alerts",
+            get(get_incident_alerts_handler),
+        )
+        .route(
             "/api/v1/incident-activity",
             get(list_incident_activity_handler),
         )
+        .route("/api/v1/incident-alerts", get(list_incident_alerts_handler))
         .route("/api/v1/ws", get(ws_handler))
         .layer(TraceLayer::new_for_http())
         // Guard against oversized request DOS (limit to 1MB)
@@ -299,11 +351,15 @@ pub fn create_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn health_handler() -> impl IntoResponse {
+async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     Json(HealthResponse {
         status: "ok",
         timestamp: Utc::now(),
         version: env!("CARGO_PKG_VERSION"),
+        storage: StorageHealthResponse {
+            backend: state.storage.backend_name(),
+            status: "connected",
+        },
     })
 }
 
@@ -333,6 +389,23 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
         .incident_alerts_emitted
         .load(Ordering::Relaxed);
 
+    let storage_backend_display = match state.storage.backend_name() {
+        "postgres" => "postgres (SQLx connection pool)",
+        _ => "in-memory (bounded VecDeque)",
+    };
+
+    let (events_persisted, incidents_persisted, activities_persisted, targets_loaded) =
+        state.storage.telemetry_counts();
+
+    let storage_status = StorageStatusResponse {
+        backend: state.storage.backend_name(),
+        status: "connected",
+        events_persisted,
+        incidents_persisted,
+        incident_activities_persisted: activities_persisted,
+        watch_targets_loaded: targets_loaded,
+    };
+
     Json(StatusResponse {
         service: "obschain",
         network: "bitcoin",
@@ -345,7 +418,8 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
         tip_height,
         events_detected,
         active_detectors,
-        storage_backend: "in-memory (bounded VecDeque)",
+        storage_backend: storage_backend_display,
+        storage: storage_status,
         is_mock_feed: state.is_mock_feed,
         metrics: state.metrics.snapshot(),
         active_incident_watchers,
@@ -422,15 +496,7 @@ async fn list_events_handler(
         .storage
         .list_events(limit, offset)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiErrorResponse {
-                    error: e.to_string(),
-                    code: 500,
-                }),
-            )
-        })?;
+        .map_err(map_storage_error)?;
 
     Ok(Json(serde_json::json!({
         "events": events,
@@ -445,15 +511,11 @@ async fn get_event_handler(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
-    let event_opt = state.storage.get_event_by_id(id).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiErrorResponse {
-                error: e.to_string(),
-                code: 500,
-            }),
-        )
-    })?;
+    let event_opt = state
+        .storage
+        .get_event_by_id(id)
+        .await
+        .map_err(map_storage_error)?;
 
     match event_opt {
         Some(event) => Ok(Json(event)),
@@ -478,15 +540,7 @@ async fn list_incidents_handler(
         .storage
         .list_incidents(limit, offset)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiErrorResponse {
-                    error: e.to_string(),
-                    code: 500,
-                }),
-            )
-        })?;
+        .map_err(map_storage_error)?;
 
     Ok(Json(serde_json::json!({
         "incidents": incidents,
@@ -505,15 +559,7 @@ async fn get_incident_or_404(
         .storage
         .get_incident_by_id_or_case_id(identifier)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiErrorResponse {
-                    error: e.to_string(),
-                    code: 500,
-                }),
-            )
-        })?;
+        .map_err(map_storage_error)?;
 
     incident_opt.ok_or_else(|| {
         (
@@ -581,15 +627,7 @@ async fn get_incident_activity_handler(
         .storage
         .list_activities(Some(incident.id), query.status, limit, offset)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiErrorResponse {
-                    error: e.to_string(),
-                    code: 500,
-                }),
-            )
-        })?;
+        .map_err(map_storage_error)?;
 
     Ok(Json(serde_json::json!({
         "incident_id": incident.id,
@@ -611,15 +649,7 @@ async fn get_incident_watch_targets_handler(
         .storage
         .list_watch_targets(Some(incident.id), 100, 0)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiErrorResponse {
-                    error: e.to_string(),
-                    code: 500,
-                }),
-            )
-        })?;
+        .map_err(map_storage_error)?;
 
     // Safe public metadata conversion: redacts internal/sensitive investigation settings
     let public_targets: Vec<PublicWatchTarget> = targets
@@ -635,6 +665,31 @@ async fn get_incident_watch_targets_handler(
     })))
 }
 
+async fn get_incident_alerts_handler(
+    State(state): State<AppState>,
+    Path(identifier): Path<String>,
+    Query(query): Query<IncidentAlertQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
+    let incident = get_incident_or_404(&state, &identifier).await?;
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let offset = query.offset.unwrap_or(0);
+
+    let alerts = state
+        .storage
+        .list_alerts(Some(incident.id), limit, offset)
+        .await
+        .map_err(map_storage_error)?;
+
+    Ok(Json(serde_json::json!({
+        "incident_id": incident.id,
+        "case_id": incident.case_id,
+        "alerts": alerts,
+        "count": alerts.len(),
+        "limit": limit,
+        "offset": offset,
+    })))
+}
+
 async fn list_incident_activity_handler(
     State(state): State<AppState>,
     Query(query): Query<IncidentActivityQuery>,
@@ -646,19 +701,32 @@ async fn list_incident_activity_handler(
         .storage
         .list_activities(None, query.status, limit, offset)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiErrorResponse {
-                    error: e.to_string(),
-                    code: 500,
-                }),
-            )
-        })?;
+        .map_err(map_storage_error)?;
 
     Ok(Json(serde_json::json!({
         "activity": activity,
         "count": activity.len(),
+        "limit": limit,
+        "offset": offset,
+    })))
+}
+
+async fn list_incident_alerts_handler(
+    State(state): State<AppState>,
+    Query(query): Query<IncidentAlertQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let offset = query.offset.unwrap_or(0);
+
+    let alerts = state
+        .storage
+        .list_alerts(None, limit, offset)
+        .await
+        .map_err(map_storage_error)?;
+
+    Ok(Json(serde_json::json!({
+        "alerts": alerts,
+        "count": alerts.len(),
         "limit": limit,
         "offset": offset,
     })))

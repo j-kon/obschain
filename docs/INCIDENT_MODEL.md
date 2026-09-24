@@ -191,3 +191,24 @@ The Live Incident Watch Engine actively correlates incoming Bitcoin network obse
 4. **Bounded Descendant Tracking**:
    - Dynamic UTXO child tracking is bounded to `OBSCHAIN_INCIDENT_FOLLOW_DEPTH` (default 3 hops, hard cap 5) to prevent combinatorial state explosions and tracking dilution.
 
+---
+
+## 7. Durable Storage & Relational Persistence (Phase 4B)
+
+When `OBSCHAIN_STORAGE_BACKEND=postgres` is configured, the entire incident intelligence domain is persisted across 17 normalized relational tables:
+
+### Relational Table Mapping
+- `incidents`: Root incident record identified by permanent `UUID` and human-readable `case_id` (e.g. `OC-2026-0001`).
+- `incident_recovery_snapshots`: **Append-only** table storing historical recovery state. Historical recovery estimates or official assessments are never overwritten. Every snapshot records `affected_sats`, `recovered_sats`, `outstanding_sats`, `is_estimate`, and `as_of_timestamp`.
+- `incident_sources`: External citations, advisories, and technical reports. URLs are normalized to eliminate duplicate entries.
+- `incident_evidence`: Typed evidence items with strict `classification` (`ON_CHAIN_VERIFIED`, `OFFICIALLY_ATTRIBUTED`, etc.), transaction references, and block heights.
+- `incident_updates`: Append-only chronological investigation updates. Old updates are never updated in place.
+- `incident_watch_targets`: Monitored outpoints, scripts, transactions, and addresses. Uses deterministic UUIDs (`0c202600-0001-0001-...`) and unique composite indexes to prevent duplicates across restarts.
+- `incident_activities`: Live correlation records (`MEMPOOL`, `CONFIRMED`, `REORGED_OUT`). Updating confirmation status updates the existing activity via deterministic `dedup_key` rather than creating duplicate entries.
+- `incident_alerts`: Monitored incident notifications decoupled from raw activity.
+
+### Epistemological Database Constraints
+1. **Recovery Immutability Invariant**: No database trigger, service logic, or repository method updates `incident_recovery_snapshots` upon an `incident_activities` write.
+2. **Deterministic Seed Invariance**: Running ObsChain multiple times executes an idempotent seed operation that updates canonical incident records in place without duplicating child records or resetting live incident activity.
+3. **Integer Non-Negativity**: SQL `CHECK (affected_sats >= 0)`, `CHECK (recovered_sats >= 0)`, and `CHECK (recovered_sats <= affected_sats)` guarantee monetary sanity at the schema level.
+

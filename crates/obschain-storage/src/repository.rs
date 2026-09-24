@@ -6,7 +6,7 @@ use std::{
 use chrono::Utc;
 use obschain_core::{
     ActivityStatus, ChainEvent, ConfidenceLevel, EventSeverity, EventType, Incident,
-    IncidentActivity, WatchTarget,
+    IncidentActivity, IncidentAlert, WatchTarget,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -21,6 +21,20 @@ pub enum StorageError {
 
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+}
+
+/// Safely convert Rust u64 satoshis / block heights to PostgreSQL signed BIGINT (i64).
+pub fn u64_to_i64_checked(val: u64) -> Result<i64, StorageError> {
+    i64::try_from(val).map_err(|_| {
+        StorageError::Database(format!("Value {val} exceeds signed 64-bit integer limit"))
+    })
+}
+
+/// Safely convert PostgreSQL signed BIGINT (i64) back to Rust u64.
+pub fn i64_to_u64_checked(val: i64) -> Result<u64, StorageError> {
+    u64::try_from(val).map_err(|_| {
+        StorageError::Database(format!("Negative integer {val} cannot convert to u64"))
+    })
 }
 
 #[async_trait::async_trait]
@@ -78,6 +92,18 @@ pub trait IncidentActivityRepository: Send + Sync {
     ) -> Result<Option<IncidentActivity>, StorageError>;
 }
 
+#[async_trait::async_trait]
+pub trait IncidentAlertRepository: Send + Sync {
+    async fn save_alert(&self, alert: &IncidentAlert) -> Result<(), StorageError>;
+    async fn list_alerts(
+        &self,
+        incident_id: Option<Uuid>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<IncidentAlert>, StorageError>;
+    async fn get_alert_by_id(&self, id: Uuid) -> Result<Option<IncidentAlert>, StorageError>;
+}
+
 /// Thread-safe in-memory event, incident, watch target, and activity store with bounded retention.
 /// Uses circular VecDeques to bound maximum memory consumption.
 #[derive(Clone)]
@@ -86,6 +112,7 @@ pub struct InMemoryStorage {
     incidents: Arc<RwLock<Vec<Incident>>>,
     watch_targets: Arc<RwLock<Vec<WatchTarget>>>,
     activities: Arc<RwLock<VecDeque<IncidentActivity>>>,
+    alerts: Arc<RwLock<VecDeque<IncidentAlert>>>,
     max_events: usize,
     max_activities: usize,
 }
@@ -116,6 +143,9 @@ impl InMemoryStorage {
             activities: Arc::new(RwLock::new(VecDeque::with_capacity(
                 max_activities.min(1000),
             ))),
+            alerts: Arc::new(RwLock::new(VecDeque::with_capacity(
+                max_activities.min(1000),
+            ))),
             max_events,
             max_activities,
         };
@@ -130,6 +160,9 @@ impl InMemoryStorage {
             incidents: Arc::new(RwLock::new(Vec::new())),
             watch_targets: Arc::new(RwLock::new(Vec::new())),
             activities: Arc::new(RwLock::new(VecDeque::with_capacity(
+                Self::DEFAULT_MAX_ACTIVITIES.min(1000),
+            ))),
+            alerts: Arc::new(RwLock::new(VecDeque::with_capacity(
                 Self::DEFAULT_MAX_ACTIVITIES.min(1000),
             ))),
             max_events,
@@ -180,6 +213,16 @@ impl InMemoryStorage {
 
     pub fn clear_activities(&self) {
         if let Ok(mut lock) = self.activities.write() {
+            lock.clear();
+        }
+    }
+
+    pub fn alert_count(&self) -> usize {
+        self.alerts.read().map(|l| l.len()).unwrap_or(0)
+    }
+
+    pub fn clear_alerts(&self) {
+        if let Ok(mut lock) = self.alerts.write() {
             lock.clear();
         }
     }
@@ -485,6 +528,63 @@ impl IncidentActivityRepository for InMemoryStorage {
             .read()
             .map_err(|e| StorageError::Database(e.to_string()))?;
         Ok(lock.iter().find(|a| a.dedup_key == dedup_key).cloned())
+    }
+}
+
+#[async_trait::async_trait]
+impl IncidentAlertRepository for InMemoryStorage {
+    async fn save_alert(&self, alert: &IncidentAlert) -> Result<(), StorageError> {
+        let mut lock = self
+            .alerts
+            .write()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        if !lock.iter().any(|a| a.id == alert.id) {
+            if lock.len() >= self.max_activities {
+                lock.pop_front();
+            }
+            lock.push_back(alert.clone());
+        }
+
+        Ok(())
+    }
+
+    async fn list_alerts(
+        &self,
+        incident_id: Option<Uuid>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<IncidentAlert>, StorageError> {
+        let lock = self
+            .alerts
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let filtered: Vec<IncidentAlert> = lock
+            .iter()
+            .rev()
+            .filter(|a| {
+                if let Some(inc_id) = incident_id {
+                    if a.incident_id != inc_id {
+                        return false;
+                    }
+                }
+                true
+            })
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect();
+
+        Ok(filtered)
+    }
+
+    async fn get_alert_by_id(&self, id: Uuid) -> Result<Option<IncidentAlert>, StorageError> {
+        let lock = self
+            .alerts
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(lock.iter().find(|a| a.id == id).cloned())
     }
 }
 

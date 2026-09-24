@@ -210,3 +210,92 @@ The pipeline tracks key metrics exported in `StatusResponse.metrics`:
 - `incident_watch_targets`: Total active watch targets loaded into engine indices
 - `incident_activities_detected`: Total incident correlation activities detected
 - `incident_alerts_emitted`: High-priority incident alerts emitted and broadcasted
+- `storage_write_errors`: Count of transient or exhausted storage write errors
+
+---
+
+## Durable PostgreSQL Storage Architecture (Phase 4B)
+
+### 1. Repository Abstraction Layer
+
+Storage is fully decoupled from the pipeline via asynchronous repository traits defined in `obschain-storage`:
+
+```rust
+#[async_trait]
+pub trait EventRepository: Send + Sync {
+    async fn save_event(&self, event: &ChainEvent) -> Result<(), StorageError>;
+    async fn get_event(&self, id: Uuid) -> Result<Option<ChainEvent>, StorageError>;
+    async fn list_events(&self, limit: usize, offset: usize) -> Result<Vec<ChainEvent>, StorageError>;
+}
+
+#[async_trait]
+pub trait IncidentRepository: Send + Sync {
+    async fn save_incident(&self, incident: &Incident) -> Result<(), StorageError>;
+    async fn get_incident(&self, id: Uuid) -> Result<Option<Incident>, StorageError>;
+    async fn get_incident_by_case_id(&self, case_id: &str) -> Result<Option<Incident>, StorageError>;
+    async fn list_incidents(&self, limit: usize, offset: usize) -> Result<Vec<Incident>, StorageError>;
+}
+
+#[async_trait]
+pub trait WatchTargetRepository: Send + Sync {
+    async fn save_watch_target(&self, target: &WatchTarget) -> Result<(), StorageError>;
+    async fn list_watch_targets_by_incident(&self, incident_id: Uuid) -> Result<Vec<WatchTarget>, StorageError>;
+}
+
+#[async_trait]
+pub trait IncidentActivityRepository: Send + Sync {
+    async fn save_activity(&self, activity: &IncidentActivity) -> Result<(), StorageError>;
+    async fn list_activities(&self, incident_id: Option<Uuid>, status: Option<ActivityStatus>, limit: usize, offset: usize) -> Result<Vec<IncidentActivity>, StorageError>;
+}
+
+#[async_trait]
+pub trait IncidentAlertRepository: Send + Sync {
+    async fn save_alert(&self, alert: &IncidentAlert) -> Result<(), StorageError>;
+    async fn list_alerts(&self, incident_id: Option<Uuid>, limit: usize, offset: usize) -> Result<Vec<IncidentAlert>, StorageError>;
+}
+```
+
+The unified `Storage` enum wraps either `InMemoryStorage` or `PostgresStorage`, allowing daemon and API handlers to interact exclusively with domain contracts.
+
+### 2. Normalized Relational Schema
+
+The PostgreSQL backend organizes incident intelligence into 17 relational tables:
+
+1. `chain_events`: Anomaly detection events with deterministic deduplication.
+2. `incidents`: Core dossier metadata (UUID, case_id, title, status, severity, recovery balances).
+3. `incident_recovery_snapshots`: Append-only historical recovery milestones.
+4. `incident_sources`: External disclosures, research papers, and advisories with URL normalization.
+5. `incident_evidence`: Provenance-classified evidence hierarchy with chain references.
+6. `incident_transactions`: Exploitation and remediation transaction references.
+7. `incident_blocks`: Chain block references.
+8. `incident_entities`: Entities and custodian organizations.
+9. `incident_messages`: Canonical on-chain communication messages (OP_RETURN).
+10. `incident_timeline`: Chronological incident events.
+11. `incident_technical_findings`: Cryptographic, script, or structural analysis findings.
+12. `incident_updates`: Append-only investigation updates.
+13. `incident_graph_nodes`: Forensic relationship graph nodes.
+14. `incident_graph_edges`: Directional typed graph relationships with referential integrity.
+15. `incident_watch_targets`: Monitored outpoints, scripts, transactions, and addresses with deterministic UUIDs.
+16. `incident_activities`: Observed on-chain activity correlated with watched targets.
+17. `incident_alerts`: High-priority alert emissions for critical incident movements.
+
+### 3. Epistemological Invariant: Rule 19
+
+ObsChain enforces strict separation between on-chain movement and financial recovery:
+- Moving incident funds proves cryptographic possession transfer, **not** that funds have been legally or operationally recovered.
+- `IncidentActivity` insertion **never** updates `incident_recovery_snapshots` or `incident.recovery`.
+- Recovery figures change solely when an explicit `RecoverySummary` or append-only update is recorded from authoritative disclosures.
+
+### 4. Write Failure & Retry Policy
+
+When live Bitcoin ingestion encounters transient database write failures:
+- The daemon retries up to 3 times using exponential backoff (100ms, 200ms, 400ms).
+- If retries are exhausted, the failure increments `metrics.storage_write_errors` and logs an error, while allowing the live pipeline to maintain ingestion without crash loops.
+- Read failures in API handlers return `503 Service Unavailable` rather than false `404 Not Found`.
+
+### 5. Performance & Telemetry Caching
+
+- `GET /api/v1/status` avoids expensive `SELECT COUNT(*)` queries on hot paths by leveraging cheap atomic counters pre-populated at startup and incremented on writes.
+- All query endpoints enforce clamped pagination (`default: 50`, `max: 200`).
+- Thoughtful composite indexes are placed on `(detected_at DESC)`, `(incident_id, observed_at DESC)`, and `(incident_id, as_of_timestamp DESC)`.
+

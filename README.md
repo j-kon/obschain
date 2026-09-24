@@ -191,10 +191,63 @@ ws.onmessage = (event) => {
 
 ---
 
+## Storage Architecture & PostgreSQL Persistence
+
+ObsChain supports two interchangeable storage backends behind unified repository traits:
+
+1. **`memory` (Default)**: In-memory bounded circular storage using thread-safe `RwLock<VecDeque>` and hash maps. Ideal for fast local development, unit tests, and CI without database infrastructure.
+2. **`postgres` (Durable)**: Production-grade persistent storage powered by SQLx, connection pooling, and 17 normalized relational tables. Preserves all chain events, incident intelligence, recovery snapshots, watch targets, on-chain activities, and alerts across restarts.
+
+### Switching Storage Backend
+
+Set via environment variables:
+
+```bash
+# In-Memory mode (default)
+export OBSCHAIN_STORAGE_BACKEND=memory
+
+# PostgreSQL mode
+export OBSCHAIN_STORAGE_BACKEND=postgres
+export DATABASE_URL=postgres://postgres:postgrespassword@localhost:5433/obschain
+export OBSCHAIN_DB_MAX_CONNECTIONS=10
+export OBSCHAIN_DB_MIN_CONNECTIONS=1
+export OBSCHAIN_DB_ACQUIRE_TIMEOUT_SECONDS=5
+```
+
+> **Safety Rule**: If `OBSCHAIN_STORAGE_BACKEND=postgres` is set but the database is unreachable or migrations fail, ObsChain **fails startup immediately with a clear error**. It does **NOT** silently fall back to in-memory mode, preventing operators from mistakenly assuming durability.
+
+### Local PostgreSQL Setup with Docker Compose
+
+Start the PostgreSQL service in the background:
+
+```bash
+docker compose up -d postgres
+```
+
+The service is pre-configured on port `5433` (avoiding local standard port 5432 conflicts) with database `obschain`.
+
+### Running Migrations
+
+Database migrations in `migrations/` are applied automatically by the daemon on startup via SQLx embedded migrations (`sqlx::migrate!`). You can also execute them manually using the SQLx CLI:
+
+```bash
+cargo install sqlx-cli --no-default-features --features rustls,postgres
+sqlx migrate run
+```
+
+### Persistence Guarantees
+
+- **Event Idempotency**: Anomaly detections and activities employ deterministic deduplication keys and `ON CONFLICT` database constraints. Replaying observations will never create duplicate records.
+- **Historical Recovery Preservation**: Incident recovery state is append-only (`incident_recovery_snapshots`). Historical recovery figures are never overwritten, maintaining full audit trails.
+- **Rule 19 (Movement != Recovery)**: Observed on-chain activity movements never automatically mutate incident recovery balances. Recovery balances change only via explicit verified recovery updates.
+- **Satoshi Precision**: All satoshi values are validated against signed 64-bit bounds (`BIGINT`) with checked Rust `u64` <-> SQL `i64` conversions.
+- **Credential Protection**: Database passwords and connection URIs are strictly redacted from logs, status endpoints, and panic payloads.
+
+---
+
 ## Known Limitations
 
 - **Mempool.space Dependency**: Initial live observation relies on mempool.space REST and WebSocket APIs. Direct validation against a local Bitcoin Core full node (RPC/ZMQ) is in development.
-- **In-Memory Retention**: Recent events are buffered in bounded circular memory (`OBSCHAIN_EVENT_STORE_LIMIT`). Persistent PostgreSQL storage will be hooked in a subsequent phase.
 
 ---
 

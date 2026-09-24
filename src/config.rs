@@ -1,9 +1,62 @@
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::str::FromStr;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageBackendConfig {
+    Memory,
+    Postgres,
+}
+
+impl std::fmt::Display for StorageBackendConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Memory => write!(f, "memory"),
+            Self::Postgres => write!(f, "postgres"),
+        }
+    }
+}
+
+impl FromStr for StorageBackendConfig {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "memory" | "mem" | "in-memory" | "" => Ok(Self::Memory),
+            "postgres" | "postgresql" | "pg" => Ok(Self::Postgres),
+            other => Err(format!(
+                "Invalid OBSCHAIN_STORAGE_BACKEND '{other}'. Supported backends: 'memory', 'postgres'"
+            )),
+        }
+    }
+}
+
+/// Helper function to safely redact passwords from database connection URLs before logging.
+pub fn redact_database_url(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some((s, r)) => (s, r),
+        None => return "<redacted>".to_string(),
+    };
+    if let Some((user_pass, host_db)) = rest.split_once('@') {
+        if let Some((user, _pass)) = user_pass.split_once(':') {
+            format!("{}://{}:***@{}", scheme, user, host_db)
+        } else {
+            format!("{}://***@{}", scheme, host_db)
+        }
+    } else {
+        format!("{}://{}", scheme, rest)
+    }
+}
 
 pub struct AppConfig {
     pub host: String,
     pub port: u16,
+    pub storage_backend: StorageBackendConfig,
     pub database_url: Option<String>,
+    pub db_max_connections: u32,
+    pub db_min_connections: u32,
+    pub db_acquire_timeout_seconds: u64,
     pub mempool_api_url: String,
     pub mempool_ws_url: String,
     pub bitcoin_rpc_url: Option<String>,
@@ -33,6 +86,25 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn from_env() -> Self {
+        let storage_backend = std::env::var("OBSCHAIN_STORAGE_BACKEND")
+            .ok()
+            .and_then(|v| StorageBackendConfig::from_str(&v).ok())
+            .unwrap_or(StorageBackendConfig::Memory);
+
+        let db_max_connections = std::env::var("OBSCHAIN_DB_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+
+        let db_min_connections = std::env::var("OBSCHAIN_DB_MIN_CONNECTIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+
+        let db_acquire_timeout_seconds = std::env::var("OBSCHAIN_DB_ACQUIRE_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
         let host = std::env::var("OBSCHAIN_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
         let port = std::env::var("OBSCHAIN_PORT")
             .ok()
@@ -156,7 +228,11 @@ impl AppConfig {
         Self {
             host,
             port,
+            storage_backend,
             database_url: std::env::var("DATABASE_URL").ok(),
+            db_max_connections,
+            db_min_connections,
+            db_acquire_timeout_seconds,
             mempool_api_url: std::env::var("MEMPOOL_API_URL")
                 .unwrap_or_else(|_| "https://mempool.space/api".to_string()),
             mempool_ws_url: std::env::var("MEMPOOL_WS_URL")

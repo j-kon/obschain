@@ -9,7 +9,7 @@ repository.workspace = true
 [dependencies]
 obschain-core = { workspace = true }
 obschain-incidents = { workspace = true }
-sqlx = { workspace = true }
+sqlx = { workspace = true, features = ["migrate"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -18,3 +18,8 @@ uuid = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[features]
+default = []
+postgres-tests = []
+

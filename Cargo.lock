@@ -1180,6 +1180,7 @@ dependencies = [
  "obschain-storage",
  "serde",
  "serde_json",
+ "sqlx",
  "thiserror",
  "tokio",
  "tokio-tungstenite 0.26.2",
