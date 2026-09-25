@@ -340,6 +340,13 @@ async fn main() -> anyhow::Result<()> {
                     sources.bitcoin_core_zmq = Some(rawblock_str.clone());
                 }
 
+                let gaps = coord_status_sync
+                    .zmq_sequence_gaps_total
+                    .load(Ordering::Relaxed);
+                let missed = coord_status_sync
+                    .zmq_notifications_missed_estimate
+                    .load(Ordering::Relaxed);
+
                 let resp = BitcoinCoreStatusResponse {
                     enabled: true,
                     connected: st.rpc_health == obschain_core::SourceHealthState::Connected,
@@ -353,6 +360,8 @@ async fn main() -> anyhow::Result<()> {
                         .map(|c| c.verification_progress),
                     pruned: st.capabilities.as_ref().map(|c| c.pruned),
                     txindex: st.capabilities.as_ref().map(|c| c.txindex_available),
+                    zmq_sequence_gaps: Some(gaps),
+                    zmq_notifications_missed: Some(missed),
                     zmq: BitcoinCoreZmqStatusResponse {
                         rawtx: rawtx_str,
                         rawblock: rawblock_str,
@@ -384,6 +393,14 @@ async fn main() -> anyhow::Result<()> {
                         .load(Ordering::Relaxed),
                     Ordering::Relaxed,
                 );
+                status_state
+                    .metrics
+                    .zmq_sequence_gaps_total
+                    .store(gaps, Ordering::Relaxed);
+                status_state
+                    .metrics
+                    .zmq_notifications_missed_estimate
+                    .store(missed, Ordering::Relaxed);
                 status_state.metrics.rpc_requests_total.store(
                     coord_status_sync.rpc_requests_total.load(Ordering::Relaxed),
                     Ordering::Relaxed,

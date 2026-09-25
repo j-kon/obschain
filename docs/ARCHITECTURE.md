@@ -350,17 +350,26 @@ The RPC adapter implements a robust, typed JSON-RPC 1.0 client tailored for long
 
 ### 2. Bitcoin Core ZeroMQ Adapter (`BitcoinZmqSubscriber`)
 
-The ZMQ subscriber provides ultra-low-latency real-time streaming using pure-Rust asynchronous Tokio sockets (`zeromq`):
-- **Topics Subscribed**:
-  - `rawtx`: Streams unconfirmed transaction hexes directly as they enter the node's memory pool.
-  - `rawblock`: Streams raw serialized block bytes immediately upon consensus validation by Bitcoin Core.
-  - `sequence`: Streams 1-byte ASCII tagged sequence notifications:
-    - `'C'`: Block connected (includes 8-byte LE height).
-    - `'D'`: Block disconnected (indicates reorganization; includes 8-byte LE height).
-    - `'A'`: Transaction added to mempool (includes 8-byte LE sequence counter).
-    - `'R'`: Transaction removed from mempool (e.g. replaced or evicted; includes 8-byte LE sequence counter).
-- **Memory & Parsing Safety**: Limits raw payload parsing to 16 MB frame size. Payload deserialization errors are safely handled without panics.
-- **Connection Lifecycle**: Employs bounded exponential backoff reconnection (500ms to 10s).
+The ZMQ subscriber provides ultra-low-latency real-time streaming using pure-Rust asynchronous Tokio sockets (`zeromq`), fully compliant with the Bitcoin Core v31.1 ZMQ specification (`doc/zmq.md`):
+- **Multipart Frame Structure**:
+  Every message published by Bitcoin Core consists of exactly 3 multipart frames:
+  - **Frame 1**: Topic name (`rawtx`, `rawblock`, `sequence`).
+  - **Frame 2**: Payload body.
+  - **Frame 3**: 4-byte little-endian ZMQ notification sequence number (`u32`).
+- **Topics & Payload Parsing**:
+  - `rawtx`: Streams raw serialized transaction bytes.
+  - `rawblock`: Streams raw serialized block bytes.
+  - `sequence`: Streams consensus and mempool sequence events (`BitcoinSequenceEvent`):
+    - `'C'`: **Block Connected** — 32-byte reversed block hash + 1-byte tag `'C'` (total 33 bytes).
+    - `'D'`: **Block Disconnected** — 32-byte reversed block hash + 1-byte tag `'D'` (total 33 bytes; chain reorganization).
+    - `'A'`: **Transaction Added** — 32-byte reversed txid + 1-byte tag `'A'` + 8-byte LE mempool sequence (total 41 bytes).
+    - `'R'`: **Transaction Removed** — 32-byte reversed txid + 1-byte tag `'R'` + 8-byte LE mempool sequence (total 41 bytes; RBF replacement or mempool eviction).
+- **Sequence Number Tracking & Separation**:
+  - *ZMQ Notification Sequence*: Tracked per topic via `ZmqSequenceTracker`. Detects missing notifications across network drops with `u32` wraparound support. Missing sequences mark health as `Degraded` and trigger bounded RPC reconciliation.
+  - *Mempool Sequence*: Tracked separately from ZMQ transport sequence to maintain ordering within the local node's mempool.
+- **Hash Byte Order**: Hashes in ZeroMQ notifications are published in reversed byte order, which directly matches the displayed hex / RPC representation without redundant double-reversal.
+- **Memory & Parsing Safety**: Limits raw payload parsing to 16 MB frame size. Validates exact body lengths and frame counts without panic.
+- **Connection Lifecycle**: Employs bounded exponential backoff reconnection (500ms to 10s). Reconnection resets topic sequence trackers to cleanly acquire the new baseline.
 
 ### 3. Source Reconciliation & Priority Hierarchy
 

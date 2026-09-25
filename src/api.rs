@@ -53,6 +53,8 @@ pub struct BitcoinCoreStatusResponse {
     pub verification_progress: Option<f64>,
     pub pruned: Option<bool>,
     pub txindex: Option<bool>,
+    pub zmq_sequence_gaps: Option<u64>,
+    pub zmq_notifications_missed: Option<u64>,
     pub zmq: BitcoinCoreZmqStatusResponse,
 }
 
@@ -91,6 +93,8 @@ pub struct PipelineMetrics {
     pub zmq_transactions_received: Arc<AtomicU64>,
     pub zmq_blocks_received: Arc<AtomicU64>,
     pub zmq_reconnects: Arc<AtomicU64>,
+    pub zmq_sequence_gaps_total: Arc<AtomicU64>,
+    pub zmq_notifications_missed_estimate: Arc<AtomicU64>,
     pub gap_blocks_reconciled: Arc<AtomicU64>,
     pub reorgs_detected: Arc<AtomicU64>,
     pub source_disagreements: Arc<AtomicU64>,
@@ -117,6 +121,10 @@ impl PipelineMetrics {
             zmq_transactions_received: self.zmq_transactions_received.load(Ordering::Relaxed),
             zmq_blocks_received: self.zmq_blocks_received.load(Ordering::Relaxed),
             zmq_reconnects: self.zmq_reconnects.load(Ordering::Relaxed),
+            zmq_sequence_gaps_total: self.zmq_sequence_gaps_total.load(Ordering::Relaxed),
+            zmq_notifications_missed_estimate: self
+                .zmq_notifications_missed_estimate
+                .load(Ordering::Relaxed),
             gap_blocks_reconciled: self.gap_blocks_reconciled.load(Ordering::Relaxed),
             reorgs_detected: self.reorgs_detected.load(Ordering::Relaxed),
             source_disagreements: self.source_disagreements.load(Ordering::Relaxed),
@@ -146,6 +154,8 @@ pub struct PipelineMetricsResponse {
     pub zmq_transactions_received: u64,
     pub zmq_blocks_received: u64,
     pub zmq_reconnects: u64,
+    pub zmq_sequence_gaps_total: u64,
+    pub zmq_notifications_missed_estimate: u64,
     pub gap_blocks_reconciled: u64,
     pub reorgs_detected: u64,
     pub source_disagreements: u64,

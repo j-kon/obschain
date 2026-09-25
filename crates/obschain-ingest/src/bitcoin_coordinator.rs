@@ -14,13 +14,13 @@ use obschain_core::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::{
     bitcoin_rpc::{BitcoinCoreRpcClient, BitcoinNodeCapabilities, BitcoinRpcError},
     bitcoin_zmq::{
-        parse_raw_block, BitcoinZmqEndpointsStatus, BitcoinZmqMessage, BitcoinZmqSubscriber,
-        ZmqSequenceEvent,
+        parse_raw_block, BitcoinSequenceEvent, BitcoinZmqEndpointsStatus, BitcoinZmqMessage,
+        BitcoinZmqSubscriber, BitcoinZmqTopic,
     },
 };
 
@@ -62,6 +62,8 @@ pub struct BitcoinCoordinator {
     pub gap_blocks_reconciled: Arc<AtomicU64>,
     pub zmq_transactions_received: Arc<AtomicU64>,
     pub zmq_blocks_received: Arc<AtomicU64>,
+    pub zmq_sequence_gaps_total: Arc<AtomicU64>,
+    pub zmq_notifications_missed_estimate: Arc<AtomicU64>,
     pub rpc_requests_total: Arc<AtomicU64>,
     pub rpc_errors_total: Arc<AtomicU64>,
 }
@@ -92,6 +94,8 @@ impl BitcoinCoordinator {
             gap_blocks_reconciled: Arc::new(AtomicU64::new(0)),
             zmq_transactions_received: Arc::new(AtomicU64::new(0)),
             zmq_blocks_received: Arc::new(AtomicU64::new(0)),
+            zmq_sequence_gaps_total: Arc::new(AtomicU64::new(0)),
+            zmq_notifications_missed_estimate: Arc::new(AtomicU64::new(0)),
             rpc_requests_total: Arc::new(AtomicU64::new(0)),
             rpc_errors_total: Arc::new(AtomicU64::new(0)),
         }
@@ -188,32 +192,81 @@ impl BitcoinCoordinator {
                         };
 
                         match msg {
-                            BitcoinZmqMessage::RawTx(tx) => {
+                            BitcoinZmqMessage::RawTx {
+                                transaction,
+                                zmq_sequence: _,
+                            } => {
                                 coord.zmq_transactions_received.fetch_add(1, Ordering::Relaxed);
-                                if obs_tx.send(Observation::Transaction(tx)).await.is_err() {
+                                if obs_tx.send(Observation::Transaction(transaction)).await.is_err() {
                                     break;
                                 }
                             }
-                            BitcoinZmqMessage::RawBlock { block, transactions } => {
+                            BitcoinZmqMessage::RawBlock {
+                                block,
+                                transactions,
+                                zmq_sequence: _,
+                            } => {
                                 coord.zmq_blocks_received.fetch_add(1, Ordering::Relaxed);
                                 coord.process_zmq_block(block, transactions, &obs_tx).await;
                             }
                             BitcoinZmqMessage::Sequence(seq) => {
                                 match seq {
-                                    ZmqSequenceEvent::BlockConnected { block_hash, height } => {
-                                        debug!(hash = %block_hash, height = ?height, "ZMQ sequence: block connected");
+                                    BitcoinSequenceEvent::BlockConnected {
+                                        block_hash,
+                                        zmq_sequence,
+                                    } => {
+                                        tracing::debug!(
+                                            hash = %block_hash,
+                                            zmq_seq = zmq_sequence,
+                                            "ZMQ sequence: block connected"
+                                        );
                                     }
-                                    ZmqSequenceEvent::BlockDisconnected { block_hash, height } => {
-                                        info!(hash = %block_hash, height = ?height, "ZMQ sequence: block disconnected (reorg triggered)");
+                                    BitcoinSequenceEvent::BlockDisconnected {
+                                        block_hash,
+                                        zmq_sequence,
+                                    } => {
+                                        tracing::info!(
+                                            hash = %block_hash,
+                                            zmq_seq = zmq_sequence,
+                                            "ZMQ sequence: block disconnected (reorg triggered)"
+                                        );
                                         coord.investigate_chain_tips(&obs_tx).await;
                                     }
-                                    ZmqSequenceEvent::TxAddedToMempool { txid, mempool_seq } => {
-                                        debug!(txid = %txid, seq = mempool_seq, "ZMQ sequence: tx added to mempool");
+                                    BitcoinSequenceEvent::TransactionAdded {
+                                        txid,
+                                        mempool_sequence,
+                                        zmq_sequence,
+                                    } => {
+                                        tracing::debug!(
+                                            txid = %txid,
+                                            mempool_seq = mempool_sequence,
+                                            zmq_seq = zmq_sequence,
+                                            "ZMQ sequence: tx added to mempool"
+                                        );
                                     }
-                                    ZmqSequenceEvent::TxRemovedFromMempool { txid, mempool_seq } => {
-                                        debug!(txid = %txid, seq = mempool_seq, "ZMQ sequence: tx removed from mempool");
+                                    BitcoinSequenceEvent::TransactionRemoved {
+                                        txid,
+                                        mempool_sequence,
+                                        zmq_sequence,
+                                    } => {
+                                        tracing::debug!(
+                                            txid = %txid,
+                                            mempool_seq = mempool_sequence,
+                                            zmq_seq = zmq_sequence,
+                                            "ZMQ sequence: tx removed from mempool"
+                                        );
                                     }
                                 }
+                            }
+                            BitcoinZmqMessage::SequenceGap {
+                                topic,
+                                previous,
+                                current,
+                                missed,
+                            } => {
+                                coord
+                                    .handle_sequence_gap(topic, previous, current, missed, &obs_tx)
+                                    .await;
                             }
                         }
                     }
@@ -400,6 +453,57 @@ impl BitcoinCoordinator {
         }
     }
 
+    /// Handles a detected ZMQ notification sequence gap: increments metrics,
+    /// marks topic health Degraded, and triggers bounded RPC reconciliation.
+    pub async fn handle_sequence_gap(
+        &self,
+        topic: BitcoinZmqTopic,
+        previous: u32,
+        current: u32,
+        missed: u32,
+        obs_tx: &mpsc::Sender<Observation>,
+    ) {
+        self.zmq_sequence_gaps_total.fetch_add(1, Ordering::Relaxed);
+        self.zmq_notifications_missed_estimate
+            .fetch_add(missed as u64, Ordering::Relaxed);
+        tracing::warn!(
+            topic = topic.as_topic_str(),
+            previous,
+            current,
+            missed,
+            "ZMQ notification sequence gap detected; marking degraded and triggering bounded recovery"
+        );
+
+        // Mark source health degraded for this topic
+        self.zmq
+            .set_topic_status(topic, SourceHealthState::Degraded)
+            .await;
+        {
+            let mut st = self.status.write().await;
+            match topic {
+                BitcoinZmqTopic::RawTx => st.zmq_status.rawtx = SourceHealthState::Degraded,
+                BitcoinZmqTopic::RawBlock => st.zmq_status.rawblock = SourceHealthState::Degraded,
+                BitcoinZmqTopic::Sequence => st.zmq_status.sequence = SourceHealthState::Degraded,
+            }
+        }
+
+        match topic {
+            BitcoinZmqTopic::RawBlock | BitcoinZmqTopic::Sequence => {
+                self.reconcile_tip_and_gap(obs_tx).await;
+            }
+            BitcoinZmqTopic::RawTx => {
+                // Refresh mempool state via RPC
+                if let Ok(mempool_info) = self.rpc.get_mempool_info().await {
+                    tracing::debug!(
+                        size = mempool_info.size,
+                        bytes = mempool_info.bytes,
+                        "Refreshed mempool state after ZMQ rawtx gap"
+                    );
+                }
+            }
+        }
+    }
+
     /// Reconciles missed blocks and updates node health state periodically.
     pub async fn reconcile_tip_and_gap(&self, obs_tx: &mpsc::Sender<Observation>) {
         self.rpc_requests_total.fetch_add(1, Ordering::Relaxed);
@@ -445,11 +549,16 @@ impl BitcoinCoordinator {
                     if let Ok(hash) = self.rpc.get_block_hash(height).await {
                         if let Ok(hex_str) = self.rpc.get_block_raw_hex(&hash).await {
                             if let Ok(bytes) = Vec::<u8>::from_hex(&hex_str) {
-                                if let Ok((block_obs, txs)) = parse_raw_block(
+                                if let Ok((mut block_obs, mut txs)) = parse_raw_block(
                                     &bytes,
                                     Some("rpc:gap_reconciliation"),
                                     16 * 1024 * 1024,
                                 ) {
+                                    block_obs.height = height;
+                                    for tx in &mut txs {
+                                        tx.block_height = Some(height);
+                                        tx.block_hash = Some(hash.clone());
+                                    }
                                     let _ = obs_tx.send(Observation::Block(block_obs)).await;
                                     for tx in txs {
                                         let _ = obs_tx.send(Observation::Transaction(tx)).await;

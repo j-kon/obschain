@@ -1,8 +1,20 @@
 version: '3.8'
 
+# NOTE: The reference version for ObsChain development, CI, and regtest verification
+# is Bitcoin Core v31.1 (installed natively via Homebrew or compiled from source).
+# Third-party Docker Hub images (e.g. ruimarinho/bitcoin-core:28) lag behind upstream
+# Bitcoin Core releases and do not publish official v31.1 tags.
+# When running via Docker, ruimarinho/bitcoin-core:28 may be used for legacy/container testing,
+# but native v31.1 is the authoritative reference environment.
+#
+# SECURITY NOTICE:
+# Bitcoin Core's ZMQ transport performs NO authentication or encryption.
+# Never expose ZMQ ports (28332, 28333, 28334) or RPC ports (18443) on public network interfaces (0.0.0.0).
+# All host port mappings are strictly bound to localhost (127.0.0.1).
+
 services:
   bitcoind-regtest:
-    image: ruimarinho/bitcoin-core:26.0
+    image: ruimarinho/bitcoin-core:28
     container_name: obschain-bitcoind-regtest
     restart: unless-stopped
     command:
@@ -12,18 +24,25 @@ services:
       - -rpcuser=obschain
       - -rpcpassword=obschainrpcpassword
       - -rpcbind=0.0.0.0
-      - -rpcallowip=0.0.0.0/0
+      - -rpcallowip=127.0.0.1
+      - -rpcallowip=172.16.0.0/12
+      - -rpcallowip=192.168.0.0/16
+      - -rpcallowip=10.0.0.0/8
       - -zmqpubrawtx=tcp://0.0.0.0:28332
       - -zmqpubrawblock=tcp://0.0.0.0:28333
       - -zmqpubsequence=tcp://0.0.0.0:28334
+      - -zmqpubrawtxhwm=10000
+      - -zmqpubrawblockhwm=1000
+      - -zmqpubsequencehwm=10000
       - -fallbackfee=0.0001
     ports:
-      - "18443:18443"
-      - "28332:28332"
-      - "28333:28333"
-      - "28334:28334"
+      - "127.0.0.1:18443:18443"
+      - "127.0.0.1:28332:28332"
+      - "127.0.0.1:28333:28333"
+      - "127.0.0.1:28334:28334"
     volumes:
       - bitcoin_regtest_data:/home/bitcoin/.bitcoin
 
 volumes:
   bitcoin_regtest_data:
+

@@ -79,3 +79,4 @@ tower-http = { workspace = true }
 
 [dev-dependencies]
 tokio-tungstenite = { workspace = true }
+zeromq = { workspace = true }

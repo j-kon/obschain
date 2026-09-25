@@ -84,18 +84,52 @@ ObsChain implements authoritative source priority:
 
 ### How Sovereign Ingestion Works
 
-1. **Bitcoin Core RPC & ZMQ**:
-   - **RPC Client (`BitcoinCoreRpcClient`)**: Constrained, typed JSON-RPC client supporting cookie authentication (`.cookie`) or credentials. Validates network identity on startup and polls chain tips and capabilities (`getblockchaininfo`, `getnetworkinfo`, `getchaintips`, etc.).
-   - **ZeroMQ Subscriber (`BitcoinZmqSubscriber`)**: Subscribes to `rawtx`, `rawblock`, and `sequence` using Tokio TCP streams with bounded message frames (max 16 MB) and exponential backoff reconnection.
-   - **Sequence Event Processing**: Parses Bitcoin Core sequence notifications:
-     - `'C'`: Block connected (confirmation advance).
-     - `'D'`: Block disconnected (chain reorganization).
-     - `'A'`: Transaction added to mempool.
-     - `'R'`: Transaction removed from mempool.
-2. **Chain Reorganization & Gap Reconciliation**:
-   - **Tip Continuity Tracking**: Evaluates parent block hashes on arrival. If a new block does not build on the current tip, triggers ancestor investigation via `getchaintips` and `getblockheader`.
-   - **Bounded Gap Replay**: Reconciles missed blocks across node restarts up to `OBSCHAIN_RECONCILE_MAX_BLOCKS` (default 100). Exceeded gaps trigger a warning and baseline update without unbounded execution blocking.
-3. **Sovereign-Only Mode (`OBSCHAIN_SOVEREIGN_ONLY=true`)**:
+1. **Bitcoin Core RPC & ZMQ Architecture**:
+   - **RPC Client (`BitcoinCoreRpcClient`)**: Constrained, typed JSON-RPC client supporting cookie authentication (`.cookie`) or credentials. Validates network identity on startup and polls chain tips and capabilities (`getblockchaininfo`, `getnetworkinfo`, `getchaintips`, `getindexinfo`).
+   - **Authoritative ZeroMQ Multipart Protocol (v31.1 Specification)**:
+     All Bitcoin Core ZeroMQ messages follow a strict 3-frame multipart structure:
+     ```text
+     Frame 1: Topic string ("rawtx", "rawblock", "sequence")
+     Frame 2: Body payload
+     Frame 3: 4-byte little-endian ZMQ notification sequence number (u32)
+     ```
+   - **Sequence Event Processing (`BitcoinSequenceEvent`)**:
+     Bitcoin Core publishes mempool and block events on the `sequence` topic with exact body length validation:
+     - `'C'`: **Block Connected** — 32-byte reversed block hash + 1-byte `'C'` tag (total 33 bytes).
+     - `'D'`: **Block Disconnected** — 32-byte reversed block hash + 1-byte `'D'` tag (total 33 bytes; reorganization).
+     - `'A'`: **Transaction Added** — 32-byte reversed txid + 1-byte `'A'` tag + 8-byte LE mempool sequence number (total 41 bytes).
+     - `'R'`: **Transaction Removed** — 32-byte reversed txid + 1-byte `'R'` tag + 8-byte LE mempool sequence number (total 41 bytes; RBF replacement or mempool eviction).
+   - **ZMQ Notification Sequence vs Mempool Sequence**:
+     - *ZMQ Notification Sequence Number* (`u32`, 4-byte LE in Frame 3): Per-topic sequence counter incremented by Bitcoin Core on every published message, allowing subscribers to detect network packet loss or dropped notifications independently across `rawtx`, `rawblock`, and `sequence`.
+     - *Mempool Sequence Number* (`u64`, 8-byte LE in Frame 2 of `'A'`/`'R'`): Node-wide transaction order sequence inside Bitcoin Core's mempool, strictly separate from transport sequence counters.
+
+2. **Per-Topic Notification Loss Detection & Bounded Recovery**:
+   - **Sequence Gap Tracking (`ZmqSequenceTracker`)**: Independently tracks sequence progression for each topic with seamless `u32` wraparound handling (`u32::MAX -> 0`). Detects single-increment progression (`100 -> 101`) as normal and multi-step jumps (`100 -> 104`) as a gap with missed notification estimation (`missed = 3`).
+   - **Source Health State Progression**:
+     ```text
+     CONNECTED ──(gap detected)──> DEGRADED ──(reconcile)──> RECONCILING ──(synced)──> CONNECTED
+     ```
+   - **Bounded Reconciliation**:
+     - For block/sequence gaps: Triggers tip continuity check and reconciles missed blocks via RPC up to `OBSCHAIN_RECONCILE_MAX_BLOCKS` (default 100).
+     - For mempool gaps: Refreshes mempool status (`getmempoolinfo`) and backlog tracking via RPC.
+     - Sequence gaps increment telemetry counters: `zmq_sequence_gaps_total` and `zmq_notifications_missed_estimate`.
+   - **Duplicate `rawtx` Lifecycle & Deduplication**:
+     Bitcoin Core publishes `rawtx` twice for transactions: once when entering the mempool, and again when arriving inside a confirmed block. ObsChain's `EventDeduplicator` ensures the second notification never produces duplicate logical anomaly events, updates confirmation state, and preserves multi-observation witness provenance.
+
+3. **Bitcoin Core Version Compatibility Matrix**:
+   - **v31.1 (Reference / Primary Tested)**: Full feature parity and protocol compliance with official `doc/zmq.md` v31.1 specifications, including 3-frame multipart ZMQ, 41-byte A/R events, `getindexinfo` txindex inspection, and little-endian sequence tracking. Native macOS/Linux reference test environment.
+   - **v31.0**: Fully compatible with the same multipart wire format and RPC interfaces.
+   - **v28.x / v27.x**: Compatible fallback for legacy or containerized environments (with `-zmqpubsequence` and `-txindex=1`). Note: Docker Hub community images (e.g. `ruimarinho/bitcoin-core`) currently lag behind upstream v31.x releases and pin v28.
+   - **Older Releases (< v27.0)**: Best effort / not guaranteed.
+
+4. **RPC & ZMQ Network Exposure & High-Water Mark (HWM) Security**:
+   - **No ZMQ Authentication**: Bitcoin Core's ZeroMQ implementation performs NO authentication and NO encryption. All ZMQ socket bindings (`tcp://127.0.0.1:28332`, `28333`, `28334`) and RPC bindings (`127.0.0.1:18443`) MUST be bound strictly to `127.0.0.1` (localhost). Never expose ZMQ ports on `0.0.0.0` or public internet interfaces.
+   - **High-Water Marks (HWM)**: Unbounded queues risk memory exhaustion under high network load. Deployments should configure explicit high-water marks in `bitcoin.conf`:
+     - `-zmqpubrawtxhwm=10000` (buffers bursty mempool transaction traffic)
+     - `-zmqpubrawblockhwm=1000` (buffers block bursts during synchronization)
+     - `-zmqpubsequencehwm=10000` (buffers high-throughput mempool sequence events)
+
+5. **Sovereign-Only Mode (`OBSCHAIN_SOVEREIGN_ONLY=true`)**:
    - Completely disables outbound network calls to `mempool.space` REST and WebSocket endpoints.
    - UTXO enrichment resolves strictly against local cache and Bitcoin Core RPC, ensuring zero watch target or query leakage to public third parties.
 

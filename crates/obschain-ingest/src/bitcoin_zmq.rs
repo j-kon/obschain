@@ -78,25 +78,63 @@ impl Default for BitcoinZmqConfig {
     }
 }
 
-/// Real-time sequence event emitted by Bitcoin Core's `sequence` topic.
+/// Real-time sequence notification event emitted by Bitcoin Core's `sequence` topic.
+/// Contains strictly typed events separating ZMQ notification sequence numbers
+/// from mempool sequence numbers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ZmqSequenceEvent {
+pub enum BitcoinSequenceEvent {
     BlockConnected {
         block_hash: String,
-        height: Option<u64>,
+        zmq_sequence: u32,
     },
     BlockDisconnected {
         block_hash: String,
-        height: Option<u64>,
+        zmq_sequence: u32,
     },
-    TxAddedToMempool {
+    TransactionAdded {
         txid: String,
-        mempool_seq: u64,
+        mempool_sequence: u64,
+        zmq_sequence: u32,
     },
-    TxRemovedFromMempool {
+    TransactionRemoved {
         txid: String,
-        mempool_seq: u64,
+        mempool_sequence: u64,
+        zmq_sequence: u32,
     },
+}
+
+pub type ZmqSequenceEvent = BitcoinSequenceEvent;
+
+impl BitcoinSequenceEvent {
+    pub fn zmq_sequence(&self) -> u32 {
+        match self {
+            Self::BlockConnected { zmq_sequence, .. } => *zmq_sequence,
+            Self::BlockDisconnected { zmq_sequence, .. } => *zmq_sequence,
+            Self::TransactionAdded { zmq_sequence, .. } => *zmq_sequence,
+            Self::TransactionRemoved { zmq_sequence, .. } => *zmq_sequence,
+        }
+    }
+
+    pub fn mempool_sequence(&self) -> Option<u64> {
+        match self {
+            Self::TransactionAdded {
+                mempool_sequence, ..
+            } => Some(*mempool_sequence),
+            Self::TransactionRemoved {
+                mempool_sequence, ..
+            } => Some(*mempool_sequence),
+            _ => None,
+        }
+    }
+
+    pub fn hash(&self) -> &str {
+        match self {
+            Self::BlockConnected { block_hash, .. } => block_hash,
+            Self::BlockDisconnected { block_hash, .. } => block_hash,
+            Self::TransactionAdded { txid, .. } => txid,
+            Self::TransactionRemoved { txid, .. } => txid,
+        }
+    }
 }
 
 /// Ingested and parsed message emitted by Bitcoin Core ZeroMQ.
@@ -105,9 +143,19 @@ pub enum BitcoinZmqMessage {
     RawBlock {
         block: BlockObservation,
         transactions: Vec<TransactionObservation>,
+        zmq_sequence: u32,
     },
-    RawTx(TransactionObservation),
-    Sequence(ZmqSequenceEvent),
+    RawTx {
+        transaction: TransactionObservation,
+        zmq_sequence: u32,
+    },
+    Sequence(BitcoinSequenceEvent),
+    SequenceGap {
+        topic: BitcoinZmqTopic,
+        previous: u32,
+        current: u32,
+        missed: u32,
+    },
 }
 
 /// Status of the individual ZMQ topic endpoints.
@@ -119,18 +167,134 @@ pub struct BitcoinZmqEndpointsStatus {
 }
 
 // ---------------------------------------------------------------------------
-// Pure Parsing Helpers
+// Pure Parsing Helpers & Sequence Tracker
 // ---------------------------------------------------------------------------
 
-/// Reverses a 32-byte hash buffer to format standard Bitcoin display hex (big-endian display).
-pub fn format_hash_display(bytes: &[u8; 32]) -> String {
-    let mut reversed = *bytes;
-    reversed.reverse();
-    reversed
+/// Tracks per-topic 4-byte notification sequence numbers published by Bitcoin Core
+/// to detect potential notification loss and gap conditions.
+#[derive(Debug, Clone, Default)]
+pub struct ZmqSequenceTracker {
+    last_seq: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceCheckResult {
+    /// First sequence observed for this connection.
+    Initial(u32),
+    /// Consecutive sequence: current == previous.wrapping_add(1).
+    Consecutive(u32),
+    /// Duplicate notification: current == previous.
+    Duplicate(u32),
+    /// Notification gap detected: missed >= 1 notifications.
+    Gap {
+        previous: u32,
+        current: u32,
+        missed: u32,
+    },
+    /// Stale or backward jump: e.g. reconnect to restarted node.
+    Stale { previous: u32, current: u32 },
+}
+
+impl ZmqSequenceTracker {
+    pub fn new() -> Self {
+        Self { last_seq: None }
+    }
+
+    pub fn last_seq(&self) -> Option<u32> {
+        self.last_seq
+    }
+
+    pub fn reset(&mut self) {
+        self.last_seq = None;
+    }
+
+    pub fn observe(&mut self, current: u32) -> SequenceCheckResult {
+        let prev = match self.last_seq {
+            None => {
+                self.last_seq = Some(current);
+                return SequenceCheckResult::Initial(current);
+            }
+            Some(p) => p,
+        };
+
+        let diff = current.wrapping_sub(prev);
+
+        if diff == 0 {
+            SequenceCheckResult::Duplicate(current)
+        } else if diff == 1 {
+            self.last_seq = Some(current);
+            SequenceCheckResult::Consecutive(current)
+        } else if diff < 0x8000_0000 {
+            let missed = diff - 1;
+            self.last_seq = Some(current);
+            SequenceCheckResult::Gap {
+                previous: prev,
+                current,
+                missed,
+            }
+        } else {
+            SequenceCheckResult::Stale {
+                previous: prev,
+                current,
+            }
+        }
+    }
+}
+
+/// Formats a 32-byte hash buffer received from Bitcoin Core ZeroMQ.
+/// In Bitcoin Core's ZMQ implementation, hashes are already published in reversed
+/// byte order (matching RPC and block explorer display hex), so bytes 0..32 are
+/// formatted directly as hex without double-reversing.
+pub fn format_zmq_hash(bytes: &[u8; 32]) -> String {
+    bytes
         .iter()
         .map(|b| format!("{:02x}", b))
         .collect::<Vec<_>>()
         .join("")
+}
+
+#[inline]
+pub fn format_hash_display(bytes: &[u8; 32]) -> String {
+    format_zmq_hash(bytes)
+}
+
+/// Validates that an incoming ZMQ multipart message has exactly 3 frames:
+/// frame 1: topic
+/// frame 2: body
+/// frame 3: 4-byte LE sequence number
+pub fn validate_and_extract_multipart(
+    frames: &[bytes::Bytes],
+    expected_topic: BitcoinZmqTopic,
+) -> Result<(&[u8], u32), BitcoinZmqError> {
+    if frames.len() != 3 {
+        return Err(BitcoinZmqError::MalformedMessage(format!(
+            "Expected exactly 3 multipart frames (topic, body, sequence), got {}",
+            frames.len()
+        )));
+    }
+
+    let topic_str = std::str::from_utf8(&frames[0])
+        .map_err(|e| BitcoinZmqError::MalformedMessage(format!("Invalid topic UTF-8: {e}")))?;
+    if topic_str != expected_topic.as_topic_str() {
+        return Err(BitcoinZmqError::MalformedMessage(format!(
+            "Unexpected topic '{}', expected '{}'",
+            topic_str,
+            expected_topic.as_topic_str()
+        )));
+    }
+
+    if frames[2].len() != 4 {
+        return Err(BitcoinZmqError::MalformedMessage(format!(
+            "ZMQ sequence frame must be exactly 4 bytes, got {}",
+            frames[2].len()
+        )));
+    }
+
+    let mut seq_bytes = [0u8; 4];
+    seq_bytes.copy_from_slice(&frames[2]);
+    let zmq_sequence = u32::from_le_bytes(seq_bytes);
+
+    Ok((&frames[1], zmq_sequence))
 }
 
 /// Parses raw transaction bytes received from ZMQ `rawtx`.
@@ -390,14 +554,15 @@ pub fn parse_raw_block(
 
 /// Parses the payload of Bitcoin Core's `sequence` ZMQ notification.
 ///
-/// Format:
-/// - 32 bytes: hash (block hash or txid in wire endianness)
-/// - 1 byte: ASCII character tag
-///   - 'C': Block connected. Followed by optional 8-byte LE height.
-///   - 'D': Block disconnected. Followed by optional 8-byte LE height.
-///   - 'A': Tx added to mempool. Followed by 8-byte LE mempool sequence.
-///   - 'R': Tx removed from mempool. Followed by 8-byte LE mempool sequence.
-pub fn parse_sequence_event(payload: &[u8]) -> Result<ZmqSequenceEvent, BitcoinZmqError> {
+/// Specification (Bitcoin Core v31.1 `doc/zmq.md`):
+/// - 'C' (Block connected): 32-byte hash (display order) + 'C' (1 byte) = 33 bytes total.
+/// - 'D' (Block disconnected): 32-byte hash (display order) + 'D' (1 byte) = 33 bytes total.
+/// - 'A' (Tx added to mempool): 32-byte hash (display order) + 'A' (1 byte) + 8-byte LE mempool sequence = 41 bytes total.
+/// - 'R' (Tx removed from mempool): 32-byte hash (display order) + 'R' (1 byte) + 8-byte LE mempool sequence = 41 bytes total.
+pub fn parse_sequence_event(
+    payload: &[u8],
+    zmq_sequence: u32,
+) -> Result<BitcoinSequenceEvent, BitcoinZmqError> {
     if payload.len() < 33 {
         return Err(BitcoinZmqError::MalformedMessage(format!(
             "Sequence payload too short: {} bytes < 33",
@@ -405,63 +570,66 @@ pub fn parse_sequence_event(payload: &[u8]) -> Result<ZmqSequenceEvent, BitcoinZ
         )));
     }
 
+    let tag = payload[32];
     let mut hash_bytes = [0u8; 32];
     hash_bytes.copy_from_slice(&payload[0..32]);
-    let hash_display = format_hash_display(&hash_bytes);
-
-    let tag = payload[32];
+    let hash_display = format_zmq_hash(&hash_bytes);
 
     match tag {
         b'C' => {
-            let height = if payload.len() >= 41 {
-                let mut h_bytes = [0u8; 8];
-                h_bytes.copy_from_slice(&payload[33..41]);
-                Some(u64::from_le_bytes(h_bytes))
-            } else {
-                None
-            };
-            Ok(ZmqSequenceEvent::BlockConnected {
+            if payload.len() != 33 {
+                return Err(BitcoinZmqError::MalformedMessage(format!(
+                    "Block connected 'C' payload must be exactly 33 bytes (32 hash + 1 tag), got {}",
+                    payload.len()
+                )));
+            }
+            Ok(BitcoinSequenceEvent::BlockConnected {
                 block_hash: hash_display,
-                height,
+                zmq_sequence,
             })
         }
         b'D' => {
-            let height = if payload.len() >= 41 {
-                let mut h_bytes = [0u8; 8];
-                h_bytes.copy_from_slice(&payload[33..41]);
-                Some(u64::from_le_bytes(h_bytes))
-            } else {
-                None
-            };
-            Ok(ZmqSequenceEvent::BlockDisconnected {
+            if payload.len() != 33 {
+                return Err(BitcoinZmqError::MalformedMessage(format!(
+                    "Block disconnected 'D' payload must be exactly 33 bytes (32 hash + 1 tag), got {}",
+                    payload.len()
+                )));
+            }
+            Ok(BitcoinSequenceEvent::BlockDisconnected {
                 block_hash: hash_display,
-                height,
+                zmq_sequence,
             })
         }
         b'A' => {
-            let mempool_seq = if payload.len() >= 41 {
-                let mut s_bytes = [0u8; 8];
-                s_bytes.copy_from_slice(&payload[33..41]);
-                u64::from_le_bytes(s_bytes)
-            } else {
-                0
-            };
-            Ok(ZmqSequenceEvent::TxAddedToMempool {
+            if payload.len() != 41 {
+                return Err(BitcoinZmqError::MalformedMessage(format!(
+                    "Transaction added 'A' payload must be exactly 41 bytes (32 hash + 1 tag + 8 mempool seq), got {}",
+                    payload.len()
+                )));
+            }
+            let mut s_bytes = [0u8; 8];
+            s_bytes.copy_from_slice(&payload[33..41]);
+            let mempool_sequence = u64::from_le_bytes(s_bytes);
+            Ok(BitcoinSequenceEvent::TransactionAdded {
                 txid: hash_display,
-                mempool_seq,
+                mempool_sequence,
+                zmq_sequence,
             })
         }
         b'R' => {
-            let mempool_seq = if payload.len() >= 41 {
-                let mut s_bytes = [0u8; 8];
-                s_bytes.copy_from_slice(&payload[33..41]);
-                u64::from_le_bytes(s_bytes)
-            } else {
-                0
-            };
-            Ok(ZmqSequenceEvent::TxRemovedFromMempool {
+            if payload.len() != 41 {
+                return Err(BitcoinZmqError::MalformedMessage(format!(
+                    "Transaction removed 'R' payload must be exactly 41 bytes (32 hash + 1 tag + 8 mempool seq), got {}",
+                    payload.len()
+                )));
+            }
+            let mut s_bytes = [0u8; 8];
+            s_bytes.copy_from_slice(&payload[33..41]);
+            let mempool_sequence = u64::from_le_bytes(s_bytes);
+            Ok(BitcoinSequenceEvent::TransactionRemoved {
                 txid: hash_display,
-                mempool_seq,
+                mempool_sequence,
+                zmq_sequence,
             })
         }
         other => Err(BitcoinZmqError::InvalidSequenceTag(other)),
@@ -546,7 +714,7 @@ impl BitcoinZmqSubscriber {
         handles
     }
 
-    async fn set_topic_status(&self, topic: BitcoinZmqTopic, state: SourceHealthState) {
+    pub async fn set_topic_status(&self, topic: BitcoinZmqTopic, state: SourceHealthState) {
         let mut w = self.status.write().await;
         match topic {
             BitcoinZmqTopic::RawTx => w.rawtx = state,
@@ -598,16 +766,73 @@ impl BitcoinZmqSubscriber {
                         .await;
                     backoff = Duration::from_millis(self.config.initial_reconnect_ms);
 
+                    let mut seq_tracker = ZmqSequenceTracker::new();
+
                     // Message receive loop
                     loop {
                         match socket.recv().await {
                             Ok(msg) => {
                                 let frames = msg.into_vec();
-                                if frames.len() < 2 {
-                                    continue;
-                                }
+                                let (payload, zmq_seq) =
+                                    match validate_and_extract_multipart(&frames, topic) {
+                                        Ok(res) => res,
+                                        Err(e) => {
+                                            warn!(
+                                                topic = topic.as_topic_str(),
+                                                error = %e,
+                                                "Rejected malformed ZMQ multipart message"
+                                            );
+                                            continue;
+                                        }
+                                    };
 
-                                let payload = &frames[1];
+                                match seq_tracker.observe(zmq_seq) {
+                                    SequenceCheckResult::Gap {
+                                        previous,
+                                        current,
+                                        missed,
+                                    } => {
+                                        warn!(
+                                            topic = topic.as_topic_str(),
+                                            previous,
+                                            current,
+                                            missed,
+                                            "ZMQ notification sequence gap detected: {missed} notification(s) potentially lost"
+                                        );
+                                        self.set_topic_status(topic, SourceHealthState::Degraded)
+                                            .await;
+                                        if sender
+                                            .send(BitcoinZmqMessage::SequenceGap {
+                                                topic,
+                                                previous,
+                                                current,
+                                                missed,
+                                            })
+                                            .await
+                                            .is_err()
+                                        {
+                                            warn!("Bitcoin ZMQ receiver channel closed");
+                                            return;
+                                        }
+                                    }
+                                    SequenceCheckResult::Duplicate(seq) => {
+                                        tracing::debug!(
+                                            topic = topic.as_topic_str(),
+                                            seq,
+                                            "Duplicate ZMQ notification sequence"
+                                        );
+                                    }
+                                    SequenceCheckResult::Stale { previous, current } => {
+                                        tracing::debug!(
+                                            topic = topic.as_topic_str(),
+                                            previous,
+                                            current,
+                                            "Stale or backward ZMQ notification sequence"
+                                        );
+                                    }
+                                    SequenceCheckResult::Initial(_)
+                                    | SequenceCheckResult::Consecutive(_) => {}
+                                }
 
                                 match topic {
                                     BitcoinZmqTopic::RawTx => {
@@ -618,7 +843,10 @@ impl BitcoinZmqSubscriber {
                                         ) {
                                             Ok(tx_obs) => {
                                                 if sender
-                                                    .send(BitcoinZmqMessage::RawTx(tx_obs))
+                                                    .send(BitcoinZmqMessage::RawTx {
+                                                        transaction: tx_obs,
+                                                        zmq_sequence: zmq_seq,
+                                                    })
                                                     .await
                                                     .is_err()
                                                 {
@@ -627,7 +855,10 @@ impl BitcoinZmqSubscriber {
                                                 }
                                             }
                                             Err(e) => {
-                                                warn!(error = %e, "Failed to parse rawtx ZMQ message");
+                                                warn!(
+                                                    error = %e,
+                                                    "Failed to parse rawtx ZMQ message"
+                                                );
                                             }
                                         }
                                     }
@@ -642,6 +873,7 @@ impl BitcoinZmqSubscriber {
                                                     .send(BitcoinZmqMessage::RawBlock {
                                                         block: block_obs,
                                                         transactions: txs,
+                                                        zmq_sequence: zmq_seq,
                                                     })
                                                     .await
                                                     .is_err()
@@ -651,12 +883,15 @@ impl BitcoinZmqSubscriber {
                                                 }
                                             }
                                             Err(e) => {
-                                                warn!(error = %e, "Failed to parse rawblock ZMQ message");
+                                                warn!(
+                                                    error = %e,
+                                                    "Failed to parse rawblock ZMQ message"
+                                                );
                                             }
                                         }
                                     }
                                     BitcoinZmqTopic::Sequence => {
-                                        match parse_sequence_event(payload) {
+                                        match parse_sequence_event(payload, zmq_seq) {
                                             Ok(seq_event) => {
                                                 if sender
                                                     .send(BitcoinZmqMessage::Sequence(seq_event))
@@ -668,7 +903,10 @@ impl BitcoinZmqSubscriber {
                                                 }
                                             }
                                             Err(e) => {
-                                                warn!(error = %e, "Failed to parse sequence ZMQ message");
+                                                warn!(
+                                                    error = %e,
+                                                    "Failed to parse sequence ZMQ message"
+                                                );
                                             }
                                         }
                                     }
@@ -724,109 +962,253 @@ impl IngestSource for BitcoinZmqSubscriber {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     #[test]
-    fn test_format_hash_display() {
+    fn test_hash_byte_order_known_hash() {
+        // Bitcoin Core Genesis Block Hash:
+        // 000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f
+        let raw_hex = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
         let mut raw = [0u8; 32];
-        raw[0] = 0x12;
-        raw[31] = 0xab;
+        for (i, chunk) in raw_hex.as_bytes().chunks(2).enumerate() {
+            let hex_str = std::str::from_utf8(chunk).unwrap();
+            raw[i] = u8::from_str_radix(hex_str, 16).unwrap();
+        }
 
-        let display = format_hash_display(&raw);
-        assert!(display.starts_with("ab"));
-        assert!(display.ends_with("12"));
+        // Must preserve display hex without double-reversing
+        let display = format_zmq_hash(&raw);
+        assert_eq!(display, raw_hex);
     }
 
     #[test]
-    fn test_sequence_block_connected_parsing() {
+    fn test_sequence_c_body_33_bytes() {
         let mut payload = Vec::new();
         // 32-byte hash
         payload.extend_from_slice(&[0xaa; 32]);
         // tag 'C'
         payload.push(b'C');
-        // 8-byte LE height = 800000
-        let height: u64 = 800_000;
-        payload.extend_from_slice(&height.to_le_bytes());
+        assert_eq!(payload.len(), 33);
 
-        let event = parse_sequence_event(&payload).expect("parsed sequence");
+        let event = parse_sequence_event(&payload, 10).expect("parsed sequence C");
         match event {
-            ZmqSequenceEvent::BlockConnected { block_hash, height } => {
-                assert_eq!(height, Some(800_000));
+            BitcoinSequenceEvent::BlockConnected {
+                block_hash,
+                zmq_sequence,
+            } => {
                 assert_eq!(
                     block_hash,
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 );
+                assert_eq!(zmq_sequence, 10);
             }
             _ => panic!("Expected BlockConnected"),
         }
     }
 
     #[test]
-    fn test_sequence_block_disconnected_parsing() {
+    fn test_sequence_d_body_33_bytes() {
         let mut payload = Vec::new();
         payload.extend_from_slice(&[0xbb; 32]);
         payload.push(b'D');
-        let height: u64 = 799_999;
-        payload.extend_from_slice(&height.to_le_bytes());
+        assert_eq!(payload.len(), 33);
 
-        let event = parse_sequence_event(&payload).expect("parsed sequence");
+        let event = parse_sequence_event(&payload, 11).expect("parsed sequence D");
         match event {
-            ZmqSequenceEvent::BlockDisconnected { block_hash, height } => {
-                assert_eq!(height, Some(799_999));
+            BitcoinSequenceEvent::BlockDisconnected {
+                block_hash,
+                zmq_sequence,
+            } => {
                 assert_eq!(
                     block_hash,
                     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                 );
+                assert_eq!(zmq_sequence, 11);
             }
             _ => panic!("Expected BlockDisconnected"),
         }
     }
 
     #[test]
-    fn test_sequence_mempool_add_and_remove_parsing() {
-        let mut add_payload = Vec::new();
-        add_payload.extend_from_slice(&[0x11; 32]);
-        add_payload.push(b'A');
-        let seq: u64 = 42;
-        add_payload.extend_from_slice(&seq.to_le_bytes());
+    fn test_sequence_a_body_41_bytes() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x11; 32]);
+        payload.push(b'A');
+        let mempool_seq: u64 = 42;
+        payload.extend_from_slice(&mempool_seq.to_le_bytes());
+        assert_eq!(payload.len(), 41);
 
-        let add_event = parse_sequence_event(&add_payload).expect("parsed add");
-        assert!(matches!(
-            add_event,
-            ZmqSequenceEvent::TxAddedToMempool {
-                mempool_seq: 42,
-                ..
+        let event = parse_sequence_event(&payload, 12).expect("parsed sequence A");
+        match event {
+            BitcoinSequenceEvent::TransactionAdded {
+                txid,
+                mempool_sequence,
+                zmq_sequence,
+            } => {
+                assert_eq!(
+                    txid,
+                    "1111111111111111111111111111111111111111111111111111111111111111"
+                );
+                assert_eq!(mempool_sequence, 42);
+                assert_eq!(zmq_sequence, 12);
             }
-        ));
+            _ => panic!("Expected TransactionAdded"),
+        }
+    }
 
-        let mut rem_payload = Vec::new();
-        rem_payload.extend_from_slice(&[0x22; 32]);
-        rem_payload.push(b'R');
-        let seq: u64 = 43;
-        rem_payload.extend_from_slice(&seq.to_le_bytes());
+    #[test]
+    fn test_sequence_r_body_41_bytes() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x22; 32]);
+        payload.push(b'R');
+        let mempool_seq: u64 = 43;
+        payload.extend_from_slice(&mempool_seq.to_le_bytes());
+        assert_eq!(payload.len(), 41);
 
-        let rem_event = parse_sequence_event(&rem_payload).expect("parsed rem");
-        assert!(matches!(
-            rem_event,
-            ZmqSequenceEvent::TxRemovedFromMempool {
-                mempool_seq: 43,
-                ..
+        let event = parse_sequence_event(&payload, 13).expect("parsed sequence R");
+        match event {
+            BitcoinSequenceEvent::TransactionRemoved {
+                txid,
+                mempool_sequence,
+                zmq_sequence,
+            } => {
+                assert_eq!(
+                    txid,
+                    "2222222222222222222222222222222222222222222222222222222222222222"
+                );
+                assert_eq!(mempool_sequence, 43);
+                assert_eq!(zmq_sequence, 13);
             }
-        ));
+            _ => panic!("Expected TransactionRemoved"),
+        }
+    }
+
+    #[test]
+    fn test_sequence_malformed_32_byte_body() {
+        let payload = vec![0u8; 32];
+        let err = parse_sequence_event(&payload, 1).unwrap_err();
+        assert!(matches!(err, BitcoinZmqError::MalformedMessage(_)));
+    }
+
+    #[test]
+    fn test_sequence_malformed_34_byte_body() {
+        let mut payload = vec![0u8; 33];
+        payload[32] = b'C';
+        payload.push(0x01); // 34 bytes
+        let err = parse_sequence_event(&payload, 1).unwrap_err();
+        assert!(matches!(err, BitcoinZmqError::MalformedMessage(_)));
+    }
+
+    #[test]
+    fn test_sequence_malformed_ar_without_mempool_sequence() {
+        // A without 8-byte LE sequence (only 33 bytes)
+        let mut payload = vec![0u8; 33];
+        payload[32] = b'A';
+        let err = parse_sequence_event(&payload, 1).unwrap_err();
+        assert!(matches!(err, BitcoinZmqError::MalformedMessage(_)));
     }
 
     #[test]
     fn test_sequence_invalid_tag() {
-        let mut payload = vec![0u8; 32];
-        payload.push(b'Z'); // Invalid tag
-        let err = parse_sequence_event(&payload).unwrap_err();
+        let mut payload = vec![0u8; 33];
+        payload[32] = b'Z'; // Invalid tag
+        let err = parse_sequence_event(&payload, 1).unwrap_err();
         assert!(matches!(err, BitcoinZmqError::InvalidSequenceTag(b'Z')));
     }
 
     #[test]
-    fn test_sequence_too_short() {
-        let payload = vec![0u8; 10];
-        let err = parse_sequence_event(&payload).unwrap_err();
-        assert!(matches!(err, BitcoinZmqError::MalformedMessage(_)));
+    fn test_tracker_sequence_gap_detection() {
+        let mut tracker = ZmqSequenceTracker::new();
+        assert_eq!(tracker.observe(100), SequenceCheckResult::Initial(100));
+        assert_eq!(tracker.observe(101), SequenceCheckResult::Consecutive(101));
+        assert_eq!(tracker.observe(101), SequenceCheckResult::Duplicate(101));
+        // Gap: 101 -> 105 (missed 3)
+        assert_eq!(
+            tracker.observe(105),
+            SequenceCheckResult::Gap {
+                previous: 101,
+                current: 105,
+                missed: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn test_tracker_u32_wraparound() {
+        let mut tracker = ZmqSequenceTracker::new();
+        assert_eq!(
+            tracker.observe(u32::MAX),
+            SequenceCheckResult::Initial(u32::MAX)
+        );
+        // u32::MAX -> 0 is consecutive
+        assert_eq!(tracker.observe(0), SequenceCheckResult::Consecutive(0));
+        // 0 -> 4 has gap of 3
+        assert_eq!(
+            tracker.observe(4),
+            SequenceCheckResult::Gap {
+                previous: 0,
+                current: 4,
+                missed: 3,
+            }
+        );
+
+        // Wraparound with gap: u32::MAX - 2 -> 1 (diff = 4, missed = 3)
+        let mut tracker2 = ZmqSequenceTracker::new();
+        tracker2.observe(u32::MAX - 2);
+        assert_eq!(
+            tracker2.observe(1),
+            SequenceCheckResult::Gap {
+                previous: u32::MAX - 2,
+                current: 1,
+                missed: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn test_multipart_validation() {
+        let topic = Bytes::from_static(b"rawtx");
+        let body = Bytes::from_static(b"sample_body");
+        let seq = Bytes::copy_from_slice(&100u32.to_le_bytes());
+
+        // Valid 3-frame message
+        let valid_frames = vec![topic.clone(), body.clone(), seq.clone()];
+        let (extracted_body, extracted_seq) =
+            validate_and_extract_multipart(&valid_frames, BitcoinZmqTopic::RawTx)
+                .expect("valid multipart");
+        assert_eq!(extracted_body, b"sample_body");
+        assert_eq!(extracted_seq, 100);
+
+        // Missing sequence frame (only 2 frames)
+        let two_frames = vec![topic.clone(), body.clone()];
+        assert!(matches!(
+            validate_and_extract_multipart(&two_frames, BitcoinZmqTopic::RawTx),
+            Err(BitcoinZmqError::MalformedMessage(_))
+        ));
+
+        // Extra unexpected frame (4 frames)
+        let four_frames = vec![
+            topic.clone(),
+            body.clone(),
+            seq.clone(),
+            Bytes::from_static(b"extra"),
+        ];
+        assert!(matches!(
+            validate_and_extract_multipart(&four_frames, BitcoinZmqTopic::RawTx),
+            Err(BitcoinZmqError::MalformedMessage(_))
+        ));
+
+        // Invalid sequence length (3 bytes instead of 4)
+        let bad_seq_frames = vec![topic.clone(), body.clone(), Bytes::from_static(&[1, 2, 3])];
+        assert!(matches!(
+            validate_and_extract_multipart(&bad_seq_frames, BitcoinZmqTopic::RawTx),
+            Err(BitcoinZmqError::MalformedMessage(_))
+        ));
+
+        // Topic mismatch
+        assert!(matches!(
+            validate_and_extract_multipart(&valid_frames, BitcoinZmqTopic::RawBlock),
+            Err(BitcoinZmqError::MalformedMessage(_))
+        ));
     }
 
     #[test]

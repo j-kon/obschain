@@ -16,8 +16,9 @@ pub use bitcoin_rpc::{
     BitcoinRpcConfig, BitcoinRpcError,
 };
 pub use bitcoin_zmq::{
+    format_zmq_hash, parse_sequence_event, validate_and_extract_multipart, BitcoinSequenceEvent,
     BitcoinZmqConfig, BitcoinZmqEndpointsStatus, BitcoinZmqMessage, BitcoinZmqSubscriber,
-    BitcoinZmqTopic, ZmqSequenceEvent,
+    BitcoinZmqTopic, SequenceCheckResult, ZmqSequenceEvent, ZmqSequenceTracker,
 };
 pub use enricher::{EnricherConfig, TransactionEnricher};
 pub use mempool_rest::{MempoolRestClient, MempoolRestConfig, MempoolRestError};

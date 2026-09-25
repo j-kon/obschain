@@ -49,7 +49,27 @@ ObsChain processes data from untrusted network sources (peer-to-peer gossip, ext
 - **Structured Error Status Mapping**: Database lookup and query errors are returned to API callers as HTTP `503 Service Unavailable`, preventing internal database connection failures from being masked as HTTP `404 Not Found`.
 - **Query Bounds & Clamped Pagination**: All list queries enforce bounds (`LIMIT $1 OFFSET $2`) where `$1` is strictly clamped to a maximum of 200 items, preventing denial-of-service memory exhaustion via unbounded `SELECT` statements.
 
-### 9. Sovereign Bitcoin Core & Ingestion Security (Phase 5)
+### 9. Sovereign Bitcoin Core & Ingestion Security (Phase 5 Hardening)
+- **ZeroMQ Unauthenticated Transport Boundary**:
+  - Bitcoin Core's ZeroMQ implementation performs NO authentication, authorization, or encryption.
+  - All ZMQ ports (`28332` rawtx, `28333` rawblock, `28334` sequence) and RPC ports (`18443`) MUST be bound strictly to `127.0.0.1` (localhost).
+  - Binding to `0.0.0.0` or setting `rpcallowip=0.0.0.0/0` on public network interfaces is strictly prohibited in production, as it exposes raw transaction and block streams to unauthenticated eavesdropping, packet injection, and denial of service.
+- **High-Water Mark (HWM) Memory Exhaustion Defenses**:
+  - Bitcoin Core uses ZeroMQ PUB sockets. Unbounded queues can cause memory bloat during network congestion.
+  - Production deployments MUST configure bounded high-water marks in `bitcoin.conf`:
+    - `-zmqpubrawtxhwm=10000` (buffers bursty mempool traffic)
+    - `-zmqpubrawblockhwm=1000` (buffers block bursts during catch-up)
+    - `-zmqpubsequencehwm=10000` (buffers high-throughput mempool sequence events)
+- **Multipart Frame Validation & Parsing Boundaries**:
+  - Every message from Bitcoin Core is validated for exactly 3 multipart frames: `[topic, body, sequence]`.
+  - Frame 3 is strictly validated as a 4-byte little-endian notification sequence number.
+  - Body length boundaries are strictly enforced: C/D events must be exactly 33 bytes; A/R events must be exactly 41 bytes (including 8-byte LE mempool sequence).
+  - Malformed frame counts or invalid lengths are rejected with warnings without panicking.
+  - Strict 16 MB frame limit (`DEFAULT_MAX_ZMQ_FRAME_BYTES`). Oversized payloads are dropped with error before deserialization.
+- **Notification Loss Detection & Degraded Health Progression**:
+  - Sequence gaps detected across `u32` notification counters transition source health to `Degraded` rather than immediately marking the node disconnected.
+  - Bounded RPC reconciliation recovers missing block tip continuity and mempool status.
+  - Bounded exponential backoff on ZMQ reconnect (500ms initial, capped at 10,000ms) prevents reconnect storms.
 - **Credential & Cookie Safety**:
   - `redact_rpc_url` strictly masks basic auth embedded in RPC URLs (`http://user:pass@host` -> `http://user:***@host`).
   - Cookie file (`.cookie`) is read directly from the filesystem only on startup and on 401 Unauthorized token rotation; its contents are NEVER logged, copied into long-lived memory, or serialized into any API, database, tracing span, or error message.
@@ -58,16 +78,9 @@ ObsChain processes data from untrusted network sources (peer-to-peer gossip, ext
   - RPC URL scheme is validated on startup: strictly restricted to `http://` or `https://`. Any `file://` or non-HTTP scheme is rejected immediately on initialization (`BitcoinRpcError::InvalidUrl`).
 - **Network Validation & Mismatch Defense**:
   - On connection, `BitcoinCoreRpcClient::inspect_capabilities` validates the connected node's chain (`main`, `test`, `signet`, `regtest`) against `OBSCHAIN_BITCOIN_NETWORK`. Startup terminates with an error if there is a network mismatch, preventing unintentional mainnet monitoring on testnet or vice versa.
-- **ZMQ Parsing & Memory Boundaries**:
-  - Payloads from ZeroMQ (`rawblock`, `rawtx`, `sequence`) are treated as untrusted network bytes, despite node pre-validation.
-  - Strict 16 MB frame limit (`DEFAULT_MAX_ZMQ_FRAME_BYTES`). Oversized payloads are dropped with error before deserialization.
-  - Zero allocation panics: payload deserialization errors (`BitcoinZmqError::Deserialization`) are safely handled and isolated without crashing the daemon.
-  - ZeroMQ sequence parsing enforces exact length boundaries (minimum 33 bytes) and validates ASCII event tags (`'C'`, `'D'`, `'A'`, `'R'`).
 - **Privacy & Sovereign-Only Mode**:
   - When `OBSCHAIN_SOVEREIGN_ONLY=true`, ObsChain terminates all third-party outbound connections (no connections to `mempool.space` REST or WebSocket APIs).
   - Watched addresses, incident outpoints, and UTXO transaction lookups are never sent to external public endpoints, preventing surveillance and metadata leakage.
-- **Reconciliation & Reconnect Safety**:
-  - Bounded exponential backoff on ZMQ reconnect (500ms initial, capped at 10,000ms) prevents reconnect storms.
-  - Bounded gap reconciliation (`OBSCHAIN_RECONCILE_MAX_BLOCKS`, default 100) prevents denial-of-service block replay storms when synchronizing after long outages.
+
 
 

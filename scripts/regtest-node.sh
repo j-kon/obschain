@@ -22,6 +22,9 @@ rpcallowip=127.0.0.1
 zmqpubrawtx=tcp://127.0.0.1:28332
 zmqpubrawblock=tcp://127.0.0.1:28333
 zmqpubsequence=tcp://127.0.0.1:28334
+zmqpubrawtxhwm=10000
+zmqpubrawblockhwm=1000
+zmqpubsequencehwm=10000
 EOF
     echo "Created regtest config at ${CONF_FILE}"
 fi

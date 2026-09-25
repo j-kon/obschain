@@ -487,15 +487,12 @@ impl BitcoinCoreRpcClient {
             }
         }
 
-        // Test txindex availability via genesis transaction lookup
-        let genesis_txid = match btc_info.chain.as_str() {
-            "main" => "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
-            _ => "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
-        };
-
-        let txindex_available = match self.get_raw_transaction_hex(genesis_txid).await {
-            Ok(_) => true,
-            Err(BitcoinRpcError::TxIndexUnavailable) => false,
+        // Query txindex availability via authoritative getindexinfo RPC
+        let txindex_available = match self
+            .call::<serde_json::Value>("getindexinfo", serde_json::json!([]))
+            .await
+        {
+            Ok(indices) => indices.get("txindex").is_some(),
             Err(_) => false,
         };
 
