@@ -1,12 +1,13 @@
 use chrono::Utc;
 use obschain_core::{
     ActivityStatus, ChainEvent, ConfidenceLevel, CorrelationStrength, EventSeverity, EventType,
-    IncidentActivity, IncidentActivityType, IncidentAlert, ObservationSource,
-    ProvenanceClassification, WatchTarget, WatchTargetKind,
+    IncidentActivity, IncidentActivityType, IncidentAlert, ObservationMode, ObservationSource,
+    ProvenanceClassification, ReplayCheckpoint, ReplayJob, ReplayJobStatus, WatchTarget,
+    WatchTargetKind,
 };
 use obschain_storage::{
-    EventRepository, IncidentActivityRepository, IncidentAlertRepository, IncidentRepository,
-    PostgresStorage, WatchTargetRepository,
+    EventFilter, EventRepository, IncidentActivityRepository, IncidentAlertRepository,
+    IncidentRepository, PostgresStorage, ReplayRepository, WatchTargetRepository,
 };
 use std::time::Duration;
 use uuid::Uuid;
@@ -70,6 +71,8 @@ async fn test_postgres_event_insertion_and_idempotency() {
             "threshold_sats": 1_000_000_000,
         }),
         witnesses: Vec::new(),
+        observation_mode: obschain_core::ObservationMode::Live,
+        replay_job_id: None,
     };
 
     // 1. Initial insert
@@ -578,4 +581,162 @@ async fn test_postgres_recovery_snapshot_history() {
         !rows.is_empty(),
         "Incident recovery snapshots must be recorded"
     );
+}
+
+#[tokio::test]
+async fn test_postgres_replay_jobs_and_checkpoints() {
+    let Some(storage) = get_test_storage().await else {
+        return;
+    };
+
+    let mut job = ReplayJob::new("regtest", 100, 200, "bitcoin_core_rpc");
+    let job_id = job.id;
+
+    // 1. Create job
+    storage.create_job(&job).await.expect("Create replay job");
+
+    let fetched = storage
+        .get_job(job_id)
+        .await
+        .expect("Get replay job")
+        .expect("Job exists");
+    assert_eq!(fetched.id, job_id);
+    assert_eq!(fetched.start_height, 100);
+    assert_eq!(fetched.end_height, 200);
+    assert_eq!(fetched.status, ReplayJobStatus::Pending);
+
+    // 2. Update job
+    job.status = ReplayJobStatus::Running;
+    job.current_height = 150;
+    job.blocks_processed = 50;
+    job.transactions_processed = 120;
+    job.events_generated = 3;
+    storage.update_job(&job).await.expect("Update replay job");
+
+    let updated = storage
+        .get_job(job_id)
+        .await
+        .expect("Get updated replay job")
+        .expect("Job exists");
+    assert_eq!(updated.status, ReplayJobStatus::Running);
+    assert_eq!(updated.current_height, 150);
+    assert_eq!(updated.blocks_processed, 50);
+
+    // 3. Save checkpoints
+    let cp1 = ReplayCheckpoint::new(job_id, 125, 25, 60, 1);
+    let cp2 = ReplayCheckpoint::new(job_id, 150, 50, 120, 3);
+    storage
+        .save_checkpoint(&cp1)
+        .await
+        .expect("Save checkpoint 1");
+    storage
+        .save_checkpoint(&cp2)
+        .await
+        .expect("Save checkpoint 2");
+
+    let latest_cp = storage
+        .get_latest_checkpoint(job_id)
+        .await
+        .expect("Get latest checkpoint")
+        .expect("Checkpoint exists");
+    assert_eq!(latest_cp.completed_height, 150);
+    assert_eq!(latest_cp.blocks_processed, 50);
+
+    // 4. List jobs
+    let jobs = storage.list_jobs(10, 0).await.expect("List replay jobs");
+    assert!(!jobs.is_empty());
+    assert!(jobs.iter().any(|j| j.id == job_id));
+}
+
+#[tokio::test]
+async fn test_postgres_event_filter_query() {
+    let Some(storage) = get_test_storage().await else {
+        return;
+    };
+
+    let replay_job_id = Uuid::new_v4();
+    let ev1 = ChainEvent {
+        id: Uuid::new_v4(),
+        event_type: EventType::LargeTransfer,
+        severity: EventSeverity::High,
+        confidence: ConfidenceLevel::VerifiedOnChain,
+        title: "Replay Event 1".to_string(),
+        description: "Replayed block 500".to_string(),
+        detected_at: Utc::now() - chrono::Duration::hours(1),
+        block_height: Some(500),
+        block_hash: Some("0000000000000000000500".to_string()),
+        txid: Some("tx_500_a".to_string()),
+        metadata: serde_json::json!({"sats": 50000}),
+        witnesses: vec![],
+        source: None,
+        observation_mode: ObservationMode::HistoricalReplay,
+        replay_job_id: Some(replay_job_id),
+    };
+
+    let ev2 = ChainEvent {
+        id: Uuid::new_v4(),
+        event_type: EventType::DormantCoinsMoved,
+        severity: EventSeverity::Critical,
+        confidence: ConfidenceLevel::VerifiedOnChain,
+        title: "Replay Event 2".to_string(),
+        description: "Replayed block 505".to_string(),
+        detected_at: Utc::now() - chrono::Duration::minutes(30),
+        block_height: Some(505),
+        block_hash: Some("0000000000000000000505".to_string()),
+        txid: Some("tx_505_b".to_string()),
+        metadata: serde_json::json!({"sats": 100000}),
+        witnesses: vec![],
+        source: None,
+        observation_mode: ObservationMode::HistoricalReplay,
+        replay_job_id: Some(replay_job_id),
+    };
+
+    storage.save_event(&ev1).await.expect("Save ev1");
+    storage.save_event(&ev2).await.expect("Save ev2");
+
+    // Filter by replay_job_id
+    let res = storage
+        .query_events(&EventFilter {
+            replay_job_id: Some(replay_job_id),
+            ..Default::default()
+        })
+        .await
+        .expect("Query events by replay_job_id");
+    assert_eq!(res.len(), 2);
+
+    // Filter by height range 502..510
+    let res_height = storage
+        .query_events(&EventFilter {
+            replay_job_id: Some(replay_job_id),
+            from_height: Some(502),
+            to_height: Some(510),
+            ..Default::default()
+        })
+        .await
+        .expect("Query events by height");
+    assert_eq!(res_height.len(), 1);
+    assert_eq!(res_height[0].block_height, Some(505));
+
+    // Filter by event_type
+    let res_type = storage
+        .query_events(&EventFilter {
+            replay_job_id: Some(replay_job_id),
+            event_type: Some(EventType::LargeTransfer),
+            ..Default::default()
+        })
+        .await
+        .expect("Query events by type");
+    assert_eq!(res_type.len(), 1);
+    assert_eq!(res_type[0].event_type, EventType::LargeTransfer);
+
+    // Filter by observation_mode
+    let res_mode = storage
+        .query_events(&EventFilter {
+            replay_job_id: Some(replay_job_id),
+            observation_mode: Some(ObservationMode::HistoricalReplay),
+            ..Default::default()
+        })
+        .await
+        .expect("Query events by mode");
+    assert_eq!(res_mode.len(), 2);
 }

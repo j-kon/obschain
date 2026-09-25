@@ -356,9 +356,64 @@ In sovereign-only mode (`OBSCHAIN_SOVEREIGN_ONLY=true`), ObsChain guarantees:
 - **Pruned Nodes**: Detected on startup via `pruned: true` in `getblockchaininfo`. Missing historical transactions in pruned blocks are handled gracefully as non-fatal lookups.
 - **IBD (Initial Block Download)**: If the node is synchronizing (`initialblockdownload: true`), ObsChain status displays `syncing` with progress percentage and will not report `live` until catchup is complete.
 
+---
+
+## Historical Replay & Bitcoin Research Engine (Phase 6A)
+
+ObsChain can reprocess historical Bitcoin blocks through the **identical** normalization, detector, persistence, and intelligence architecture used for live observations.
+
+### CLI Historical Replay
+
+Replay ranges of confirmed blocks directly via the `obschain` CLI:
+
+```bash
+# Replay Bitcoin blocks 900000 through 900050
+cargo run --bin obschain -- replay --start 900000 --end 900050
+
+# Replay with custom batching and checkpoints
+cargo run --bin obschain -- replay --start 800000 --end 800500 --batch-size 20 --checkpoint-interval 50
+```
+
+### Research REST API & Filtering
+
+Historical events are queryable via enriched research filter parameters on `GET /api/v1/events`:
+
+```bash
+# Query large transactions generated during replay between blocks 900000 and 901000
+curl "http://localhost:8080/api/v1/events?from_height=900000&to_height=901000&observation_mode=historical_replay&event_type=large_transaction&limit=50"
+```
+
+### Replay Job REST API (Optional)
+
+Replay jobs can also be initiated and monitored over HTTP when `OBSCHAIN_REPLAY_API_ENABLED=true`:
+
+- `POST /api/v1/replay/jobs`: Launch a new background replay job.
+- `GET /api/v1/replay/jobs`: List active and historical replay jobs.
+- `GET /api/v1/replay/jobs/:id`: Inspect real-time job progress, metrics, and checkpoints.
+- `POST /api/v1/replay/jobs/:id/cancel`: Gracefully cancel a running replay job.
+- `POST /api/v1/replay/jobs/:id/pause`: Pause replay at current block boundary.
+- `POST /api/v1/replay/jobs/:id/resume`: Resume a paused replay job.
+
+### Replay Configuration
+
+```env
+OBSCHAIN_REPLAY_BATCH_SIZE=10              # Blocks fetched per batch (default: 10)
+OBSCHAIN_REPLAY_CONCURRENCY=2              # Maximum concurrent block fetch tasks (default: 2)
+OBSCHAIN_REPLAY_CHECKPOINT_INTERVAL=25     # Blocks between persistent checkpoints (default: 25)
+OBSCHAIN_REPLAY_MAX_RANGE=100000           # Maximum allowed block range per job (default: 100000)
+OBSCHAIN_REPLAY_TX_CACHE_LIMIT=100000      # Bounded previous-transaction cache limit (default: 100000)
+OBSCHAIN_REPLAY_DB_CONCURRENCY=2           # Dedicated PostgreSQL replay connection pool (default: 2)
+OBSCHAIN_REPLAY_API_ENABLED=false          # Controls HTTP POST /api/v1/replay/jobs (default: false)
+```
+
+See [docs/HISTORICAL_REPLAY.md](docs/HISTORICAL_REPLAY.md) for full architecture, detector availability matrix, and time-semantics specifications.
+
+---
+
 ## Testing & Quality
 
 Run full workspace checks:
+
 
 ```bash
 cargo fmt --check

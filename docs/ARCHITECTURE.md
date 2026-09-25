@@ -413,4 +413,47 @@ When `OBSCHAIN_SOVEREIGN_ONLY=true` is enabled:
 - `TransactionEnricher` executes strictly against the local UTXO cache and local Bitcoin Core RPC.
 - No incident outpoints, watched addresses, or transaction lookups are ever transmitted across the public internet.
 
+---
+
+## Historical Replay & Research Engine (Phase 6A)
+
+ObsChain processes historical Bitcoin blocks through the **identical** normalization, detector, persistence, and intelligence architecture used for live observations:
+
+```text
+Bitcoin Core JSON-RPC
+         │
+         ▼
+HistoricalReplayEngine (Bounded Concurrency, Pre-flight History Checks)
+         │
+         ▼
+Block & Transaction Normalization (Raw hex parsing without N+1 RPCs)
+         │
+         ▼
+Historical UTXO Enrichment (Block-local map -> Bounded TxCache -> Bitcoin Core RPC)
+         │
+         ▼
+ObservationContext & Clock (Deterministic block header timestamps)
+         │
+         ▼
+DetectorEngine Pipeline (Replay-safe detectors evaluated, non-replayable bypassed)
+         │
+         ▼
+Deduplicated ChainEvents (UUID v5 deterministic identity)
+         │
+         ▼
+PostgreSQL Persistence (ON CONFLICT (id) DO UPDATE) & IncidentWatchEngine Correlation
+```
+
+### 1. Deterministic Replay Clock & Semantics
+Historical anomaly evaluation uses the historical block's header timestamp (`ObservationContext.block_time`), strictly preventing wall-clock `Utc::now()` time skew. UTXO dormancy calculations reflect age as of the historical block confirmation date.
+
+### 2. Detector Replay Availability Matrix
+Detectors advertise explicit operational suitability via `DetectorAvailability`:
+- **Replayable**: `LargeTransactionDetector`, `LongBlockIntervalDetector`, `DormantCoinDetector`, `ConsolidationDetector`, `FanOutDetector`, `ExtremeFeeDetector`.
+- **Unavailable in Active-Chain Replay**: `RbfDetector` (requires real-time mempool eviction data) and `ReorgDetector` (canonical active-chain replay has no access to stale fork blocks without sidecar archival feeds).
+
+### 3. Idempotent Storage & Resumable Checkpoints
+Every replayed event receives a deterministic UUID v5 derived from `(event_type, txid/block_hash/height)`. Re-running identical block ranges updates existing records without duplicating events or inflating event metrics. Replay jobs persist progress every `OBSCHAIN_REPLAY_CHECKPOINT_INTERVAL` blocks and resume seamlessly upon daemon restart.
+
+
 

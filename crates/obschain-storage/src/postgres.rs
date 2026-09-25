@@ -3,10 +3,10 @@ use obschain_core::{
     ActivityStatus, Chain, ChainEvent, ConfidenceLevel, CorrelationStrength, EventSeverity,
     EventType, Evidence, EvidenceType, GraphEdge, GraphEdgeType, GraphNode, GraphNodeType,
     Incident, IncidentActivity, IncidentActivityType, IncidentAlert, IncidentBlock, IncidentEntity,
-    IncidentGraph, IncidentStatus, IncidentTransaction, IncidentUpdate, ObservationSource,
-    OnChainMessage, ProvenanceClassification, RecoverySummary, Source, SourceCategory,
-    TechnicalFinding, TimelineCategory, TimelineEntry, TransactionRole, WatchTarget,
-    WatchTargetKind,
+    IncidentGraph, IncidentStatus, IncidentTransaction, IncidentUpdate, ObservationMode,
+    ObservationSource, OnChainMessage, ProvenanceClassification, RecoverySummary, ReplayCheckpoint,
+    ReplayJob, ReplayJobStatus, Source, SourceCategory, TechnicalFinding, TimelineCategory,
+    TimelineEntry, TransactionRole, WatchTarget, WatchTargetKind,
 };
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -15,8 +15,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::repository::{
-    i64_to_u64_checked, u64_to_i64_checked, EventRepository, IncidentActivityRepository,
-    IncidentAlertRepository, IncidentRepository, StorageError, WatchTargetRepository,
+    i64_to_u64_checked, u64_to_i64_checked, EventFilter, EventRepository,
+    IncidentActivityRepository, IncidentAlertRepository, IncidentRepository, ReplayRepository,
+    StorageError, WatchTargetRepository,
 };
 
 /// SQLx PostgreSQL durable storage backend implementing all repository abstractions.
@@ -133,6 +134,15 @@ impl PostgresStorage {
         let count: i64 = row.get("count");
         Ok(count as usize)
     }
+
+    pub async fn count_replay_jobs(&self) -> Result<usize, StorageError> {
+        let row = sqlx::query("SELECT COUNT(*) as count FROM replay_jobs")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let count: i64 = row.get("count");
+        Ok(count as usize)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -165,18 +175,23 @@ impl EventRepository for PostgresStorage {
             None => None,
         };
 
+        let mode_str = event.observation_mode.as_str();
+
         sqlx::query(
             r#"
             INSERT INTO chain_events (
                 id, event_type, severity, confidence, title, description,
-                detected_at, block_height, block_hash, txid, metadata, source
+                detected_at, block_height, block_hash, txid, metadata, source,
+                observation_mode, replay_job_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             ON CONFLICT (id) DO UPDATE SET
                 title = EXCLUDED.title,
                 description = EXCLUDED.description,
                 metadata = EXCLUDED.metadata,
-                source = EXCLUDED.source
+                source = EXCLUDED.source,
+                observation_mode = EXCLUDED.observation_mode,
+                replay_job_id = EXCLUDED.replay_job_id
             "#,
         )
         .bind(event.id)
@@ -191,6 +206,8 @@ impl EventRepository for PostgresStorage {
         .bind(&event.txid)
         .bind(&event.metadata)
         .bind(source_json)
+        .bind(mode_str)
+        .bind(event.replay_job_id)
         .execute(&self.pool)
         .await
         .map_err(|e| StorageError::Database(e.to_string()))?;
@@ -210,7 +227,8 @@ impl EventRepository for PostgresStorage {
         let rows = sqlx::query(
             r#"
             SELECT id, event_type, severity, confidence, title, description,
-                   detected_at, block_height, block_hash, txid, metadata, source
+                   detected_at, block_height, block_hash, txid, metadata, source,
+                   observation_mode, replay_job_id
             FROM chain_events
             ORDER BY detected_at DESC
             LIMIT $1 OFFSET $2
@@ -248,6 +266,15 @@ impl EventRepository for PostgresStorage {
                 None => None,
             };
 
+            let obs_mode_str: Option<String> = row.try_get("observation_mode").ok();
+            let observation_mode = obs_mode_str
+                .map(|s| match s.to_lowercase().as_str() {
+                    "historical_replay" => ObservationMode::HistoricalReplay,
+                    _ => ObservationMode::Live,
+                })
+                .unwrap_or(ObservationMode::Live);
+            let replay_job_id: Option<Uuid> = row.try_get("replay_job_id").ok().flatten();
+
             events.push(ChainEvent {
                 id: row.get("id"),
                 event_type,
@@ -265,6 +292,8 @@ impl EventRepository for PostgresStorage {
                     .map(|s| vec![obschain_core::ObservationWitness::new(s)])
                     .unwrap_or_default(),
                 source,
+                observation_mode,
+                replay_job_id,
             });
         }
 
@@ -275,7 +304,8 @@ impl EventRepository for PostgresStorage {
         let row_opt = sqlx::query(
             r#"
             SELECT id, event_type, severity, confidence, title, description,
-                   detected_at, block_height, block_hash, txid, metadata, source
+                   detected_at, block_height, block_hash, txid, metadata, source,
+                   observation_mode, replay_job_id
             FROM chain_events
             WHERE id = $1
             "#,
@@ -312,6 +342,15 @@ impl EventRepository for PostgresStorage {
             None => None,
         };
 
+        let obs_mode_str: Option<String> = row.try_get("observation_mode").ok();
+        let observation_mode = obs_mode_str
+            .map(|s| match s.to_lowercase().as_str() {
+                "historical_replay" => ObservationMode::HistoricalReplay,
+                _ => ObservationMode::Live,
+            })
+            .unwrap_or(ObservationMode::Live);
+        let replay_job_id: Option<Uuid> = row.try_get("replay_job_id").ok().flatten();
+
         Ok(Some(ChainEvent {
             id: row.get("id"),
             event_type,
@@ -329,7 +368,132 @@ impl EventRepository for PostgresStorage {
                 .map(|s| vec![obschain_core::ObservationWitness::new(s)])
                 .unwrap_or_default(),
             source,
+            observation_mode,
+            replay_job_id,
         }))
+    }
+
+    async fn query_events(&self, filter: &EventFilter) -> Result<Vec<ChainEvent>, StorageError> {
+        let limit_clamped = filter.limit.unwrap_or(100).clamp(1, 1000) as i64;
+        let offset_i64 = filter.offset.unwrap_or(0) as i64;
+
+        let from_height_i64 = match filter.from_height {
+            Some(h) => Some(u64_to_i64_checked(h)?),
+            None => None,
+        };
+        let to_height_i64 = match filter.to_height {
+            Some(h) => Some(u64_to_i64_checked(h)?),
+            None => None,
+        };
+
+        let event_type_str = filter.event_type.as_ref().map(|et| {
+            serde_json::to_string(et)
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string()
+        });
+        let severity_str = filter.severity.map(|s| {
+            serde_json::to_string(&s)
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string()
+        });
+        let mode_str = filter.observation_mode.map(|m| m.as_str().to_string());
+
+        let rows = sqlx::query(
+            r#"
+            SELECT id, event_type, severity, confidence, title, description,
+                   detected_at, block_height, block_hash, txid, metadata, source,
+                   observation_mode, replay_job_id
+            FROM chain_events
+            WHERE ($1::BIGINT IS NULL OR block_height >= $1)
+              AND ($2::BIGINT IS NULL OR block_height <= $2)
+              AND ($3::TIMESTAMPTZ IS NULL OR detected_at >= $3)
+              AND ($4::TIMESTAMPTZ IS NULL OR detected_at <= $4)
+              AND ($5::VARCHAR IS NULL OR event_type = $5)
+              AND ($6::VARCHAR IS NULL OR severity = $6)
+              AND ($7::VARCHAR IS NULL OR observation_mode = $7)
+              AND ($8::UUID IS NULL OR replay_job_id = $8)
+              AND ($9::VARCHAR IS NULL OR txid = $9)
+              AND ($10::VARCHAR IS NULL OR block_hash = $10)
+            ORDER BY detected_at DESC
+            LIMIT $11 OFFSET $12
+            "#,
+        )
+        .bind(from_height_i64)
+        .bind(to_height_i64)
+        .bind(filter.from_time)
+        .bind(filter.to_time)
+        .bind(event_type_str)
+        .bind(severity_str)
+        .bind(mode_str)
+        .bind(filter.replay_job_id)
+        .bind(&filter.txid)
+        .bind(&filter.block_hash)
+        .bind(limit_clamped)
+        .bind(offset_i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            let event_type_str: String = row.get("event_type");
+            let severity_str: String = row.get("severity");
+            let confidence_str: String = row.get("confidence");
+
+            let event_type: EventType = serde_json::from_str(&format!("\"{event_type_str}\""))
+                .unwrap_or(EventType::LargeTransfer);
+            let severity: EventSeverity =
+                serde_json::from_str(&format!("\"{severity_str}\"")).unwrap_or(EventSeverity::Info);
+            let confidence: ConfidenceLevel =
+                serde_json::from_str(&format!("\"{confidence_str}\""))
+                    .unwrap_or(ConfidenceLevel::Heuristic);
+
+            let block_height_i64: Option<i64> = row.get("block_height");
+            let block_height = match block_height_i64 {
+                Some(h) => Some(i64_to_u64_checked(h)?),
+                None => None,
+            };
+
+            let source_json: Option<serde_json::Value> = row.get("source");
+            let source = match source_json {
+                Some(v) => serde_json::from_value(v).ok(),
+                None => None,
+            };
+
+            let obs_mode_str: Option<String> = row.try_get("observation_mode").ok();
+            let observation_mode = obs_mode_str
+                .map(|s| match s.to_lowercase().as_str() {
+                    "historical_replay" => ObservationMode::HistoricalReplay,
+                    _ => ObservationMode::Live,
+                })
+                .unwrap_or(ObservationMode::Live);
+            let replay_job_id: Option<Uuid> = row.try_get("replay_job_id").ok().flatten();
+
+            events.push(ChainEvent {
+                id: row.get("id"),
+                event_type,
+                severity,
+                confidence,
+                title: row.get("title"),
+                description: row.get("description"),
+                detected_at: row.get("detected_at"),
+                block_height,
+                block_hash: row.get("block_hash"),
+                txid: row.get("txid"),
+                metadata: row.get("metadata"),
+                witnesses: source
+                    .clone()
+                    .map(|s| vec![obschain_core::ObservationWitness::new(s)])
+                    .unwrap_or_default(),
+                source,
+                observation_mode,
+                replay_job_id,
+            });
+        }
+
+        Ok(events)
     }
 }
 
@@ -2130,6 +2294,258 @@ impl IncidentAlertRepository for PostgresStorage {
             observed_at: row.get("observed_at"),
             value_sats,
             trigger_txid: row.get("trigger_txid"),
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReplayRepository Implementation
+// ---------------------------------------------------------------------------
+
+#[async_trait::async_trait]
+impl ReplayRepository for PostgresStorage {
+    async fn create_job(&self, job: &ReplayJob) -> Result<(), StorageError> {
+        let start_height_i64 = u64_to_i64_checked(job.start_height)?;
+        let end_height_i64 = u64_to_i64_checked(job.end_height)?;
+        let current_height_i64 = u64_to_i64_checked(job.current_height)?;
+        let blocks_i64 = u64_to_i64_checked(job.blocks_processed)?;
+        let txs_i64 = u64_to_i64_checked(job.transactions_processed)?;
+        let events_i64 = u64_to_i64_checked(job.events_generated)?;
+        let errors_i64 = u64_to_i64_checked(job.error_count)?;
+        let status_str = job.status.as_str();
+
+        sqlx::query(
+            r#"
+            INSERT INTO replay_jobs (
+                id, network, start_height, end_height, current_height, status, source_type,
+                created_at, started_at, completed_at, blocks_processed, transactions_processed,
+                events_generated, error_count, last_error
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            ON CONFLICT (id) DO UPDATE SET
+                current_height = EXCLUDED.current_height,
+                status = EXCLUDED.status,
+                started_at = EXCLUDED.started_at,
+                completed_at = EXCLUDED.completed_at,
+                blocks_processed = EXCLUDED.blocks_processed,
+                transactions_processed = EXCLUDED.transactions_processed,
+                events_generated = EXCLUDED.events_generated,
+                error_count = EXCLUDED.error_count,
+                last_error = EXCLUDED.last_error
+            "#,
+        )
+        .bind(job.id)
+        .bind(&job.network)
+        .bind(start_height_i64)
+        .bind(end_height_i64)
+        .bind(current_height_i64)
+        .bind(status_str)
+        .bind(&job.source_type)
+        .bind(job.created_at)
+        .bind(job.started_at)
+        .bind(job.completed_at)
+        .bind(blocks_i64)
+        .bind(txs_i64)
+        .bind(events_i64)
+        .bind(errors_i64)
+        .bind(&job.last_error)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn get_job(&self, id: Uuid) -> Result<Option<ReplayJob>, StorageError> {
+        let row_opt = sqlx::query(
+            r#"
+            SELECT id, network, start_height, end_height, current_height, status, source_type,
+                   created_at, started_at, completed_at, blocks_processed, transactions_processed,
+                   events_generated, error_count, last_error
+            FROM replay_jobs
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let Some(row) = row_opt else {
+            return Ok(None);
+        };
+
+        let status_str: String = row.get("status");
+        let status = match status_str.to_lowercase().as_str() {
+            "pending" => ReplayJobStatus::Pending,
+            "running" => ReplayJobStatus::Running,
+            "paused" => ReplayJobStatus::Paused,
+            "completed" => ReplayJobStatus::Completed,
+            "cancelled" => ReplayJobStatus::Cancelled,
+            "failed" => ReplayJobStatus::Failed,
+            _ => ReplayJobStatus::Failed,
+        };
+
+        let start_height: i64 = row.get("start_height");
+        let end_height: i64 = row.get("end_height");
+        let current_height: i64 = row.get("current_height");
+        let blocks_processed: i64 = row.get("blocks_processed");
+        let transactions_processed: i64 = row.get("transactions_processed");
+        let events_generated: i64 = row.get("events_generated");
+        let error_count: i64 = row.get("error_count");
+
+        Ok(Some(ReplayJob {
+            id: row.get("id"),
+            network: row.get("network"),
+            start_height: i64_to_u64_checked(start_height)?,
+            end_height: i64_to_u64_checked(end_height)?,
+            current_height: i64_to_u64_checked(current_height)?,
+            status,
+            source_type: row.get("source_type"),
+            created_at: row.get("created_at"),
+            started_at: row.get("started_at"),
+            completed_at: row.get("completed_at"),
+            blocks_processed: i64_to_u64_checked(blocks_processed)?,
+            transactions_processed: i64_to_u64_checked(transactions_processed)?,
+            events_generated: i64_to_u64_checked(events_generated)?,
+            error_count: i64_to_u64_checked(error_count)?,
+            last_error: row.get("last_error"),
+        }))
+    }
+
+    async fn update_job(&self, job: &ReplayJob) -> Result<(), StorageError> {
+        self.create_job(job).await
+    }
+
+    async fn list_jobs(&self, limit: usize, offset: usize) -> Result<Vec<ReplayJob>, StorageError> {
+        let limit_clamped = limit.clamp(1, 100) as i64;
+        let offset_i64 = offset as i64;
+
+        let rows = sqlx::query(
+            r#"
+            SELECT id, network, start_height, end_height, current_height, status, source_type,
+                   created_at, started_at, completed_at, blocks_processed, transactions_processed,
+                   events_generated, error_count, last_error
+            FROM replay_jobs
+            ORDER BY created_at DESC
+            LIMIT $1 OFFSET $2
+            "#,
+        )
+        .bind(limit_clamped)
+        .bind(offset_i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut jobs = Vec::with_capacity(rows.len());
+        for row in rows {
+            let status_str: String = row.get("status");
+            let status = match status_str.to_lowercase().as_str() {
+                "pending" => ReplayJobStatus::Pending,
+                "running" => ReplayJobStatus::Running,
+                "paused" => ReplayJobStatus::Paused,
+                "completed" => ReplayJobStatus::Completed,
+                "cancelled" => ReplayJobStatus::Cancelled,
+                "failed" => ReplayJobStatus::Failed,
+                _ => ReplayJobStatus::Failed,
+            };
+
+            let start_height: i64 = row.get("start_height");
+            let end_height: i64 = row.get("end_height");
+            let current_height: i64 = row.get("current_height");
+            let blocks_processed: i64 = row.get("blocks_processed");
+            let transactions_processed: i64 = row.get("transactions_processed");
+            let events_generated: i64 = row.get("events_generated");
+            let error_count: i64 = row.get("error_count");
+
+            jobs.push(ReplayJob {
+                id: row.get("id"),
+                network: row.get("network"),
+                start_height: i64_to_u64_checked(start_height)?,
+                end_height: i64_to_u64_checked(end_height)?,
+                current_height: i64_to_u64_checked(current_height)?,
+                status,
+                source_type: row.get("source_type"),
+                created_at: row.get("created_at"),
+                started_at: row.get("started_at"),
+                completed_at: row.get("completed_at"),
+                blocks_processed: i64_to_u64_checked(blocks_processed)?,
+                transactions_processed: i64_to_u64_checked(transactions_processed)?,
+                events_generated: i64_to_u64_checked(events_generated)?,
+                error_count: i64_to_u64_checked(error_count)?,
+                last_error: row.get("last_error"),
+            });
+        }
+
+        Ok(jobs)
+    }
+
+    async fn save_checkpoint(&self, checkpoint: &ReplayCheckpoint) -> Result<(), StorageError> {
+        let completed_height_i64 = u64_to_i64_checked(checkpoint.completed_height)?;
+        let blocks_i64 = u64_to_i64_checked(checkpoint.blocks_processed)?;
+        let txs_i64 = u64_to_i64_checked(checkpoint.transactions_processed)?;
+        let events_i64 = u64_to_i64_checked(checkpoint.events_generated)?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO replay_checkpoints (
+                id, job_id, completed_height, blocks_processed, transactions_processed,
+                events_generated, checkpointed_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (id) DO NOTHING
+            "#,
+        )
+        .bind(checkpoint.id)
+        .bind(checkpoint.job_id)
+        .bind(completed_height_i64)
+        .bind(blocks_i64)
+        .bind(txs_i64)
+        .bind(events_i64)
+        .bind(checkpoint.checkpointed_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn get_latest_checkpoint(
+        &self,
+        job_id: Uuid,
+    ) -> Result<Option<ReplayCheckpoint>, StorageError> {
+        let row_opt = sqlx::query(
+            r#"
+            SELECT id, job_id, completed_height, blocks_processed, transactions_processed,
+                   events_generated, checkpointed_at
+            FROM replay_checkpoints
+            WHERE job_id = $1
+            ORDER BY completed_height DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let Some(row) = row_opt else {
+            return Ok(None);
+        };
+
+        let completed_height: i64 = row.get("completed_height");
+        let blocks_processed: i64 = row.get("blocks_processed");
+        let transactions_processed: i64 = row.get("transactions_processed");
+        let events_generated: i64 = row.get("events_generated");
+
+        Ok(Some(ReplayCheckpoint {
+            id: row.get("id"),
+            job_id: row.get("job_id"),
+            completed_height: i64_to_u64_checked(completed_height)?,
+            blocks_processed: i64_to_u64_checked(blocks_processed)?,
+            transactions_processed: i64_to_u64_checked(transactions_processed)?,
+            events_generated: i64_to_u64_checked(events_generated)?,
+            checkpointed_at: row.get("checkpointed_at"),
         }))
     }
 }

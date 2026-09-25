@@ -15,13 +15,15 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use obschain_core::{
-    ActivityStatus, ChainEvent, IncidentActivity, IncidentAlert, PublicWatchTarget,
+    ActivityStatus, ChainEvent, EventSeverity, EventType, IncidentActivity, IncidentAlert,
+    ObservationMode, PublicWatchTarget,
 };
 use obschain_detectors::Detector;
+use obschain_ingest::HistoricalReplayEngine;
 use obschain_intelligence::IncidentWatchEngine;
 use obschain_storage::{
-    EventRepository, IncidentActivityRepository, IncidentAlertRepository, IncidentRepository,
-    Storage, StorageError, WatchTargetRepository,
+    EventFilter, EventRepository, IncidentActivityRepository, IncidentAlertRepository,
+    IncidentRepository, ReplayRepository, Storage, StorageError, WatchTargetRepository,
 };
 use serde::{Deserialize, Serialize};
 use tower_http::{
@@ -164,6 +166,7 @@ pub struct PipelineMetricsResponse {
 }
 
 /// Unified tagged WebSocket broadcast message for real-time streaming to connected clients.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WebSocketBroadcast {
@@ -210,6 +213,8 @@ pub struct AppState {
     pub sources: Arc<RwLock<SourcesStatus>>,
     pub metrics: PipelineMetrics,
     pub bitcoin_core_status: Arc<tokio::sync::RwLock<Option<BitcoinCoreStatusResponse>>>,
+    pub replay_engine: Option<Arc<HistoricalReplayEngine>>,
+    pub replay_api_enabled: bool,
 }
 
 impl AppState {
@@ -285,8 +290,20 @@ impl AppState {
             })),
             metrics,
             bitcoin_core_status: Arc::new(tokio::sync::RwLock::new(None)),
+            replay_engine: None,
+            replay_api_enabled: false,
         };
         (state, tx)
+    }
+
+    pub fn with_replay(
+        mut self,
+        replay_engine: Option<Arc<HistoricalReplayEngine>>,
+        replay_api_enabled: bool,
+    ) -> Self {
+        self.replay_engine = replay_engine;
+        self.replay_api_enabled = replay_api_enabled;
+        self
     }
 }
 
@@ -353,6 +370,34 @@ pub struct IncidentActivityQuery {
 
 #[derive(Debug, Deserialize)]
 pub struct IncidentAlertQuery {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EventsQuery {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub from_height: Option<u64>,
+    pub to_height: Option<u64>,
+    pub from_time: Option<DateTime<Utc>>,
+    pub to_time: Option<DateTime<Utc>>,
+    pub event_type: Option<EventType>,
+    pub severity: Option<EventSeverity>,
+    pub observation_mode: Option<ObservationMode>,
+    pub replay_job_id: Option<Uuid>,
+    pub txid: Option<String>,
+    pub block_hash: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateReplayJobRequest {
+    pub start_height: u64,
+    pub end_height: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReplayJobsQuery {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
 }
@@ -426,6 +471,23 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/v1/incident-alerts", get(list_incident_alerts_handler))
         .route("/api/v1/ws", get(ws_handler))
+        .route(
+            "/api/v1/replay/jobs",
+            get(list_replay_jobs_handler).post(create_replay_job_handler),
+        )
+        .route("/api/v1/replay/jobs/{id}", get(get_replay_job_handler))
+        .route(
+            "/api/v1/replay/jobs/{id}/cancel",
+            axum::routing::post(cancel_replay_job_handler),
+        )
+        .route(
+            "/api/v1/replay/jobs/{id}/pause",
+            axum::routing::post(pause_replay_job_handler),
+        )
+        .route(
+            "/api/v1/replay/jobs/{id}/resume",
+            axum::routing::post(resume_replay_job_handler),
+        )
         .layer(TraceLayer::new_for_http())
         // Guard against oversized request DOS (limit to 1MB)
         .layer(RequestBodyLimitLayer::new(1024 * 1024))
@@ -578,15 +640,30 @@ async fn handle_client_socket(mut socket: WebSocket, state: AppState) {
 
 async fn list_events_handler(
     State(state): State<AppState>,
-    Query(pagination): Query<PaginationQuery>,
+    Query(query): Query<EventsQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
     // Bound limit to prevent denial of service (unbounded memory allocations)
-    let limit = pagination.limit.unwrap_or(50).clamp(1, 100);
-    let offset = pagination.offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let offset = query.offset.unwrap_or(0);
+
+    let filter = EventFilter {
+        from_height: query.from_height,
+        to_height: query.to_height,
+        from_time: query.from_time,
+        to_time: query.to_time,
+        event_type: query.event_type,
+        severity: query.severity,
+        observation_mode: query.observation_mode,
+        replay_job_id: query.replay_job_id,
+        txid: query.txid,
+        block_hash: query.block_hash,
+        limit: Some(limit),
+        offset: Some(offset),
+    };
 
     let events = state
         .storage
-        .list_events(limit, offset)
+        .query_events(&filter)
         .await
         .map_err(map_storage_error)?;
 
@@ -821,5 +898,268 @@ async fn list_incident_alerts_handler(
         "count": alerts.len(),
         "limit": limit,
         "offset": offset,
+    })))
+}
+
+async fn create_replay_job_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateReplayJobRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
+    if !state.replay_api_enabled {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiErrorResponse {
+                error: "Historical replay API is disabled on this node (set OBSCHAIN_REPLAY_API_ENABLED=true to enable)".to_string(),
+                code: 403,
+            }),
+        ));
+    }
+
+    let Some(ref engine) = state.replay_engine else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiErrorResponse {
+                error: "Historical replay engine is not configured (Bitcoin Core RPC required)"
+                    .to_string(),
+                code: 503,
+            }),
+        ));
+    };
+
+    if payload.start_height > payload.end_height {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                error: format!(
+                    "Invalid range: start_height ({}) must be <= end_height ({})",
+                    payload.start_height, payload.end_height
+                ),
+                code: 400,
+            }),
+        ));
+    }
+
+    let block_count = payload.end_height - payload.start_height + 1;
+    if block_count > engine.config().max_range {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                error: format!(
+                    "Requested replay range ({} blocks) exceeds configured maximum allowed range ({} blocks)",
+                    block_count,
+                    engine.config().max_range
+                ),
+                code: 400,
+            }),
+        ));
+    }
+
+    // Inspect node capabilities & pruned node status & IBD
+    engine
+        .validate_capabilities_and_range(payload.start_height, payload.end_height)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ApiErrorResponse {
+                    error: e.to_string(),
+                    code: 400,
+                }),
+            )
+        })?;
+
+    let job = engine
+        .create_replay_job(payload.start_height, payload.end_height)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorResponse {
+                    error: format!("Failed to create replay job: {e}"),
+                    code: 500,
+                }),
+            )
+        })?;
+
+    let engine_clone = engine.clone();
+    let job_id = job.id;
+    tokio::spawn(async move {
+        if let Err(e) = engine_clone.run_job(job_id).await {
+            tracing::error!(error = %e, job_id = %job_id, "Historical replay job encountered error");
+        }
+    });
+
+    Ok((StatusCode::CREATED, Json(job)))
+}
+
+async fn list_replay_jobs_handler(
+    State(state): State<AppState>,
+    Query(query): Query<ReplayJobsQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let offset = query.offset.unwrap_or(0);
+
+    let jobs = state
+        .storage
+        .list_jobs(limit, offset)
+        .await
+        .map_err(map_storage_error)?;
+
+    Ok(Json(serde_json::json!({
+        "jobs": jobs,
+        "count": jobs.len(),
+        "limit": limit,
+        "offset": offset,
+    })))
+}
+
+async fn get_replay_job_handler(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
+    let job = state
+        .storage
+        .get_job(id)
+        .await
+        .map_err(map_storage_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiErrorResponse {
+                    error: format!("Replay job {id} not found"),
+                    code: 404,
+                }),
+            )
+        })?;
+
+    let checkpoint = state
+        .storage
+        .get_latest_checkpoint(id)
+        .await
+        .map_err(map_storage_error)?;
+
+    Ok(Json(serde_json::json!({
+        "job": job,
+        "latest_checkpoint": checkpoint,
+    })))
+}
+
+async fn cancel_replay_job_handler(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
+    if !state.replay_api_enabled {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiErrorResponse {
+                error: "Historical replay API is disabled on this node".to_string(),
+                code: 403,
+            }),
+        ));
+    }
+
+    let Some(ref engine) = state.replay_engine else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiErrorResponse {
+                error: "Historical replay engine is not configured".to_string(),
+                code: 503,
+            }),
+        ));
+    };
+
+    engine.cancel_replay(id).await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                error: e.to_string(),
+                code: 400,
+            }),
+        )
+    })?;
+
+    let job = state.storage.get_job(id).await.map_err(map_storage_error)?;
+    Ok(Json(serde_json::json!({
+        "status": "cancelled",
+        "job": job,
+    })))
+}
+
+async fn pause_replay_job_handler(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
+    if !state.replay_api_enabled {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiErrorResponse {
+                error: "Historical replay API is disabled on this node".to_string(),
+                code: 403,
+            }),
+        ));
+    }
+
+    let Some(ref engine) = state.replay_engine else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiErrorResponse {
+                error: "Historical replay engine is not configured".to_string(),
+                code: 503,
+            }),
+        ));
+    };
+
+    engine.pause_replay(id).await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                error: e.to_string(),
+                code: 400,
+            }),
+        )
+    })?;
+
+    let job = state.storage.get_job(id).await.map_err(map_storage_error)?;
+    Ok(Json(serde_json::json!({
+        "status": "paused",
+        "job": job,
+    })))
+}
+
+async fn resume_replay_job_handler(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
+    if !state.replay_api_enabled {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiErrorResponse {
+                error: "Historical replay API is disabled on this node".to_string(),
+                code: 403,
+            }),
+        ));
+    }
+
+    let Some(ref engine) = state.replay_engine else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiErrorResponse {
+                error: "Historical replay engine is not configured".to_string(),
+                code: 503,
+            }),
+        ));
+    };
+
+    let engine_clone = engine.clone();
+    tokio::spawn(async move {
+        if let Err(e) = engine_clone.resume_replay(id).await {
+            tracing::error!(error = %e, job_id = %id, "Failed to resume historical replay job");
+        }
+    });
+
+    let job = state.storage.get_job(id).await.map_err(map_storage_error)?;
+    Ok(Json(serde_json::json!({
+        "status": "resumed",
+        "job": job,
     })))
 }

@@ -2,11 +2,17 @@ pub mod bitcoin_coordinator;
 pub mod bitcoin_rpc;
 pub mod bitcoin_zmq;
 pub mod enricher;
+pub mod historical_replay;
 pub mod mempool_rest;
 pub mod mempool_types;
 pub mod mempool_ws;
 pub mod source;
 pub mod utxo_cache;
+
+pub use historical_replay::{
+    CacheMetrics, CachedTx, CachedTxOutput, HistoricalReplayEngine, HistoricalTxCache,
+    ReplayConfig, ReplayError,
+};
 
 pub use bitcoin_coordinator::{
     BitcoinCoordinator, BitcoinCoordinatorConfig, BitcoinCoordinatorStatus,

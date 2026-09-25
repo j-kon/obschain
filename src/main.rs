@@ -3,6 +3,7 @@ use std::{
     time::Duration,
 };
 
+use clap::{Parser, Subcommand};
 use obschain::{
     create_router, redact_database_url, redact_rpc_url, AppConfig, AppState,
     BitcoinCoreStatusResponse, BitcoinCoreZmqStatusResponse, PipelineMetrics, StorageBackendConfig,
@@ -16,8 +17,8 @@ use obschain_detectors::{
 };
 use obschain_ingest::{
     BitcoinCoordinator, BitcoinCoordinatorConfig, BitcoinCoreRpcClient, BitcoinRpcConfig,
-    BitcoinZmqConfig, BitcoinZmqSubscriber, EnricherConfig, MempoolRestClient, MempoolRestConfig,
-    MempoolWebSocketClient, TransactionEnricher, UtxoCache,
+    BitcoinZmqConfig, BitcoinZmqSubscriber, EnricherConfig, HistoricalReplayEngine,
+    MempoolRestClient, MempoolRestConfig, MempoolWebSocketClient, TransactionEnricher, UtxoCache,
 };
 use obschain_intelligence::IncidentWatchEngine;
 use obschain_storage::{
@@ -27,6 +28,37 @@ use obschain_storage::{
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "obschain",
+    about = "ObsChain Sovereign Bitcoin Observation & Intelligence Engine"
+)]
+pub struct CliArgs {
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Commands {
+    /// Start the live observation daemon (default behavior)
+    Run,
+    /// Replay historical Bitcoin blocks through ObsChain detectors
+    Replay {
+        /// Start block height
+        #[arg(long, short)]
+        start: u64,
+        /// End block height
+        #[arg(long, short)]
+        end: u64,
+        /// Maximum blocks per batch
+        #[arg(long)]
+        batch_size: Option<u64>,
+        /// Checkpoint interval in blocks
+        #[arg(long)]
+        checkpoint_interval: Option<u64>,
+    },
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -39,7 +71,19 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    let args = CliArgs::parse();
     let config = AppConfig::from_env();
+
+    if let Some(Commands::Replay {
+        start,
+        end,
+        batch_size,
+        checkpoint_interval,
+    }) = args.command
+    {
+        return run_replay(&config, start, end, batch_size, checkpoint_interval).await;
+    }
+
     let addr = config.socket_addr()?;
 
     info!(
@@ -59,76 +103,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // 1. Setup storage (in-memory or postgres) and channels
-    let storage: Storage = match config.storage_backend {
-        StorageBackendConfig::Memory => {
-            info!(
-                storage_backend = "memory",
-                limit = config.event_store_limit,
-                "Using in-memory bounded storage backend"
-            );
-            if config.mock_feed {
-                InMemoryStorage::with_limit(config.event_store_limit).into()
-            } else {
-                InMemoryStorage::new_empty(config.event_store_limit).into()
-            }
-        }
-        StorageBackendConfig::Postgres => {
-            let raw_db_url = config.database_url.as_deref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "OBSCHAIN_STORAGE_BACKEND is set to 'postgres', but DATABASE_URL environment variable is missing"
-                )
-            })?;
-
-            let redacted_url = redact_database_url(raw_db_url);
-            info!(
-                storage_backend = "postgres",
-                database = %redacted_url,
-                max_connections = config.db_max_connections,
-                min_connections = config.db_min_connections,
-                acquire_timeout_secs = config.db_acquire_timeout_seconds,
-                "Connecting to PostgreSQL database"
-            );
-
-            let pool = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(config.db_max_connections)
-                .min_connections(config.db_min_connections)
-                .acquire_timeout(Duration::from_secs(config.db_acquire_timeout_seconds))
-                .connect(raw_db_url)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to connect to PostgreSQL database (ensure database is running and reachable): {e}"
-                    )
-                })?;
-
-            let pg_storage = PostgresStorage::new(pool);
-
-            info!("Applying pending PostgreSQL database migrations");
-            pg_storage
-                .run_migrations()
-                .await
-                .map_err(|e| anyhow::anyhow!("Database migration failed during startup: {e}"))?;
-            info!(
-                storage_backend = "postgres",
-                database_connected = true,
-                migrations_applied = true,
-                "PostgreSQL schema migrated successfully"
-            );
-
-            info!("Seeding canonical incident intelligence and watch targets idempotently");
-            pg_storage.seed_canonical_incidents().await.map_err(|e| {
-                anyhow::anyhow!("Failed to seed canonical incident into PostgreSQL: {e}")
-            })?;
-            info!("Canonical incident and watch targets seeded successfully");
-
-            pg_storage
-                .initialize_telemetry_counters()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to initialize telemetry counters: {e}"))?;
-
-            pg_storage.into()
-        }
-    };
+    let storage = setup_storage(&config).await?;
 
     // Bounded observation channel: protects against unbounded memory growth under high tx volume
     let (obs_tx, mut obs_rx) = mpsc::channel::<Observation>(1000);
@@ -307,6 +282,31 @@ async fn main() -> anyhow::Result<()> {
     );
     let watch_engine_arc = Arc::new(tokio::sync::RwLock::new(watch_engine));
 
+    let replay_engine = if let Some(ref rpc) = btc_rpc_client {
+        let replay_config = obschain_ingest::ReplayConfig {
+            batch_size: config.replay_batch_size,
+            concurrency: config.replay_concurrency,
+            checkpoint_interval: config.replay_checkpoint_interval,
+            max_range: config.replay_max_range,
+            tx_cache_limit: config.replay_tx_cache_limit,
+            db_concurrency: config.replay_db_concurrency,
+            sovereign_only: config.sovereign_only,
+            api_enabled: config.replay_api_enabled,
+        };
+        let replay_detector_engine = Arc::new(tokio::sync::Mutex::new(DetectorEngine::new(
+            detectors.clone(),
+        )));
+        Some(Arc::new(HistoricalReplayEngine::new(
+            rpc.clone(),
+            storage.clone(),
+            replay_detector_engine,
+            Some(watch_engine_arc.clone()),
+            replay_config,
+        )))
+    } else {
+        None
+    };
+
     let metrics = PipelineMetrics::default();
     let (state, event_broadcaster) = AppState::with_metrics_and_watch_engine(
         storage.clone(),
@@ -315,6 +315,7 @@ async fn main() -> anyhow::Result<()> {
         metrics.clone(),
         watch_engine_arc.clone(),
     );
+    let state = state.with_replay(replay_engine, config.replay_api_enabled);
     let app = create_router(state.clone());
 
     // 7. Spawn Bitcoin Core Coordinator if configured
@@ -890,4 +891,203 @@ async fn save_event_with_retry(storage: &Storage, event: &ChainEvent, metrics: &
             }
         }
     }
+}
+
+async fn setup_storage(config: &AppConfig) -> anyhow::Result<Storage> {
+    match config.storage_backend {
+        StorageBackendConfig::Memory => {
+            info!(
+                storage_backend = "memory",
+                limit = config.event_store_limit,
+                "Using in-memory bounded storage backend"
+            );
+            if config.mock_feed {
+                Ok(InMemoryStorage::with_limit(config.event_store_limit).into())
+            } else {
+                Ok(InMemoryStorage::new_empty(config.event_store_limit).into())
+            }
+        }
+        StorageBackendConfig::Postgres => {
+            let raw_db_url = config.database_url.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "OBSCHAIN_STORAGE_BACKEND is set to 'postgres', but DATABASE_URL environment variable is missing"
+                )
+            })?;
+
+            let redacted_url = redact_database_url(raw_db_url);
+            info!(
+                storage_backend = "postgres",
+                database = %redacted_url,
+                max_connections = config.db_max_connections,
+                min_connections = config.db_min_connections,
+                acquire_timeout_secs = config.db_acquire_timeout_seconds,
+                "Connecting to PostgreSQL database"
+            );
+
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(config.db_max_connections)
+                .min_connections(config.db_min_connections)
+                .acquire_timeout(Duration::from_secs(config.db_acquire_timeout_seconds))
+                .connect(raw_db_url)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to connect to PostgreSQL database (ensure database is running and reachable): {e}"
+                    )
+                })?;
+
+            let pg_storage = PostgresStorage::new(pool);
+
+            info!("Applying pending PostgreSQL database migrations");
+            pg_storage
+                .run_migrations()
+                .await
+                .map_err(|e| anyhow::anyhow!("Database migration failed during startup: {e}"))?;
+            info!(
+                storage_backend = "postgres",
+                database_connected = true,
+                migrations_applied = true,
+                "PostgreSQL schema migrated successfully"
+            );
+
+            info!("Seeding canonical incident intelligence and watch targets idempotently");
+            pg_storage.seed_canonical_incidents().await.map_err(|e| {
+                anyhow::anyhow!("Failed to seed canonical incident into PostgreSQL: {e}")
+            })?;
+            info!("Canonical incident and watch targets seeded successfully");
+
+            pg_storage
+                .initialize_telemetry_counters()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to initialize telemetry counters: {e}"))?;
+
+            Ok(pg_storage.into())
+        }
+    }
+}
+
+async fn setup_bitcoin_rpc(config: &AppConfig) -> anyhow::Result<Arc<BitcoinCoreRpcClient>> {
+    let rpc_config = BitcoinRpcConfig {
+        rpc_url: config.bitcoin_rpc_url.clone(),
+        rpc_user: config.bitcoin_rpc_user.clone(),
+        rpc_password: config.bitcoin_rpc_password.clone(),
+        cookie_file: config.bitcoin_cookie_file.clone(),
+        timeout: Duration::from_secs(30),
+        expected_network: Some(config.bitcoin_network.clone()),
+    };
+    let rpc = BitcoinCoreRpcClient::new(rpc_config)?;
+    Ok(Arc::new(rpc))
+}
+
+async fn run_replay(
+    config: &AppConfig,
+    start: u64,
+    end: u64,
+    batch_size: Option<u64>,
+    checkpoint_interval: Option<u64>,
+) -> anyhow::Result<()> {
+    info!(
+        start_height = start,
+        end_height = end,
+        "ObsChain historical replay CLI starting"
+    );
+
+    let storage = setup_storage(config).await?;
+    let rpc = setup_bitcoin_rpc(config).await?;
+
+    let large_tx_detector = Arc::new(LargeTransactionDetector::with_threshold_sats(
+        config.large_tx_threshold_sats,
+    ));
+    let long_interval_detector = Arc::new(LongBlockIntervalDetector::with_threshold_seconds(
+        config.long_block_interval_seconds,
+    ));
+    let dormant_detector = Arc::new(DormantCoinDetector::with_thresholds(
+        config.dormant_min_age_days,
+        config.dormant_min_value_sats,
+    ));
+    let consolidation_detector = Arc::new(ConsolidationDetector::with_thresholds(
+        config.consolidation_min_inputs,
+        config.consolidation_max_outputs,
+        config.consolidation_min_value_sats,
+    ));
+    let fanout_detector = Arc::new(FanOutDetector::with_thresholds(
+        config.fanout_min_outputs,
+        config.fanout_min_value_sats,
+    ));
+    let extreme_fee_detector = Arc::new(ExtremeFeeDetector::with_thresholds(
+        config.extreme_fee_sats,
+        config.extreme_fee_rate_sat_vb,
+    ));
+    let rbf_detector = Arc::new(RbfDetector::new());
+    let reorg_detector = Arc::new(ReorgDetector::new());
+
+    let detectors: Vec<Arc<dyn obschain_detectors::Detector>> = vec![
+        large_tx_detector,
+        long_interval_detector,
+        dormant_detector,
+        consolidation_detector,
+        fanout_detector,
+        extreme_fee_detector,
+        rbf_detector,
+        reorg_detector,
+    ];
+
+    let mut watch_engine = IncidentWatchEngine::from_env();
+    let canonical_targets = obschain_incidents::canonical_liquid_watch_targets();
+    let targets_count = canonical_targets.len();
+    watch_engine.load_targets(canonical_targets);
+    watch_engine.register_incident_title(
+        obschain_incidents::LIQUID_CASE_ID,
+        "Liquid Network Security Incident",
+    );
+    info!(
+        targets_loaded = targets_count,
+        "IncidentWatchEngine initialized for historical replay"
+    );
+    let watch_engine_arc = Arc::new(tokio::sync::RwLock::new(watch_engine));
+
+    let replay_config = obschain_ingest::ReplayConfig {
+        batch_size: batch_size
+            .map(|b| b as usize)
+            .unwrap_or(config.replay_batch_size),
+        concurrency: config.replay_concurrency,
+        checkpoint_interval: checkpoint_interval.unwrap_or(config.replay_checkpoint_interval),
+        max_range: config.replay_max_range,
+        tx_cache_limit: config.replay_tx_cache_limit,
+        db_concurrency: config.replay_db_concurrency,
+        sovereign_only: config.sovereign_only,
+        api_enabled: true,
+    };
+
+    let detector_engine = Arc::new(tokio::sync::Mutex::new(DetectorEngine::new(detectors)));
+
+    let engine = HistoricalReplayEngine::new(
+        rpc,
+        storage,
+        detector_engine,
+        Some(watch_engine_arc),
+        replay_config,
+    );
+
+    engine.validate_capabilities_and_range(start, end).await?;
+
+    let job = engine.create_replay_job(start, end).await?;
+    info!(
+        job_id = %job.id,
+        start_height = start,
+        end_height = end,
+        "Created historical replay job. Executing replay pipeline..."
+    );
+
+    let completed_job = engine.run_job(job.id).await?;
+    info!(
+        job_id = %completed_job.id,
+        status = ?completed_job.status,
+        blocks_processed = completed_job.blocks_processed,
+        transactions_processed = completed_job.transactions_processed,
+        events_generated = completed_job.events_generated,
+        "Historical replay completed successfully!"
+    );
+
+    Ok(())
 }

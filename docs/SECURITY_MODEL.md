@@ -82,5 +82,23 @@ ObsChain processes data from untrusted network sources (peer-to-peer gossip, ext
   - When `OBSCHAIN_SOVEREIGN_ONLY=true`, ObsChain terminates all third-party outbound connections (no connections to `mempool.space` REST or WebSocket APIs).
   - Watched addresses, incident outpoints, and UTXO transaction lookups are never sent to external public endpoints, preventing surveillance and metadata leakage.
 
+### 10. Historical Replay & Research Engine Security (Phase 6A)
+- **API Administrative Boundary & Default Disabled**:
+  - `POST /api/v1/replay/jobs` is disabled by default (`OBSCHAIN_REPLAY_API_ENABLED=false`). Public deployments reject replay creation attempts with HTTP `403 Forbidden` unless explicitly configured.
+- **Range & Parameter Validation**:
+  - Replay ranges are bounded: `start <= end`, `start >= 0`, `end <= current_tip`, and `(end - start + 1) <= OBSCHAIN_REPLAY_MAX_RANGE` (default 100,000 blocks).
+  - Requests attempting unbounded or malicious scans are rejected immediately with HTTP `400 Bad Request`.
+- **Pre-flight Sync & Prune Validation**:
+  - Replay rejects execution if Bitcoin Core is performing initial block download (`initialblockdownload = true`) to prevent inconsistent state reads.
+  - Replay checks `pruneheight` before launching: if `start_height < pruneheight`, execution terminates immediately with a descriptive error rather than silently skipping historical blocks.
+- **Node RPC Exhaustion & Concurrency Limits**:
+  - Concurrency is strictly bounded by semaphore (`OBSCHAIN_REPLAY_CONCURRENCY`, default 2).
+  - Raw block deserialization is performed locally in Rust memory from raw hex rather than firing $N$ individual `getrawtransaction` RPC calls.
+  - Intra-block transaction indexing and bounded FIFO cache (`OBSCHAIN_REPLAY_TX_CACHE_LIMIT`, default 100,000 entries) eliminate redundant RPC lookups and bound process memory.
+- **Database Isolation & Backpressure**:
+  - Replay queries are bounded to dedicated connections (`OBSCHAIN_REPLAY_DB_CONCURRENCY`, default 2) to prevent starvations in live ingestion and dashboard API pools.
+  - Replay commits at atomic checkpoint intervals (`OBSCHAIN_REPLAY_CHECKPOINT_INTERVAL`, default 25 blocks) with deterministic UUID v5 event IDs (`ON CONFLICT (id) DO UPDATE`), guaranteeing complete crash recovery and idempotency without duplicate event amplification.
+
+
 
 

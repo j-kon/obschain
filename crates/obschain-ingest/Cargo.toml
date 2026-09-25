@@ -8,6 +8,9 @@ repository.workspace = true
 
 [dependencies]
 obschain-core = { workspace = true }
+obschain-detectors = { workspace = true }
+obschain-intelligence = { workspace = true }
+obschain-storage = { workspace = true }
 bitcoin = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
@@ -21,6 +24,8 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 zeromq = { workspace = true }
 bytes = { workspace = true }
+uuid = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }

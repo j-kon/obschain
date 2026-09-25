@@ -99,6 +99,16 @@ impl Detector for ReorgDetector {
 
         vec![event]
     }
+
+    fn availability(&self) -> crate::DetectorAvailability {
+        crate::DetectorAvailability {
+            historically_replayable: false,
+            requires_mempool_history: false,
+            requires_multiple_observers: false,
+            requires_external_labels: false,
+            notes: Some("Ordinary active-chain block replay cannot reconstruct stale forks or competing tips no longer in the active chain"),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -416,3 +416,150 @@ async fn test_ws_incident_broadcast() {
         panic!("Expected text frame");
     }
 }
+
+#[tokio::test]
+async fn test_replay_api_disabled_by_default() {
+    let app = test_app();
+    let body = serde_json::json!({
+        "start_height": 900000,
+        "end_height": 901000
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/replay/jobs")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["code"], 403);
+    assert!(json["error"].as_str().unwrap().contains("disabled"));
+}
+
+#[tokio::test]
+async fn test_replay_jobs_listing_and_not_found() {
+    let app = test_app();
+
+    // List jobs
+    let req = Request::builder()
+        .uri("/api/v1/replay/jobs")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["count"], 0);
+
+    // Job not found
+    let random_id = Uuid::new_v4();
+    let req2 = Request::builder()
+        .uri(format!("/api/v1/replay/jobs/{random_id}"))
+        .body(Body::empty())
+        .unwrap();
+    let res2 = app.oneshot(req2).await.unwrap();
+    assert_eq!(res2.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_events_research_filter_query() {
+    use chrono::Utc;
+    use obschain_core::{ChainEvent, ConfidenceLevel, EventSeverity, EventType, ObservationMode};
+    use obschain_storage::EventRepository;
+
+    let storage = InMemoryStorage::new_empty(1000);
+
+    let ev1 = ChainEvent {
+        id: Uuid::new_v4(),
+        event_type: EventType::LargeTransfer,
+        severity: EventSeverity::High,
+        confidence: ConfidenceLevel::High,
+        title: "Large Transfer 1".to_string(),
+        description: "100 BTC".to_string(),
+        detected_at: Utc::now(),
+        block_height: Some(150),
+        block_hash: None,
+        txid: Some("tx1".to_string()),
+        source: None,
+        witnesses: vec![],
+        metadata: serde_json::json!({}),
+        observation_mode: ObservationMode::Live,
+        replay_job_id: None,
+    };
+
+    let ev2 = ChainEvent {
+        id: Uuid::new_v4(),
+        event_type: EventType::LongBlockInterval,
+        severity: EventSeverity::Medium,
+        confidence: ConfidenceLevel::High,
+        title: "Long Interval".to_string(),
+        description: "45 mins".to_string(),
+        detected_at: Utc::now(),
+        block_height: Some(250),
+        block_hash: None,
+        txid: None,
+        source: None,
+        witnesses: vec![],
+        metadata: serde_json::json!({}),
+        observation_mode: ObservationMode::HistoricalReplay,
+        replay_job_id: Some(Uuid::new_v4()),
+    };
+
+    storage.save_event(&ev1).await.unwrap();
+    storage.save_event(&ev2).await.unwrap();
+
+    let detectors: Vec<Arc<dyn obschain_detectors::Detector>> = vec![];
+    let (state, _) = AppState::new(storage, detectors, false);
+    let app = create_router(state);
+
+    // Filter by height range 100..200
+    let req = Request::builder()
+        .uri("/api/v1/events?from_height=100&to_height=200")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["count"], 1);
+    assert_eq!(json["events"][0]["block_height"], 150);
+
+    // Filter by observation_mode=HISTORICAL_REPLAY
+    let req2 = Request::builder()
+        .uri("/api/v1/events?observation_mode=HISTORICAL_REPLAY")
+        .body(Body::empty())
+        .unwrap();
+    let res2 = app.clone().oneshot(req2).await.unwrap();
+    assert_eq!(res2.status(), StatusCode::OK);
+    let bytes2 = axum::body::to_bytes(res2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json2: serde_json::Value = serde_json::from_slice(&bytes2).unwrap();
+    assert_eq!(json2["count"], 1);
+    assert_eq!(json2["events"][0]["block_height"], 250);
+
+    // Filter by event_type=LARGE_TRANSFER
+    let req3 = Request::builder()
+        .uri("/api/v1/events?event_type=LARGE_TRANSFER")
+        .body(Body::empty())
+        .unwrap();
+    let res3 = app.oneshot(req3).await.unwrap();
+    assert_eq!(res3.status(), StatusCode::OK);
+    let bytes3 = axum::body::to_bytes(res3.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json3: serde_json::Value = serde_json::from_slice(&bytes3).unwrap();
+    assert_eq!(json3["count"], 1);
+    assert_eq!(json3["events"][0]["event_type"], "LARGE_TRANSFER");
+}

@@ -108,6 +108,16 @@ impl Detector for RbfDetector {
 
         vec![event]
     }
+
+    fn availability(&self) -> crate::DetectorAvailability {
+        crate::DetectorAvailability {
+            historically_replayable: false,
+            requires_mempool_history: true,
+            requires_multiple_observers: false,
+            requires_external_labels: false,
+            notes: Some("Requires unconfirmed mempool observation stream; cannot be reconstructed purely from confirmed blockchain history"),
+        }
+    }
 }
 
 #[cfg(test)]

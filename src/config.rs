@@ -143,6 +143,14 @@ pub struct AppConfig {
     pub utxo_lookup_concurrency: usize,
     pub dedup_cache_capacity: usize,
     pub dedup_cache_ttl_seconds: u64,
+    // Phase 6A Historical Replay Configuration
+    pub replay_batch_size: usize,
+    pub replay_concurrency: usize,
+    pub replay_checkpoint_interval: u64,
+    pub replay_max_range: u64,
+    pub replay_tx_cache_limit: usize,
+    pub replay_db_concurrency: usize,
+    pub replay_api_enabled: bool,
 }
 
 impl AppConfig {
@@ -336,6 +344,41 @@ impl AppConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(100);
 
+        // Phase 6A Historical Replay Configuration
+        let replay_batch_size = std::env::var("OBSCHAIN_REPLAY_BATCH_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+
+        let replay_concurrency = std::env::var("OBSCHAIN_REPLAY_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+
+        let replay_checkpoint_interval = std::env::var("OBSCHAIN_REPLAY_CHECKPOINT_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(25);
+
+        let replay_max_range = std::env::var("OBSCHAIN_REPLAY_MAX_RANGE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000);
+
+        let replay_tx_cache_limit = std::env::var("OBSCHAIN_REPLAY_TX_CACHE_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000);
+
+        let replay_db_concurrency = std::env::var("OBSCHAIN_REPLAY_DB_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+
+        let replay_api_enabled = std::env::var("OBSCHAIN_REPLAY_API_ENABLED")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false);
+
         Self {
             host,
             port,
@@ -379,6 +422,13 @@ impl AppConfig {
             utxo_lookup_concurrency,
             dedup_cache_capacity,
             dedup_cache_ttl_seconds,
+            replay_batch_size,
+            replay_concurrency,
+            replay_checkpoint_interval,
+            replay_max_range,
+            replay_tx_cache_limit,
+            replay_db_concurrency,
+            replay_api_enabled,
         }
     }
 

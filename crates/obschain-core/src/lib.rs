@@ -4,6 +4,7 @@ pub mod event;
 pub mod fee;
 pub mod incident;
 pub mod observation;
+pub mod replay;
 pub mod source;
 pub mod watch;
 
@@ -28,6 +29,9 @@ pub use incident::{
 pub use observation::{
     BlockObservation, MempoolObservation, Observation, ReorgObservation, SpentOutputContext,
     TransactionObservation, TransactionReplacement, TxInputObservation, TxOutputObservation,
+};
+pub use replay::{
+    ObservationContext, ObservationMode, ReplayCheckpoint, ReplayJob, ReplayJobStatus,
 };
 pub use source::{ObservationSource, ObservationWitness, SourceHealthState};
 pub use watch::{

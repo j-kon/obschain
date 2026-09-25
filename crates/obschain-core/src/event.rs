@@ -60,6 +60,10 @@ pub struct ChainEvent {
     pub source: Option<crate::source::ObservationSource>,
     #[serde(default)]
     pub witnesses: Vec<crate::source::ObservationWitness>,
+    #[serde(default)]
+    pub observation_mode: crate::replay::ObservationMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_job_id: Option<Uuid>,
     pub metadata: serde_json::Value,
 }
 
@@ -84,8 +88,32 @@ impl ChainEvent {
             txid: None,
             source: None,
             witnesses: Vec::new(),
+            observation_mode: crate::replay::ObservationMode::Live,
+            replay_job_id: None,
             metadata: serde_json::json!({}),
         }
+    }
+
+    /// Computes a stable, deterministic UUID for this logical event based on
+    /// its event type and target entity (txid, block_hash, or block_height).
+    /// Guarantees that live observation and historical replay generate identical event IDs.
+    pub fn deterministic_id(&self) -> Uuid {
+        let key = if let Some(ref tx) = self.txid {
+            format!("{:?}:tx:{}", self.event_type, tx)
+        } else if let Some(ref b) = self.block_hash {
+            format!("{:?}:block:{}", self.event_type, b)
+        } else if let Some(h) = self.block_height {
+            format!("{:?}:height:{}", self.event_type, h)
+        } else {
+            format!("{:?}:title:{}", self.event_type, self.title)
+        };
+        Uuid::new_v5(&Uuid::NAMESPACE_OID, key.as_bytes())
+    }
+
+    /// Replaces the event's random ID with its deterministic ID.
+    pub fn with_deterministic_id(mut self) -> Self {
+        self.id = self.deterministic_id();
+        self
     }
 
     /// Appends an independent observation witness if not already present.

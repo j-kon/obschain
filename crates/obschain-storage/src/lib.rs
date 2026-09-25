@@ -3,13 +3,14 @@ pub mod repository;
 
 pub use postgres::PostgresStorage;
 pub use repository::{
-    i64_to_u64_checked, u64_to_i64_checked, EventRepository, InMemoryStorage,
-    IncidentActivityRepository, IncidentAlertRepository, IncidentRepository, StorageError,
-    WatchTargetRepository,
+    i64_to_u64_checked, u64_to_i64_checked, EventFilter, EventRepository, InMemoryStorage,
+    IncidentActivityRepository, IncidentAlertRepository, IncidentRepository, ReplayRepository,
+    StorageError, WatchTargetRepository,
 };
 
 use obschain_core::{
-    ActivityStatus, ChainEvent, Incident, IncidentActivity, IncidentAlert, WatchTarget,
+    ActivityStatus, ChainEvent, Incident, IncidentActivity, IncidentAlert, ReplayCheckpoint,
+    ReplayJob, WatchTarget,
 };
 use uuid::Uuid;
 
@@ -113,6 +114,13 @@ impl Storage {
             Self::Postgres(p) => p.count_alerts().await.unwrap_or(0),
         }
     }
+
+    pub async fn count_replay_jobs(&self) -> usize {
+        match self {
+            Self::Memory(m) => m.replay_job_count(),
+            Self::Postgres(p) => p.count_replay_jobs().await.unwrap_or(0),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -139,6 +147,13 @@ impl EventRepository for Storage {
         match self {
             Self::Memory(m) => m.get_event_by_id(id).await,
             Self::Postgres(p) => p.get_event_by_id(id).await,
+        }
+    }
+
+    async fn query_events(&self, filter: &EventFilter) -> Result<Vec<ChainEvent>, StorageError> {
+        match self {
+            Self::Memory(m) => m.query_events(filter).await,
+            Self::Postgres(p) => p.query_events(filter).await,
         }
     }
 }
@@ -275,6 +290,54 @@ impl IncidentAlertRepository for Storage {
         match self {
             Self::Memory(m) => m.get_alert_by_id(id).await,
             Self::Postgres(p) => p.get_alert_by_id(id).await,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ReplayRepository for Storage {
+    async fn create_job(&self, job: &ReplayJob) -> Result<(), StorageError> {
+        match self {
+            Self::Memory(m) => m.create_job(job).await,
+            Self::Postgres(p) => p.create_job(job).await,
+        }
+    }
+
+    async fn get_job(&self, id: Uuid) -> Result<Option<ReplayJob>, StorageError> {
+        match self {
+            Self::Memory(m) => m.get_job(id).await,
+            Self::Postgres(p) => p.get_job(id).await,
+        }
+    }
+
+    async fn update_job(&self, job: &ReplayJob) -> Result<(), StorageError> {
+        match self {
+            Self::Memory(m) => m.update_job(job).await,
+            Self::Postgres(p) => p.update_job(job).await,
+        }
+    }
+
+    async fn list_jobs(&self, limit: usize, offset: usize) -> Result<Vec<ReplayJob>, StorageError> {
+        match self {
+            Self::Memory(m) => m.list_jobs(limit, offset).await,
+            Self::Postgres(p) => p.list_jobs(limit, offset).await,
+        }
+    }
+
+    async fn save_checkpoint(&self, checkpoint: &ReplayCheckpoint) -> Result<(), StorageError> {
+        match self {
+            Self::Memory(m) => m.save_checkpoint(checkpoint).await,
+            Self::Postgres(p) => p.save_checkpoint(checkpoint).await,
+        }
+    }
+
+    async fn get_latest_checkpoint(
+        &self,
+        job_id: Uuid,
+    ) -> Result<Option<ReplayCheckpoint>, StorageError> {
+        match self {
+            Self::Memory(m) => m.get_latest_checkpoint(job_id).await,
+            Self::Postgres(p) => p.get_latest_checkpoint(job_id).await,
         }
     }
 }

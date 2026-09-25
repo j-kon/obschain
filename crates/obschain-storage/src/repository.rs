@@ -6,7 +6,7 @@ use std::{
 use chrono::Utc;
 use obschain_core::{
     ActivityStatus, ChainEvent, ConfidenceLevel, EventSeverity, EventType, Incident,
-    IncidentActivity, IncidentAlert, WatchTarget,
+    IncidentActivity, IncidentAlert, ObservationMode, ReplayCheckpoint, ReplayJob, WatchTarget,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -37,6 +37,23 @@ pub fn i64_to_u64_checked(val: i64) -> Result<u64, StorageError> {
     })
 }
 
+/// Structured filter parameters for querying historical and live chain events.
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+pub struct EventFilter {
+    pub from_height: Option<u64>,
+    pub to_height: Option<u64>,
+    pub from_time: Option<chrono::DateTime<Utc>>,
+    pub to_time: Option<chrono::DateTime<Utc>>,
+    pub event_type: Option<EventType>,
+    pub severity: Option<EventSeverity>,
+    pub observation_mode: Option<ObservationMode>,
+    pub replay_job_id: Option<Uuid>,
+    pub txid: Option<String>,
+    pub block_hash: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
 #[async_trait::async_trait]
 pub trait EventRepository: Send + Sync {
     async fn save_event(&self, event: &ChainEvent) -> Result<(), StorageError>;
@@ -46,6 +63,20 @@ pub trait EventRepository: Send + Sync {
         offset: usize,
     ) -> Result<Vec<ChainEvent>, StorageError>;
     async fn get_event_by_id(&self, id: Uuid) -> Result<Option<ChainEvent>, StorageError>;
+    async fn query_events(&self, filter: &EventFilter) -> Result<Vec<ChainEvent>, StorageError>;
+}
+
+#[async_trait::async_trait]
+pub trait ReplayRepository: Send + Sync {
+    async fn create_job(&self, job: &ReplayJob) -> Result<(), StorageError>;
+    async fn get_job(&self, id: Uuid) -> Result<Option<ReplayJob>, StorageError>;
+    async fn update_job(&self, job: &ReplayJob) -> Result<(), StorageError>;
+    async fn list_jobs(&self, limit: usize, offset: usize) -> Result<Vec<ReplayJob>, StorageError>;
+    async fn save_checkpoint(&self, checkpoint: &ReplayCheckpoint) -> Result<(), StorageError>;
+    async fn get_latest_checkpoint(
+        &self,
+        job_id: Uuid,
+    ) -> Result<Option<ReplayCheckpoint>, StorageError>;
 }
 
 #[async_trait::async_trait]
@@ -113,6 +144,8 @@ pub struct InMemoryStorage {
     watch_targets: Arc<RwLock<Vec<WatchTarget>>>,
     activities: Arc<RwLock<VecDeque<IncidentActivity>>>,
     alerts: Arc<RwLock<VecDeque<IncidentAlert>>>,
+    replay_jobs: Arc<RwLock<Vec<ReplayJob>>>,
+    replay_checkpoints: Arc<RwLock<Vec<ReplayCheckpoint>>>,
     max_events: usize,
     max_activities: usize,
 }
@@ -146,6 +179,8 @@ impl InMemoryStorage {
             alerts: Arc::new(RwLock::new(VecDeque::with_capacity(
                 max_activities.min(1000),
             ))),
+            replay_jobs: Arc::new(RwLock::new(Vec::new())),
+            replay_checkpoints: Arc::new(RwLock::new(Vec::new())),
             max_events,
             max_activities,
         };
@@ -165,6 +200,8 @@ impl InMemoryStorage {
             alerts: Arc::new(RwLock::new(VecDeque::with_capacity(
                 Self::DEFAULT_MAX_ACTIVITIES.min(1000),
             ))),
+            replay_jobs: Arc::new(RwLock::new(Vec::new())),
+            replay_checkpoints: Arc::new(RwLock::new(Vec::new())),
             max_events,
             max_activities: Self::DEFAULT_MAX_ACTIVITIES,
         };
@@ -199,6 +236,10 @@ impl InMemoryStorage {
 
     pub fn activity_count(&self) -> usize {
         self.activities.read().map(|l| l.len()).unwrap_or(0)
+    }
+
+    pub fn replay_job_count(&self) -> usize {
+        self.replay_jobs.read().map(|l| l.len()).unwrap_or(0)
     }
 
     pub fn watch_target_count(&self) -> usize {
@@ -304,6 +345,12 @@ impl EventRepository for InMemoryStorage {
             .write()
             .map_err(|e| StorageError::Database(e.to_string()))?;
 
+        // Idempotent update if event already exists
+        if let Some(pos) = lock.iter().position(|e| e.id == event.id) {
+            lock[pos] = event.clone();
+            return Ok(());
+        }
+
         // Enforce bounded memory retention
         if lock.len() >= self.max_events {
             lock.pop_front();
@@ -338,6 +385,79 @@ impl EventRepository for InMemoryStorage {
             .read()
             .map_err(|e| StorageError::Database(e.to_string()))?;
         Ok(lock.iter().find(|e| e.id == id).cloned())
+    }
+
+    async fn query_events(&self, filter: &EventFilter) -> Result<Vec<ChainEvent>, StorageError> {
+        let lock = self
+            .events
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let limit = filter.limit.unwrap_or(100).clamp(1, 1000);
+        let offset = filter.offset.unwrap_or(0);
+
+        let filtered = lock
+            .iter()
+            .rev()
+            .filter(|e| {
+                if let Some(from_h) = filter.from_height {
+                    if e.block_height.map(|h| h < from_h).unwrap_or(true) {
+                        return false;
+                    }
+                }
+                if let Some(to_h) = filter.to_height {
+                    if e.block_height.map(|h| h > to_h).unwrap_or(true) {
+                        return false;
+                    }
+                }
+                if let Some(from_t) = filter.from_time {
+                    if e.detected_at < from_t {
+                        return false;
+                    }
+                }
+                if let Some(to_t) = filter.to_time {
+                    if e.detected_at > to_t {
+                        return false;
+                    }
+                }
+                if let Some(ref et) = filter.event_type {
+                    if &e.event_type != et {
+                        return false;
+                    }
+                }
+                if let Some(sev) = filter.severity {
+                    if e.severity != sev {
+                        return false;
+                    }
+                }
+                if let Some(mode) = filter.observation_mode {
+                    if e.observation_mode != mode {
+                        return false;
+                    }
+                }
+                if let Some(job_id) = filter.replay_job_id {
+                    if e.replay_job_id != Some(job_id) {
+                        return false;
+                    }
+                }
+                if let Some(ref txid) = filter.txid {
+                    if e.txid.as_ref() != Some(txid) {
+                        return false;
+                    }
+                }
+                if let Some(ref bh) = filter.block_hash {
+                    if e.block_hash.as_ref() != Some(bh) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect();
+
+        Ok(filtered)
     }
 }
 
@@ -585,6 +705,82 @@ impl IncidentAlertRepository for InMemoryStorage {
             .read()
             .map_err(|e| StorageError::Database(e.to_string()))?;
         Ok(lock.iter().find(|a| a.id == id).cloned())
+    }
+}
+
+#[async_trait::async_trait]
+impl ReplayRepository for InMemoryStorage {
+    async fn create_job(&self, job: &ReplayJob) -> Result<(), StorageError> {
+        let mut lock = self
+            .replay_jobs
+            .write()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        if let Some(pos) = lock.iter().position(|j| j.id == job.id) {
+            lock[pos] = job.clone();
+        } else {
+            lock.push(job.clone());
+        }
+        Ok(())
+    }
+
+    async fn get_job(&self, id: Uuid) -> Result<Option<ReplayJob>, StorageError> {
+        let lock = self
+            .replay_jobs
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(lock.iter().find(|j| j.id == id).cloned())
+    }
+
+    async fn update_job(&self, job: &ReplayJob) -> Result<(), StorageError> {
+        let mut lock = self
+            .replay_jobs
+            .write()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        if let Some(pos) = lock.iter().position(|j| j.id == job.id) {
+            lock[pos] = job.clone();
+            Ok(())
+        } else {
+            Err(StorageError::NotFound(format!(
+                "ReplayJob {} not found",
+                job.id
+            )))
+        }
+    }
+
+    async fn list_jobs(&self, limit: usize, offset: usize) -> Result<Vec<ReplayJob>, StorageError> {
+        let lock = self
+            .replay_jobs
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut jobs = lock.clone();
+        jobs.sort_by_key(|b| std::cmp::Reverse(b.created_at));
+        let res = jobs.into_iter().skip(offset).take(limit).collect();
+        Ok(res)
+    }
+
+    async fn save_checkpoint(&self, checkpoint: &ReplayCheckpoint) -> Result<(), StorageError> {
+        let mut lock = self
+            .replay_checkpoints
+            .write()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        lock.push(checkpoint.clone());
+        Ok(())
+    }
+
+    async fn get_latest_checkpoint(
+        &self,
+        job_id: Uuid,
+    ) -> Result<Option<ReplayCheckpoint>, StorageError> {
+        let lock = self
+            .replay_checkpoints
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let latest = lock
+            .iter()
+            .filter(|c| c.job_id == job_id)
+            .max_by_key(|c| c.completed_height)
+            .cloned();
+        Ok(latest)
     }
 }
 
