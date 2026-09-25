@@ -4,18 +4,20 @@ use std::{
 };
 
 use obschain::{
-    create_router, redact_database_url, AppConfig, AppState, PipelineMetrics, StorageBackendConfig,
+    create_router, redact_database_url, redact_rpc_url, AppConfig, AppState,
+    BitcoinCoreStatusResponse, BitcoinCoreZmqStatusResponse, PipelineMetrics, StorageBackendConfig,
     WebSocketBroadcast,
 };
 use obschain_core::{ChainEvent, IncidentActivity, IncidentAlert, Observation};
 use obschain_detectors::{
     ConsolidationDetector, DetectorEngine, DormantCoinDetector, EventDeduplicator,
     ExtremeFeeDetector, FanOutDetector, LargeTransactionDetector, LongBlockIntervalDetector,
-    RbfDetector,
+    RbfDetector, ReorgDetector,
 };
 use obschain_ingest::{
-    EnricherConfig, MempoolRestClient, MempoolRestConfig, MempoolWebSocketClient,
-    TransactionEnricher, UtxoCache,
+    BitcoinCoordinator, BitcoinCoordinatorConfig, BitcoinCoreRpcClient, BitcoinRpcConfig,
+    BitcoinZmqConfig, BitcoinZmqSubscriber, EnricherConfig, MempoolRestClient, MempoolRestConfig,
+    MempoolWebSocketClient, TransactionEnricher, UtxoCache,
 };
 use obschain_intelligence::IncidentWatchEngine;
 use obschain_storage::{
@@ -134,24 +136,98 @@ async fn main() -> anyhow::Result<()> {
     // Graceful shutdown coordination channel
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // 2. Setup Mempool REST client
-    let rest_config = MempoolRestConfig {
-        base_url: config.mempool_api_url.clone(),
-        timeout: Duration::from_secs(10),
-        connect_timeout: Duration::from_secs(5),
-        max_retries: 3,
-        max_response_bytes: 10 * 1024 * 1024,
-    };
+    // 2. Setup sovereign Bitcoin Core RPC and ZMQ if enabled
+    let mut btc_rpc_client = None;
+    let mut btc_coordinator = None;
 
-    let rest_client = match MempoolRestClient::new(rest_config) {
-        Ok(c) => Some(Arc::new(c)),
-        Err(e) => {
-            warn!(error = %e, "Failed to initialize MempoolRestClient");
-            None
+    if config.bitcoin_core_enabled {
+        let redacted_rpc = redact_rpc_url(&config.bitcoin_rpc_url);
+        info!(
+            rpc_url = %redacted_rpc,
+            network = %config.bitcoin_network,
+            sovereign_only = config.sovereign_only,
+            primary_source = %config.primary_source,
+            "Initializing sovereign Bitcoin Core RPC and ZMQ client"
+        );
+
+        let rpc_config = BitcoinRpcConfig {
+            rpc_url: config.bitcoin_rpc_url.clone(),
+            rpc_user: config.bitcoin_rpc_user.clone(),
+            rpc_password: config.bitcoin_rpc_password.clone(),
+            cookie_file: config.bitcoin_cookie_file.clone(),
+            timeout: Duration::from_secs(10),
+            expected_network: Some(config.bitcoin_network.clone()),
+        };
+
+        let rpc = match BitcoinCoreRpcClient::new(rpc_config) {
+            Ok(client) => Arc::new(client),
+            Err(e) => {
+                error!(error = %e, "Failed to initialize BitcoinCoreRpcClient");
+                return Err(anyhow::anyhow!("Bitcoin Core initialization failed: {e}"));
+            }
+        };
+
+        let zmq_config = BitcoinZmqConfig {
+            rawtx_endpoint: config.bitcoin_zmq_rawtx.clone(),
+            rawblock_endpoint: config.bitcoin_zmq_rawblock.clone(),
+            sequence_endpoint: config.bitcoin_zmq_sequence.clone(),
+            ..Default::default()
+        };
+
+        let zmq_sub = Arc::new(BitcoinZmqSubscriber::new(zmq_config));
+        let coord_config = BitcoinCoordinatorConfig {
+            reconcile_max_blocks: config.reconcile_max_blocks,
+            health_poll_interval_secs: 10,
+        };
+
+        let coord = Arc::new(BitcoinCoordinator::new(rpc.clone(), zmq_sub, coord_config));
+
+        match coord.initialize().await {
+            Ok(caps) => {
+                info!(
+                    network = %caps.network,
+                    blocks = caps.blocks,
+                    headers = caps.headers,
+                    ibd = caps.initial_block_download,
+                    verification_progress = caps.verification_progress,
+                    pruned = caps.pruned,
+                    txindex = caps.txindex_available,
+                    "Bitcoin Core node verified successfully"
+                );
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to connect or validate Bitcoin Core node");
+                return Err(anyhow::anyhow!("Bitcoin Core validation failed: {e}"));
+            }
         }
+
+        btc_rpc_client = Some(rpc);
+        btc_coordinator = Some(coord);
+    }
+
+    // 3. Setup Mempool REST client (only if NOT in sovereign-only mode)
+    let rest_client = if !config.sovereign_only {
+        let rest_config = MempoolRestConfig {
+            base_url: config.mempool_api_url.clone(),
+            timeout: Duration::from_secs(10),
+            connect_timeout: Duration::from_secs(5),
+            max_retries: 3,
+            max_response_bytes: 10 * 1024 * 1024,
+        };
+
+        match MempoolRestClient::new(rest_config) {
+            Ok(c) => Some(Arc::new(c)),
+            Err(e) => {
+                warn!(error = %e, "Failed to initialize MempoolRestClient");
+                None
+            }
+        }
+    } else {
+        info!("OBSCHAIN_SOVEREIGN_ONLY is active: mempool.space REST client disabled");
+        None
     };
 
-    // 3. Setup UTXO cache and bounded enrichment layer
+    // 4. Setup UTXO cache and bounded multi-source enrichment layer
     let utxo_cache = UtxoCache::new(
         config.utxo_cache_limit,
         Duration::from_secs(config.utxo_cache_ttl_seconds),
@@ -163,16 +239,20 @@ async fn main() -> anyhow::Result<()> {
         request_timeout: Duration::from_secs(5),
     };
 
-    let enricher = rest_client
-        .as_ref()
-        .map(|rc| TransactionEnricher::new(rc.clone(), utxo_cache.clone(), enricher_config));
+    let enricher = Some(TransactionEnricher::new_with_sources(
+        btc_rpc_client.clone(),
+        rest_client.clone(),
+        config.sovereign_only,
+        utxo_cache.clone(),
+        enricher_config,
+    ));
 
     let deduplicator = EventDeduplicator::new(
         config.dedup_cache_capacity,
         Duration::from_secs(config.dedup_cache_ttl_seconds),
     );
 
-    // 4. Setup Detectors and DetectorEngine
+    // 5. Setup Detectors and DetectorEngine
     let large_tx_detector = Arc::new(LargeTransactionDetector::with_threshold_sats(
         config.large_tx_threshold_sats,
     ));
@@ -197,6 +277,7 @@ async fn main() -> anyhow::Result<()> {
         config.extreme_fee_rate_sat_vb,
     ));
     let rbf_detector = Arc::new(RbfDetector::new());
+    let reorg_detector = Arc::new(ReorgDetector::new());
 
     let detectors: Vec<Arc<dyn obschain_detectors::Detector>> = vec![
         large_tx_detector,
@@ -206,10 +287,11 @@ async fn main() -> anyhow::Result<()> {
         fanout_detector,
         extreme_fee_detector,
         rbf_detector,
+        reorg_detector,
     ];
     let mut engine = DetectorEngine::new(detectors.clone());
 
-    // 5. Setup IncidentWatchEngine, AppState, and Metrics for Axum HTTP and WebSocket API
+    // 6. Setup IncidentWatchEngine, AppState, and Metrics for Axum HTTP and WebSocket API
     let mut watch_engine = IncidentWatchEngine::from_env();
     let canonical_targets = obschain_incidents::canonical_liquid_watch_targets();
     let targets_count = canonical_targets.len();
@@ -235,121 +317,210 @@ async fn main() -> anyhow::Result<()> {
     );
     let app = create_router(state.clone());
 
-    // 6. Mempool WebSocket ingestion supervisor
-    let ws_client = MempoolWebSocketClient::new(config.mempool_ws_url.clone());
-    let ws_connected = ws_client.connected_handle();
-    let ws_sources = state.sources.clone();
-    let mut ws_status_shutdown = shutdown_rx.clone();
+    // 7. Spawn Bitcoin Core Coordinator if configured
+    if let Some(coord) = btc_coordinator {
+        let coord_handles = coord.clone().start(obs_tx.clone(), shutdown_rx.clone());
+        let _ = coord_handles; // Keep tasks running on Tokio runtime
 
-    // WS connection status tracking worker
-    tokio::spawn(async move {
-        let mut last_state = false;
-        while !*ws_status_shutdown.borrow() {
-            let current = ws_connected.load(Ordering::Relaxed);
-            if current != last_state {
-                last_state = current;
-                if let Ok(mut sources) = ws_sources.write() {
-                    sources.mempool_websocket = if current {
-                        "connected".to_string()
-                    } else {
-                        "connecting".to_string()
-                    };
-                }
-            }
-            tokio::select! {
-                _ = ws_status_shutdown.changed() => break,
-                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
-            }
-        }
-    });
-
-    // Spawn WebSocket ingestion supervisor
-    let ws_obs_tx = obs_tx.clone();
-    let ws_shutdown_rx = shutdown_rx.clone();
-    tokio::spawn(async move {
-        ws_client.run_supervisor(ws_obs_tx, ws_shutdown_rx).await;
-    });
-
-    // 7. Mempool REST poller for tip synchronization and fallback ingestion
-    if let Some(rest) = rest_client {
-        let rest_sources = state.sources.clone();
-        let rest_tip = state.tip_height.clone();
-        let rest_obs_tx = obs_tx.clone();
-        let mut rest_shutdown = shutdown_rx.clone();
+        let coord_status_sync = coord.clone();
+        let status_state = state.clone();
+        let mut coord_shutdown = shutdown_rx.clone();
 
         tokio::spawn(async move {
-            let mut last_polled_height = 0u64;
+            while !*coord_shutdown.borrow() {
+                let st = coord_status_sync.get_status().await;
+                let rpc_str = st.rpc_health.as_str().to_string();
+                let rawtx_str = st.zmq_status.rawtx.as_str().to_string();
+                let rawblock_str = st.zmq_status.rawblock.as_str().to_string();
+                let seq_str = st.zmq_status.sequence.as_str().to_string();
 
-            // Initial REST sync
-            match rest.get_tip_height().await {
-                Ok(height) => {
-                    info!(tip_height = height, "Mempool REST client synced tip height");
-                    rest_tip.store(height, Ordering::Relaxed);
-                    last_polled_height = height;
-
-                    if let Ok(mut sources) = rest_sources.write() {
-                        sources.mempool_rest = "connected".to_string();
-                    }
-
-                    // Fetch current tip block details to establish baseline observation
-                    if let Ok(hash) = rest.get_tip_hash().await {
-                        if let Ok(block) = rest.get_block(&hash).await {
-                            let obs = block.into_observation(rest.base_url());
-                            let _ = rest_obs_tx.send(Observation::Block(obs)).await;
-                        }
-                    }
-
-                    // Ingest recent mempool transactions
-                    if let Ok(recent_txs) = rest.get_mempool_recent().await {
-                        for tx in recent_txs {
-                            let obs = tx.into_observation(rest.base_url());
-                            let _ = rest_obs_tx.send(Observation::Transaction(obs)).await;
-                        }
-                    }
+                if let Ok(mut sources) = status_state.sources.write() {
+                    sources.bitcoin_core = rpc_str.clone();
+                    sources.bitcoin_core_rpc = Some(rpc_str.clone());
+                    sources.bitcoin_core_zmq = Some(rawblock_str.clone());
                 }
-                Err(e) => {
-                    warn!(error = %e, "Initial Mempool REST tip check failed");
-                    if let Ok(mut sources) = rest_sources.write() {
-                        sources.mempool_rest = "error".to_string();
-                    }
-                }
-            }
 
-            // Periodic REST health and tip verification loop (every 30 seconds)
-            while !*rest_shutdown.borrow() {
+                let resp = BitcoinCoreStatusResponse {
+                    enabled: true,
+                    connected: st.rpc_health == obschain_core::SourceHealthState::Connected,
+                    network: st.capabilities.as_ref().map(|c| c.network.clone()),
+                    blocks: st.capabilities.as_ref().map(|c| c.blocks),
+                    headers: st.capabilities.as_ref().map(|c| c.headers),
+                    ibd: st.capabilities.as_ref().map(|c| c.initial_block_download),
+                    verification_progress: st
+                        .capabilities
+                        .as_ref()
+                        .map(|c| c.verification_progress),
+                    pruned: st.capabilities.as_ref().map(|c| c.pruned),
+                    txindex: st.capabilities.as_ref().map(|c| c.txindex_available),
+                    zmq: BitcoinCoreZmqStatusResponse {
+                        rawtx: rawtx_str,
+                        rawblock: rawblock_str,
+                        sequence: seq_str,
+                    },
+                };
+
+                *status_state.bitcoin_core_status.write().await = Some(resp);
+
+                status_state.metrics.reorgs_detected.store(
+                    coord_status_sync.reorgs_detected.load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+                status_state.metrics.gap_blocks_reconciled.store(
+                    coord_status_sync
+                        .gap_blocks_reconciled
+                        .load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+                status_state.metrics.zmq_transactions_received.store(
+                    coord_status_sync
+                        .zmq_transactions_received
+                        .load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+                status_state.metrics.zmq_blocks_received.store(
+                    coord_status_sync
+                        .zmq_blocks_received
+                        .load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+                status_state.metrics.rpc_requests_total.store(
+                    coord_status_sync.rpc_requests_total.load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+                status_state.metrics.rpc_errors_total.store(
+                    coord_status_sync.rpc_errors_total.load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+                status_state
+                    .metrics
+                    .bitcoin_core_tip
+                    .store(coord_status_sync.last_tip_height(), Ordering::Relaxed);
+
                 tokio::select! {
-                    _ = rest_shutdown.changed() => break,
-                    _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                        match rest.get_tip_height().await {
-                            Ok(height) => {
-                                if let Ok(mut sources) = rest_sources.write() {
-                                    sources.mempool_rest = "connected".to_string();
-                                }
-
-                                if height > last_polled_height {
-                                    info!(new_height = height, prev_height = last_polled_height, "Bitcoin tip updated via REST check");
-                                    rest_tip.store(height, Ordering::Relaxed);
-                                    last_polled_height = height;
-
-                                    if let Ok(hash) = rest.get_tip_hash().await {
-                                        if let Ok(block) = rest.get_block(&hash).await {
-                                            let obs = block.into_observation(rest.base_url());
-                                            let _ = rest_obs_tx.send(Observation::Block(obs)).await;
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "Mempool REST periodic health check failed");
-                                if let Ok(mut sources) = rest_sources.write() {
-                                    sources.mempool_rest = "error".to_string();
-                                }
-                            }
-                        }
-                    }
+                    _ = coord_shutdown.changed() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                 }
             }
         });
+    }
+
+    // 8. Mempool WebSocket ingestion supervisor & REST poller (only if NOT in sovereign-only mode)
+    if config.sovereign_only {
+        info!("OBSCHAIN_SOVEREIGN_ONLY=true: public mempool.space services disabled for privacy");
+        if let Ok(mut sources) = state.sources.write() {
+            sources.mempool_rest = "disabled_sovereign_only".to_string();
+            sources.mempool_websocket = "disabled_sovereign_only".to_string();
+        }
+    } else {
+        let ws_client = MempoolWebSocketClient::new(config.mempool_ws_url.clone());
+        let ws_connected = ws_client.connected_handle();
+        let ws_sources = state.sources.clone();
+        let mut ws_status_shutdown = shutdown_rx.clone();
+
+        tokio::spawn(async move {
+            let mut last_state = false;
+            while !*ws_status_shutdown.borrow() {
+                let current = ws_connected.load(Ordering::Relaxed);
+                if current != last_state {
+                    last_state = current;
+                    if let Ok(mut sources) = ws_sources.write() {
+                        sources.mempool_websocket = if current {
+                            "connected".to_string()
+                        } else {
+                            "connecting".to_string()
+                        };
+                    }
+                }
+                tokio::select! {
+                    _ = ws_status_shutdown.changed() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                }
+            }
+        });
+
+        let ws_obs_tx = obs_tx.clone();
+        let ws_shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            ws_client.run_supervisor(ws_obs_tx, ws_shutdown_rx).await;
+        });
+
+        if let Some(rest) = rest_client {
+            let rest_sources = state.sources.clone();
+            let rest_tip = state.tip_height.clone();
+            let rest_obs_tx = obs_tx.clone();
+            let mut rest_shutdown = shutdown_rx.clone();
+
+            tokio::spawn(async move {
+                let mut last_polled_height = 0u64;
+
+                match rest.get_tip_height().await {
+                    Ok(height) => {
+                        info!(tip_height = height, "Mempool REST client synced tip height");
+                        rest_tip.store(height, Ordering::Relaxed);
+                        last_polled_height = height;
+
+                        if let Ok(mut sources) = rest_sources.write() {
+                            sources.mempool_rest = "connected".to_string();
+                        }
+
+                        if let Ok(hash) = rest.get_tip_hash().await {
+                            if let Ok(block) = rest.get_block(&hash).await {
+                                let obs = block.into_observation(rest.base_url());
+                                let _ = rest_obs_tx.send(Observation::Block(obs)).await;
+                            }
+                        }
+
+                        if let Ok(recent_txs) = rest.get_mempool_recent().await {
+                            for tx in recent_txs {
+                                let obs = tx.into_observation(rest.base_url());
+                                let _ = rest_obs_tx.send(Observation::Transaction(obs)).await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Initial Mempool REST tip check failed");
+                        if let Ok(mut sources) = rest_sources.write() {
+                            sources.mempool_rest = "error".to_string();
+                        }
+                    }
+                }
+
+                while !*rest_shutdown.borrow() {
+                    tokio::select! {
+                        _ = rest_shutdown.changed() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                            match rest.get_tip_height().await {
+                                Ok(height) => {
+                                    if let Ok(mut sources) = rest_sources.write() {
+                                        sources.mempool_rest = "connected".to_string();
+                                    }
+
+                                    if height > last_polled_height {
+                                        info!(new_height = height, prev_height = last_polled_height, "Bitcoin tip updated via REST check");
+                                        rest_tip.store(height, Ordering::Relaxed);
+                                        last_polled_height = height;
+
+                                        if let Ok(hash) = rest.get_tip_hash().await {
+                                            if let Ok(block) = rest.get_block(&hash).await {
+                                                let obs = block.into_observation(rest.base_url());
+                                                let _ = rest_obs_tx.send(Observation::Block(obs)).await;
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Mempool REST periodic health check failed");
+                                    if let Ok(mut sources) = rest_sources.write() {
+                                        sources.mempool_rest = "error".to_string();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
     }
 
     // 8. Detector pipeline worker: Observation channel -> Enrichment -> Engine -> ChainEvent -> Dedup -> Storage & Broadcast
@@ -438,6 +609,17 @@ async fn main() -> anyhow::Result<()> {
                                 tx_count = mp.count,
                                 total_fee_sats = mp.total_fee_sats,
                                 "Mempool backlog stats updated"
+                            );
+                        }
+                        Observation::Reorg(reorg) => {
+                            pipeline_metrics.reorgs_detected.fetch_add(1, Ordering::Relaxed);
+                            warn!(
+                                old_tip = %reorg.old_tip_hash,
+                                new_tip = %reorg.new_tip_hash,
+                                depth = reorg.depth,
+                                disconnected = reorg.disconnected_blocks.len(),
+                                connected = reorg.connected_blocks.len(),
+                                "Bitcoin chain reorganization observed"
                             );
                         }
                     }

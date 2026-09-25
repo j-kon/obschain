@@ -260,6 +260,10 @@ impl EventRepository for PostgresStorage {
                 block_hash: row.get("block_hash"),
                 txid: row.get("txid"),
                 metadata: row.get("metadata"),
+                witnesses: source
+                    .clone()
+                    .map(|s| vec![obschain_core::ObservationWitness::new(s)])
+                    .unwrap_or_default(),
                 source,
             });
         }
@@ -320,6 +324,10 @@ impl EventRepository for PostgresStorage {
             block_hash: row.get("block_hash"),
             txid: row.get("txid"),
             metadata: row.get("metadata"),
+            witnesses: source
+                .clone()
+                .map(|s| vec![obschain_core::ObservationWitness::new(s)])
+                .unwrap_or_default(),
             source,
         }))
     }

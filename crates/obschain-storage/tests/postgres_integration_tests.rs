@@ -69,6 +69,7 @@ async fn test_postgres_event_insertion_and_idempotency() {
             "fee_rate_sat_vb": 12.5,
             "threshold_sats": 1_000_000_000,
         }),
+        witnesses: Vec::new(),
     };
 
     // 1. Initial insert

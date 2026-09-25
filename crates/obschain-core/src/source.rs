@@ -55,3 +55,55 @@ impl ObservationSource {
         }
     }
 }
+
+/// Operational and connectivity state of an ingestion source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SourceHealthState {
+    Connected,
+    Connecting,
+    Syncing,
+    Degraded,
+    Disconnected,
+    NotConfigured,
+}
+
+impl SourceHealthState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Connecting => "connecting",
+            Self::Syncing => "syncing",
+            Self::Degraded => "degraded",
+            Self::Disconnected => "disconnected",
+            Self::NotConfigured => "not_configured",
+        }
+    }
+}
+
+/// An independent observer or corroborating witness for a chain event or transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ObservationWitness {
+    pub source: ObservationSource,
+    pub observed_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+impl ObservationWitness {
+    pub fn new(source: ObservationSource) -> Self {
+        Self {
+            source,
+            observed_at: chrono::Utc::now(),
+            metadata: None,
+        }
+    }
+
+    pub fn with_metadata(source: ObservationSource, metadata: serde_json::Value) -> Self {
+        Self {
+            source,
+            observed_at: chrono::Utc::now(),
+            metadata: Some(metadata),
+        }
+    }
+}

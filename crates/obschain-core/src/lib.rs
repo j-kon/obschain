@@ -26,10 +26,10 @@ pub use incident::{
     TimelineEntry, TimelineEvent, TransactionRole,
 };
 pub use observation::{
-    BlockObservation, MempoolObservation, Observation, SpentOutputContext, TransactionObservation,
-    TransactionReplacement, TxInputObservation, TxOutputObservation,
+    BlockObservation, MempoolObservation, Observation, ReorgObservation, SpentOutputContext,
+    TransactionObservation, TransactionReplacement, TxInputObservation, TxOutputObservation,
 };
-pub use source::ObservationSource;
+pub use source::{ObservationSource, ObservationWitness, SourceHealthState};
 pub use watch::{
     ActivityStatus, CorrelationStrength, IncidentActivity, IncidentActivityType, IncidentAlert,
     PublicWatchTarget, WatchTarget, WatchTargetKind,

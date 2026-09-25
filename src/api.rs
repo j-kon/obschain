@@ -36,6 +36,41 @@ pub struct SourcesStatus {
     pub mempool_rest: String,
     pub mempool_websocket: String,
     pub bitcoin_core: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitcoin_core_rpc: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitcoin_core_zmq: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BitcoinCoreStatusResponse {
+    pub enabled: bool,
+    pub connected: bool,
+    pub network: Option<String>,
+    pub blocks: Option<u64>,
+    pub headers: Option<u64>,
+    pub ibd: Option<bool>,
+    pub verification_progress: Option<f64>,
+    pub pruned: Option<bool>,
+    pub txindex: Option<bool>,
+    pub zmq: BitcoinCoreZmqStatusResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BitcoinCoreZmqStatusResponse {
+    pub rawtx: String,
+    pub rawblock: String,
+    pub sequence: String,
+}
+
+impl Default for BitcoinCoreZmqStatusResponse {
+    fn default() -> Self {
+        Self {
+            rawtx: "not_configured".to_string(),
+            rawblock: "not_configured".to_string(),
+            sequence: "not_configured".to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -51,6 +86,16 @@ pub struct PipelineMetrics {
     pub incident_activities_detected: Arc<AtomicU64>,
     pub incident_alerts_emitted: Arc<AtomicU64>,
     pub storage_write_errors: Arc<AtomicU64>,
+    pub rpc_requests_total: Arc<AtomicU64>,
+    pub rpc_errors_total: Arc<AtomicU64>,
+    pub zmq_transactions_received: Arc<AtomicU64>,
+    pub zmq_blocks_received: Arc<AtomicU64>,
+    pub zmq_reconnects: Arc<AtomicU64>,
+    pub gap_blocks_reconciled: Arc<AtomicU64>,
+    pub reorgs_detected: Arc<AtomicU64>,
+    pub source_disagreements: Arc<AtomicU64>,
+    pub bitcoin_core_tip: Arc<AtomicU64>,
+    pub bitcoin_core_sync_progress: Arc<AtomicU64>,
 }
 
 impl PipelineMetrics {
@@ -67,6 +112,18 @@ impl PipelineMetrics {
             incident_activities_detected: self.incident_activities_detected.load(Ordering::Relaxed),
             incident_alerts_emitted: self.incident_alerts_emitted.load(Ordering::Relaxed),
             storage_write_errors: self.storage_write_errors.load(Ordering::Relaxed),
+            rpc_requests_total: self.rpc_requests_total.load(Ordering::Relaxed),
+            rpc_errors_total: self.rpc_errors_total.load(Ordering::Relaxed),
+            zmq_transactions_received: self.zmq_transactions_received.load(Ordering::Relaxed),
+            zmq_blocks_received: self.zmq_blocks_received.load(Ordering::Relaxed),
+            zmq_reconnects: self.zmq_reconnects.load(Ordering::Relaxed),
+            gap_blocks_reconciled: self.gap_blocks_reconciled.load(Ordering::Relaxed),
+            reorgs_detected: self.reorgs_detected.load(Ordering::Relaxed),
+            source_disagreements: self.source_disagreements.load(Ordering::Relaxed),
+            bitcoin_core_tip: self.bitcoin_core_tip.load(Ordering::Relaxed),
+            bitcoin_core_sync_progress: self.bitcoin_core_sync_progress.load(Ordering::Relaxed)
+                as f64
+                / 1_000_000.0,
         }
     }
 }
@@ -84,6 +141,16 @@ pub struct PipelineMetricsResponse {
     pub incident_activities_detected: u64,
     pub incident_alerts_emitted: u64,
     pub storage_write_errors: u64,
+    pub rpc_requests_total: u64,
+    pub rpc_errors_total: u64,
+    pub zmq_transactions_received: u64,
+    pub zmq_blocks_received: u64,
+    pub zmq_reconnects: u64,
+    pub gap_blocks_reconciled: u64,
+    pub reorgs_detected: u64,
+    pub source_disagreements: u64,
+    pub bitcoin_core_tip: u64,
+    pub bitcoin_core_sync_progress: f64,
 }
 
 /// Unified tagged WebSocket broadcast message for real-time streaming to connected clients.
@@ -132,6 +199,7 @@ pub struct AppState {
     pub events_detected: Arc<AtomicU64>,
     pub sources: Arc<RwLock<SourcesStatus>>,
     pub metrics: PipelineMetrics,
+    pub bitcoin_core_status: Arc<tokio::sync::RwLock<Option<BitcoinCoreStatusResponse>>>,
 }
 
 impl AppState {
@@ -202,8 +270,11 @@ impl AppState {
                 mempool_rest: "configured".to_string(),
                 mempool_websocket: "disconnected".to_string(),
                 bitcoin_core: "not_configured".to_string(),
+                bitcoin_core_rpc: None,
+                bitcoin_core_zmq: None,
             })),
             metrics,
+            bitcoin_core_status: Arc::new(tokio::sync::RwLock::new(None)),
         };
         (state, tx)
     }
@@ -254,6 +325,7 @@ pub struct StatusResponse {
     pub incident_watch_targets: usize,
     pub incident_activities_detected: u64,
     pub incident_alerts_emitted: u64,
+    pub bitcoin_core: BitcoinCoreStatusResponse,
 }
 
 #[derive(Debug, Deserialize)]
@@ -375,6 +447,8 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
             mempool_rest: "unknown".to_string(),
             mempool_websocket: "unknown".to_string(),
             bitcoin_core: "not_configured".to_string(),
+            bitcoin_core_rpc: None,
+            bitcoin_core_zmq: None,
         });
     let tip_height = state.tip_height.load(Ordering::Relaxed);
     let events_detected = state.events_detected.load(Ordering::Relaxed);
@@ -406,6 +480,13 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
         watch_targets_loaded: targets_loaded,
     };
 
+    let bitcoin_core = state
+        .bitcoin_core_status
+        .read()
+        .await
+        .clone()
+        .unwrap_or_default();
+
     Json(StatusResponse {
         service: "obschain",
         network: "bitcoin",
@@ -426,6 +507,7 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
         incident_watch_targets,
         incident_activities_detected,
         incident_alerts_emitted,
+        bitcoin_core,
     })
 }
 

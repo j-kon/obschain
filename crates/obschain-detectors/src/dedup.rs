@@ -16,6 +16,7 @@ pub struct EventDeduplicator {
 
 struct DedupInner {
     seen: HashMap<String, Instant>,
+    witnesses: HashMap<String, Vec<obschain_core::ObservationWitness>>,
     order: VecDeque<String>,
     max_capacity: usize,
     ttl: Duration,
@@ -30,6 +31,7 @@ impl EventDeduplicator {
         Self {
             inner: Arc::new(RwLock::new(DedupInner {
                 seen: HashMap::with_capacity(capacity.min(5000)),
+                witnesses: HashMap::with_capacity(capacity.min(5000)),
                 order: VecDeque::with_capacity(capacity.min(5000)),
                 max_capacity: capacity,
                 ttl,
@@ -52,7 +54,16 @@ impl EventDeduplicator {
         }
     }
 
+    /// Retrieves all corroborated witnesses observed for a specific deduplication key.
+    pub fn witnesses_for(&self, key: &str) -> Vec<obschain_core::ObservationWitness> {
+        let Ok(inner) = self.inner.read() else {
+            return Vec::new();
+        };
+        inner.witnesses.get(key).cloned().unwrap_or_default()
+    }
+
     /// Filters a batch of events, returning only fresh events and dropping duplicates.
+    /// Preserves provenance by appending duplicate observations as corroborated witnesses.
     pub fn filter(&self, events: Vec<ChainEvent>) -> Vec<ChainEvent> {
         let mut fresh = Vec::with_capacity(events.len());
 
@@ -63,14 +74,27 @@ impl EventDeduplicator {
         let now = Instant::now();
         let ttl = inner.ttl;
 
-        for event in events {
+        for mut event in events {
             let key = Self::event_key(&event);
 
             if let Some(seen_at) = inner.seen.get(&key) {
                 if now.duration_since(*seen_at) < ttl {
-                    // Duplicate within TTL window
+                    // Duplicate within TTL window: preserve corroborating witness
+                    if let Some(src) = &event.source {
+                        let witness = obschain_core::ObservationWitness::new(src.clone());
+                        inner
+                            .witnesses
+                            .entry(key.clone())
+                            .or_default()
+                            .push(witness);
+                    }
                     self.deduplicated_count.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!(event_type = ?event.event_type, key = %key, "Dropping duplicate chain event");
+                    tracing::debug!(
+                        event_type = ?event.event_type,
+                        key = %key,
+                        source = ?event.source,
+                        "Dropping duplicate chain event; preserved witness provenance"
+                    );
                     continue;
                 }
             }
@@ -79,9 +103,20 @@ impl EventDeduplicator {
             while inner.seen.len() >= inner.max_capacity {
                 if let Some(oldest) = inner.order.pop_front() {
                     inner.seen.remove(&oldest);
+                    inner.witnesses.remove(&oldest);
                 } else {
                     break;
                 }
+            }
+
+            if let Some(src) = &event.source {
+                let witness = obschain_core::ObservationWitness::new(src.clone());
+                event.add_witness(witness.clone());
+                inner
+                    .witnesses
+                    .entry(key.clone())
+                    .or_default()
+                    .push(witness);
             }
 
             inner.seen.insert(key.clone(), now);
@@ -194,5 +229,35 @@ mod tests {
         // Oldest (tx_0) should have been evicted and can be accepted again
         let ev_old = make_test_event(EventType::LargeTransfer, Some("tx_0"));
         assert_eq!(dedup.filter(vec![ev_old]).len(), 1);
+    }
+
+    #[test]
+    fn test_corroborating_witness_preservation() {
+        let dedup = EventDeduplicator::default();
+
+        let mut ev1 = make_test_event(EventType::LargeTransfer, Some("tx_multi_witness"));
+        ev1.source = Some(obschain_core::ObservationSource::bitcoin_core_zmq(
+            "tcp://127.0.0.1:28332",
+        ));
+
+        let mut ev2 = make_test_event(EventType::LargeTransfer, Some("tx_multi_witness"));
+        ev2.source = Some(obschain_core::ObservationSource::mempool_ws(
+            "wss://mempool.space/ws",
+        ));
+
+        let res1 = dedup.filter(vec![ev1]);
+        assert_eq!(res1.len(), 1);
+        assert_eq!(res1[0].witnesses.len(), 1);
+        assert_eq!(res1[0].witnesses[0].source.provider, "bitcoin_core");
+
+        // ev2 is a duplicate from mempool.space: dropped, but added as witness!
+        let res2 = dedup.filter(vec![ev2]);
+        assert_eq!(res2.len(), 0);
+
+        let key = EventDeduplicator::event_key(&res1[0]);
+        let witnesses = dedup.witnesses_for(&key);
+        assert_eq!(witnesses.len(), 2);
+        assert_eq!(witnesses[0].source.provider, "bitcoin_core");
+        assert_eq!(witnesses[1].source.provider, "mempool.space");
     }
 }

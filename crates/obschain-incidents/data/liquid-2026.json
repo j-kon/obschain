@@ -44,28 +44,28 @@
   },
   "entities": [
     {
-      "id": "714b53b1-17a1-49bd-97e3-265f4070b510",
+      "id": "85967834-3139-4c38-ab88-1cd3bc05495d",
       "name": "Liquid Federation",
       "entity_type": "Federation",
       "description": "Decentralized federation maintaining the Liquid Network 2-way peg wallet",
       "attribution_confidence": "OFFICIALLY_ATTRIBUTED"
     },
     {
-      "id": "5818c4d8-c0e3-40b8-98fe-b7b48c7ae52d",
+      "id": "43ad35e4-fe41-4fe9-b9da-9d6af9693df0",
       "name": "Blockstream",
       "entity_type": "Core Maintainer",
       "description": "Core technical maintainer of Elements and coordinator of Liquid bridge remediation",
       "attribution_confidence": "OFFICIALLY_ATTRIBUTED"
     },
     {
-      "id": "79207959-7d26-43c2-9ad3-43e352ee551d",
+      "id": "236553de-a1e9-4c21-a780-7dedf8856240",
       "name": "SideSwap",
       "entity_type": "Routing Service",
       "description": "Swap and peg-out service whose automated infrastructure was utilized during withdrawal",
       "attribution_confidence": "OFFICIALLY_ATTRIBUTED"
     },
     {
-      "id": "2086681f-4a26-40a9-892d-4e5c02929a44",
+      "id": "46bfbd1a-d14f-4202-863f-0f3ff80c65c0",
       "name": "Exploit Actor",
       "entity_type": "Unidentified Actor",
       "description": "Unidentified entity who exploited rangeproof cache and self-identified as whitehat on-chain",
@@ -181,7 +181,7 @@
   ],
   "timeline": [
     {
-      "id": "f70e06e3-5dbc-4395-a02f-5924c8894cc0",
+      "id": "e8423604-5ab3-4b14-9a31-e5bafae9e34a",
       "timestamp": "2026-09-06T13:53:00Z",
       "title": "Exploit Transaction Accepted on Liquid",
       "description": "Invalid Liquid transaction f24a4b17... accepted in block 4,050,336 creating ~4,000 unbacked L-BTC.",
@@ -199,7 +199,7 @@
       "classification": "ON_CHAIN_VERIFIED"
     },
     {
-      "id": "58ca4393-8df9-4945-9483-1f880c304fb2",
+      "id": "f1320899-1c19-4314-8fbe-ebf522ff0c89",
       "timestamp": "2026-09-06T14:00:00Z",
       "title": "Small Peg-Out Test Executed",
       "description": "Official report notes preliminary test peg-out executed to verify withdrawal routing.",
@@ -211,7 +211,7 @@
       "classification": "OFFICIALLY_ATTRIBUTED"
     },
     {
-      "id": "4212c521-af75-4978-8169-11d21577b12b",
+      "id": "06548af8-c4da-44cb-9693-dd10d5f61022",
       "timestamp": "2026-09-06T14:05:00Z",
       "title": "Large L-BTC Peg-Out Deposit Processed",
       "description": "Attacker routed unbacked L-BTC to SideSwap peg-out infrastructure.",
@@ -223,7 +223,7 @@
       "classification": "OFFICIALLY_ATTRIBUTED"
     },
     {
-      "id": "f873472b-63af-40be-b4ee-af976d86895e",
+      "id": "f5e3f4a1-2b76-44bd-959b-ced2add76a0c",
       "timestamp": "2026-09-06T14:28:56Z",
       "title": "Federation Release of 3,996.02 BTC Confirmed on Bitcoin",
       "description": "Bitcoin transaction 8db751a6... confirmed in block 965,783 paying out ~3,996.02 BTC from Liquid reserves.",
@@ -241,7 +241,7 @@
       "classification": "ON_CHAIN_VERIFIED"
     },
     {
-      "id": "d1975df7-2b36-4bb0-9025-364ceb85debb",
+      "id": "6bf634bd-62ef-48c9-8d80-8154572ba517",
       "timestamp": "2026-09-06T18:26:00Z",
       "title": "Liquid Federation Bridge Nodes Halted",
       "description": "Functionaries paused federation bridge nodes to prevent additional peg-out executions.",
@@ -253,7 +253,7 @@
       "classification": "OFFICIALLY_ATTRIBUTED"
     },
     {
-      "id": "ecb39ace-b7c1-4b84-8679-d21dca39cd85",
+      "id": "17edec25-2bf6-4b24-84d7-1bca0bc162bd",
       "timestamp": "2026-09-06T18:30:10Z",
       "title": "Actor Posts Initial On-Chain Message",
       "description": "Transaction c103de95... confirmed in block 965,818 containing OP_RETURN 'we are whitehats. contact us on chain.'",
@@ -269,7 +269,7 @@
       "classification": "ON_CHAIN_VERIFIED"
     },
     {
-      "id": "533de188-fa8b-449b-8230-25edda6815d2",
+      "id": "d3b90a0f-562f-40d3-aecf-3b327107972d",
       "timestamp": "2026-09-06T19:31:47Z",
       "title": "Blockstream Responds On-Chain",
       "description": "Transaction 91271efc... confirmed in block 965,822 directing actor to contact security@blockstream.com.",
@@ -285,7 +285,7 @@
       "classification": "ON_CHAIN_VERIFIED"
     },
     {
-      "id": "c2f8c592-8565-4459-9052-cf07c2c22d05",
+      "id": "a1b73be9-1f14-42c9-a2ce-2208eb66297c",
       "timestamp": "2026-09-06T20:25:00Z",
       "title": "Public Incident Disclosure",
       "description": "Blockstream published initial public security advisory acknowledging Liquid reserve exploit.",
@@ -297,7 +297,7 @@
       "classification": "OFFICIALLY_ATTRIBUTED"
     },
     {
-      "id": "78ae76b2-f144-4048-a61d-d8061d66c148",
+      "id": "1152ade8-138d-48d6-87b4-801342797bd6",
       "timestamp": "2026-09-07T01:09:00Z",
       "title": "Emergency Interim Patch Deployed",
       "description": "Bridge nodes restarted with range-proof verification cache disabled (-norangeproofcache).",
@@ -309,7 +309,7 @@
       "classification": "OFFICIALLY_ATTRIBUTED"
     },
     {
-      "id": "9e86488d-ea0a-48c2-a793-a594f529dc60",
+      "id": "75855e55-2dc0-4057-a452-c215a19857c6",
       "timestamp": "2026-09-07T16:09:00Z",
       "title": "3,400 BTC Returned on Bitcoin Mainnet",
       "description": "Transaction a6d697a2... confirmed in block 965,950 returning 3,400.00 BTC to Liquid federation address.",
@@ -327,7 +327,7 @@
       "classification": "ON_CHAIN_VERIFIED"
     },
     {
-      "id": "127b5f15-fe18-4789-a446-0913cd26d9bc",
+      "id": "20d4f1e5-10ba-40cd-b340-2255c9be1fc8",
       "timestamp": "2026-09-08T12:00:00Z",
       "title": "Elements PR #1600 Hardened Fix Merged",
       "description": "Permanent fix with CHashWriter explicit framing merged into Elements master branch.",
@@ -341,7 +341,7 @@
       "classification": "OFFICIALLY_ATTRIBUTED"
     },
     {
-      "id": "f78bb9d3-30f9-47fc-953e-77c2be9e9c8e",
+      "id": "7975f18d-356e-4b00-872e-4c3f2b25f6f9",
       "timestamp": "2026-09-09T08:00:00Z",
       "title": "Elements v23.3.4 Formally Released",
       "description": "Release build made available for all Liquid node operators.",
@@ -353,7 +353,7 @@
       "classification": "OFFICIALLY_ATTRIBUTED"
     },
     {
-      "id": "91525e59-72e6-4857-ab16-8654317ac755",
+      "id": "50cd6ad2-94e5-49d7-a570-1f5bf600a7b6",
       "timestamp": "2026-09-09T18:00:00Z",
       "title": "Corrected Liquid Sidechain Resumes",
       "description": "Block production on the Liquid sidechain resumed under consensus validation of v23.3.4.",
@@ -365,7 +365,7 @@
       "classification": "OFFICIALLY_ATTRIBUTED"
     },
     {
-      "id": "c48855ff-c1bd-46d9-a67b-e71618ef3284",
+      "id": "71d616d0-eb78-4e18-940b-e9119883d934",
       "timestamp": "2026-09-10T14:00:00Z",
       "title": "Transaction Processing Fully Restored",
       "description": "General transaction processing and standard sidechain operations resumed.",
@@ -536,7 +536,7 @@
   ],
   "updates": [
     {
-      "id": "f5f48366-bd8a-4a27-8891-12940b827eb5",
+      "id": "633780ca-0702-4dea-854c-9e16242efaf3",
       "timestamp": "2026-09-23T00:00:00Z",
       "title": "Official Assessment Published (~602 BTC Outstanding)",
       "summary": "Blockstream published full post-incident assessment confirming 3,400 BTC returned and ~602 BTC outstanding subject to ongoing recovery.",

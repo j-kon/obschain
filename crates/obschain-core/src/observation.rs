@@ -120,6 +120,22 @@ pub struct TransactionReplacement {
     pub source: Option<ObservationSource>,
 }
 
+/// Represents an observed Bitcoin chain reorganization or competing tip.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReorgObservation {
+    pub old_tip_hash: String,
+    pub old_tip_height: u64,
+    pub new_tip_hash: String,
+    pub new_tip_height: u64,
+    pub common_ancestor_hash: Option<String>,
+    pub depth: u64,
+    pub disconnected_blocks: Vec<String>,
+    pub connected_blocks: Vec<String>,
+    pub observed_at: DateTime<Utc>,
+    #[serde(default)]
+    pub source: Option<ObservationSource>,
+}
+
 /// High-level normalized observation payload passed to detectors.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
@@ -128,6 +144,7 @@ pub enum Observation {
     Transaction(TransactionObservation),
     Mempool(MempoolObservation),
     Replacement(TransactionReplacement),
+    Reorg(ReorgObservation),
 }
 
 impl Observation {
@@ -137,6 +154,7 @@ impl Observation {
             Observation::Transaction(t) => t.source.as_ref(),
             Observation::Mempool(m) => m.source.as_ref(),
             Observation::Replacement(r) => r.source.as_ref(),
+            Observation::Reorg(r) => r.source.as_ref(),
         }
     }
 
@@ -146,6 +164,7 @@ impl Observation {
             Observation::Transaction(t) => t.timestamp,
             Observation::Mempool(m) => m.timestamp,
             Observation::Replacement(r) => r.observed_at,
+            Observation::Reorg(r) => r.observed_at,
         }
     }
 }

@@ -299,3 +299,109 @@ When live Bitcoin ingestion encounters transient database write failures:
 - All query endpoints enforce clamped pagination (`default: 50`, `max: 200`).
 - Thoughtful composite indexes are placed on `(detected_at DESC)`, `(incident_id, observed_at DESC)`, and `(incident_id, as_of_timestamp DESC)`.
 
+---
+
+## Sovereign Bitcoin Core Ingestion Architecture (Phase 5)
+
+ObsChain establishes a locally operated Bitcoin Core full node as the primary, authoritative data source for all block and transaction observations, while retaining public API sources (`mempool.space`) as supplementary witnesses and enrichment fallbacks.
+
+```text
+ ┌─────────────────────────────────────────────────────────────┐
+ │                  SOVEREIGN INGESTION CORE                   │
+ │                                                             │
+ │   BitcoinCoreRpcClient           BitcoinZmqSubscriber       │
+ │   ├── Safe URL Validation        ├── rawtx (ZeroMQ TCP)     │
+ │   ├── Cookie Auth (.cookie)      ├── rawblock (ZeroMQ TCP)  │
+ │   ├── 401 Cookie Auto-Refresh    └── sequence (ZeroMQ TCP)  │
+ │   ├── Network Validation                │                   │
+ │   └── Capability Inspector              │                   │
+ └─────────────────┬───────────────────────┼───────────────────┘
+                   │                       │
+                   ▼                       ▼
+ ┌─────────────────────────────────────────────────────────────┐
+ │                 BITCOIN CORE COORDINATOR                    │
+ │                                                             │
+ │   ├── Source Health State Machine (Connecting/Connected/...)│
+ │   ├── Tip Continuity & Parent Hash Verification             │
+ │   ├── Reorganization Pipeline (Ancestor Trace)              │
+ │   ├── Bounded Gap Reconciliation (Max Replay Limit)         │
+ │   └── Source Reconciliation & Provenance Preservation       │
+ └──────────────────────────────┬──────────────────────────────┘
+                                │
+                                ▼
+ ┌─────────────────────────────────────────────────────────────┐
+ │               MULTI-WITNESS OBSERVATION PIPELINE            │
+ │                                                             │
+ │   ObservationWitness                                        │
+ │   ├── Primary Witness: BitcoinCoreZmq / BitcoinCoreRpc      │
+ │   ├── Secondary Witness: MempoolSpaceWs / MempoolSpaceRest  │
+ │   └── Deduplication: Multi-Witness Accumulation on Event    │
+ └─────────────────────────────────────────────────────────────┘
+```
+
+### 1. Bitcoin Core RPC Adapter (`BitcoinCoreRpcClient`)
+
+The RPC adapter implements a robust, typed JSON-RPC 1.0 client tailored for long-running daemon operations:
+- **Security Boundaries**: Strictly accepts only `http://` and `https://` schemas; rejects `file://` or arbitrary URIs to prevent SSRF vulnerabilities. Redacts credentials and cookie contents from logs and API payloads.
+- **Authentication**: Supports static credentials (`BITCOIN_RPC_USER` / `BITCOIN_RPC_PASSWORD`) or dynamic cookie authentication (`BITCOIN_COOKIE_FILE`). On receiving `401 Unauthorized` during cookie operation, the client invalidates its cached token, re-reads the cookie file from disk, and retries once automatically.
+- **Network Validation**: Inspects `getblockchaininfo.chain` against the configured network (`OBSCHAIN_BITCOIN_NETWORK`). Rejects startup if a mismatch is detected (e.g., node reports `testnet` when application expects `bitcoin`).
+- **Capability Inspection (`BitcoinNodeCapabilities`)**: Checks node version, verification progress, IBD status, pruning mode, and txindex availability (tested via genesis transaction lookup).
+- **Core RPC Methods**: Implements typed bindings for `getblockchaininfo`, `getnetworkinfo`, `getmempoolinfo`, `getrawmempool`, `getrawtransaction`, `getmempoolentry`, `getblockhash`, `getblock`, `getblockheader`, `gettxout`, and `getchaintips`.
+
+### 2. Bitcoin Core ZeroMQ Adapter (`BitcoinZmqSubscriber`)
+
+The ZMQ subscriber provides ultra-low-latency real-time streaming using pure-Rust asynchronous Tokio sockets (`zeromq`):
+- **Topics Subscribed**:
+  - `rawtx`: Streams unconfirmed transaction hexes directly as they enter the node's memory pool.
+  - `rawblock`: Streams raw serialized block bytes immediately upon consensus validation by Bitcoin Core.
+  - `sequence`: Streams 1-byte ASCII tagged sequence notifications:
+    - `'C'`: Block connected (includes 8-byte LE height).
+    - `'D'`: Block disconnected (indicates reorganization; includes 8-byte LE height).
+    - `'A'`: Transaction added to mempool (includes 8-byte LE sequence counter).
+    - `'R'`: Transaction removed from mempool (e.g. replaced or evicted; includes 8-byte LE sequence counter).
+- **Memory & Parsing Safety**: Limits raw payload parsing to 16 MB frame size. Payload deserialization errors are safely handled without panics.
+- **Connection Lifecycle**: Employs bounded exponential backoff reconnection (500ms to 10s).
+
+### 3. Source Reconciliation & Priority Hierarchy
+
+ObsChain evaluates observations across observers using deterministic source priority:
+1. **Authoritative Local Chain Data**: Bitcoin Core validated chain data (`BitcoinCoreZmq` / `BitcoinCoreRpc`).
+2. **Authoritative Local Mempool Data**: Bitcoin Core mempool observations (`sequence` / `rawtx`).
+3. **Supplementary Public Ingestion**: `mempool.space` WebSocket and REST feeds.
+
+Observations from public feeds never overwrite authoritative local node data. Instead, differences in tip height or transaction arrival timestamps are captured as secondary observer telemetry.
+
+### 4. Multi-Witness Architecture (`ObservationWitness`)
+
+Rather than dropping duplicate events when a transaction is observed across multiple network observer nodes, ObsChain records an `ObservationWitness` entry for each witness:
+- Stored on `ChainEvent.witnesses`.
+- Retains observer timestamp, source origin (`ObservationSource`), and verification status.
+- Preserves the structural foundation for cross-node propagation analysis and single-observer anomaly isolation.
+
+### 5. Reorganization Pipeline & ReorgDetector
+
+Chain reorganizations are detected and tracked as first-class domain occurrences:
+- **Tip Discontinuity**: When a new block arrives whose `prev_blockhash` does not equal the current known tip hash, ObsChain initiates chain tip investigation.
+- **Ancestor Tracing**: Uses `getblockheader` and `getchaintips` to trace backwards and locate the common ancestor between the old tip and new tip.
+- **`ReorgObservation`**: Emitted with `old_tip_hash`, `new_tip_hash`, `depth`, `common_ancestor_hash`, `disconnected_blocks`, and `connected_blocks`.
+- **`ReorgDetector`**: Maps depth deterministically to event severity:
+  - `depth <= 1`: `Low` severity (stale/competing block).
+  - `depth == 2`: `Medium` severity.
+  - `depth 3..=5`: `High` severity.
+  - `depth >= 6`: `Critical` severity.
+
+### 6. Bounded Gap Reconciliation
+
+If the daemon is offline during Bitcoin Core block production, or after a bitcoind restart:
+- The coordinator compares `stored_tip` against node tip height.
+- If `gap <= OBSCHAIN_RECONCILE_MAX_BLOCKS` (default 100), the coordinator fetches missed block hashes via RPC `getblockhash` / `getblock`, deserializes them, and feeds them into the normal observation channel.
+- If `gap > OBSCHAIN_RECONCILE_MAX_BLOCKS`, the coordinator logs a warning and updates its baseline tip without replaying thousands of blocks on the live stream.
+
+### 7. Sovereign-Only Mode & Privacy Guarantees
+
+When `OBSCHAIN_SOVEREIGN_ONLY=true` is enabled:
+- Public WebSocket and REST clients for `mempool.space` are never instantiated.
+- `TransactionEnricher` executes strictly against the local UTXO cache and local Bitcoin Core RPC.
+- No incident outpoints, watched addresses, or transaction lookups are ever transmitted across the public internet.
+
+

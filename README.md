@@ -47,44 +47,63 @@ obschain/
 - Cargo
 - Docker & Docker Compose (optional for PostgreSQL)
 
-## Architecture & Live Bitcoin Ingestion
+## Architecture & Live Sovereign Bitcoin Ingestion
 
 ```text
-mempool.space (REST + WebSocket)
-               ↓
-   ObsChain Ingestion Engine
-               ↓
-    Normalized Observations
-               ↓
-        Detector Pipeline
-               ↓
-           ChainEvent
-               ↓
-   Bounded Store + Live WS Broadcast (/api/v1/ws)
+Bitcoin Core (Full Node)               mempool.space (Secondary Witness)
+  ├── RPC Client                          ├── REST Sync Client
+  └── ZMQ Subscriber (rawtx/rawblock/seq) └── WebSocket Stream
+            │                                       │
+            └───────────────────┬───────────────────┘
+                                │
+                    ObsChain Ingestion Engine
+                    (Priority & Multi-Witness)
+                                │
+                     Normalized Observations
+            (Blocks, Transactions, Mempool, Reorgs)
+                                │
+                    Historical UTXO Enrichment
+            (Local Cache → Core RPC → Public REST)
+                                │
+                        Detector Pipeline
+            (8 Anomaly Detectors + Deduplicator)
+                                │
+                    Incident Watch Engine
+             (Watch Targets, DAG Descendants)
+                                │
+                    Durable Storage & Stream
+             (PostgreSQL / Memory + WebSocket)
 ```
 
-> **Note**: `mempool.space` is currently the initial live observation source. Bitcoin Core integration (RPC + ZMQ) is planned as the long-term independent sovereign source.
+### Ingestion Source Priority & Multi-Witness
 
-### How Live Ingestion Works
+ObsChain implements authoritative source priority:
+1. **Bitcoin Core Validated Chain Data** (Authoritative Local Source): Consensus-validated blocks and transactions received via ZMQ `rawblock`, `rawtx`, and `sequence`, cross-checked with JSON-RPC.
+2. **Bitcoin Core Mempool Backlog**: Local node mempool state and sequence events (`'A'` add, `'R'` remove).
+3. **mempool.space** (Supplementary Witness / Fallback): Public REST and WebSocket streams act as secondary witnesses when enabled, providing cross-observer telemetry without overwriting authoritative local node data.
 
-1. **Dual Ingestion (REST + WebSocket)**:
-   - **WebSocket Stream**: Connects to `MEMPOOL_WS_URL` with auto-reconnection and exponential backoff. Subscribes to live blocks, mempool stats, and transaction broadcasts.
-   - **REST Sync**: Periodically validates chain tip height via `MEMPOOL_API_URL`, establishing an initial baseline on startup and synchronizing current mempool backlog state.
-2. **Strict Normalization**:
-   - External raw payloads are normalized immediately into internal `Observation` domain models (`BlockObservation`, `TransactionObservation`, `MempoolObservation`).
-   - **Integer Satoshis**: All amounts remain integer `u64` satoshis internally to eliminate floating-point precision issues.
-   - **Safe Fee Rates**: Derived in sat/vB using integer vsize calculations with zero-division protection.
-   - **Provenance Tracking**: Every observation and event tags its exact ingestion origin (`mempool_ws`, `mempool_rest`, etc.).
-3. **Anomaly Detectors & Engine**:
-   - Normalized observations flow through a bounded channel (`mpsc(1000)`) into the `DetectorEngine`.
-   - When an observation triggers an anomaly rule, a `ChainEvent` is emitted and stored in thread-safe bounded memory (retaining up to `OBSCHAIN_EVENT_STORE_LIMIT` events).
-4. **Live Streaming Broadcast**:
-   - Detected events are broadcast instantaneously to connected browser clients over Axum WebSocket (`GET /api/v1/ws`).
+### How Sovereign Ingestion Works
+
+1. **Bitcoin Core RPC & ZMQ**:
+   - **RPC Client (`BitcoinCoreRpcClient`)**: Constrained, typed JSON-RPC client supporting cookie authentication (`.cookie`) or credentials. Validates network identity on startup and polls chain tips and capabilities (`getblockchaininfo`, `getnetworkinfo`, `getchaintips`, etc.).
+   - **ZeroMQ Subscriber (`BitcoinZmqSubscriber`)**: Subscribes to `rawtx`, `rawblock`, and `sequence` using Tokio TCP streams with bounded message frames (max 16 MB) and exponential backoff reconnection.
+   - **Sequence Event Processing**: Parses Bitcoin Core sequence notifications:
+     - `'C'`: Block connected (confirmation advance).
+     - `'D'`: Block disconnected (chain reorganization).
+     - `'A'`: Transaction added to mempool.
+     - `'R'`: Transaction removed from mempool.
+2. **Chain Reorganization & Gap Reconciliation**:
+   - **Tip Continuity Tracking**: Evaluates parent block hashes on arrival. If a new block does not build on the current tip, triggers ancestor investigation via `getchaintips` and `getblockheader`.
+   - **Bounded Gap Replay**: Reconciles missed blocks across node restarts up to `OBSCHAIN_RECONCILE_MAX_BLOCKS` (default 100). Exceeded gaps trigger a warning and baseline update without unbounded execution blocking.
+3. **Sovereign-Only Mode (`OBSCHAIN_SOVEREIGN_ONLY=true`)**:
+   - Completely disables outbound network calls to `mempool.space` REST and WebSocket endpoints.
+   - UTXO enrichment resolves strictly against local cache and Bitcoin Core RPC, ensuring zero watch target or query leakage to public third parties.
 
 ---
 
 ## Active Detectors
 
+- **`ReorgDetector`**: Emits `EventType::ReorgDetected` upon detecting chain reorganizations or competing tips (`ReorgObservation`). Evaluates reorganization depth and path, recording disconnected and connected block hashes. Deterministically assigns severity: 1 block -> `Low` (stale/competing block), 2 blocks -> `Medium`, 3-5 blocks -> `High`, 6+ blocks -> `Critical`.
 - **`DormantCoinDetector`**: Emits `EventType::DormantCoinsMoved` when Bitcoin UTXOs dormant for 5+ years are spent (`OBSCHAIN_DORMANT_MIN_AGE_DAYS`, default: 1,825 days, `OBSCHAIN_DORMANT_MIN_VALUE_SATS`, default: 1 BTC). Derives age strictly from historical confirmation context (`SpentOutputContext`), calculating Coin Age Destroyed in satoshi-days without floating-point overflow. Classifies outputs into `Dormant`, `VeryOld`, `Ancient`, or `EarlyBitcoin` (<2011 cutoff).
 - **`ConsolidationDetector`**: Emits `EventType::Consolidation` when transactions merge many inputs into few outputs (`OBSCHAIN_CONSOLIDATION_MIN_INPUTS`, default: 20 inputs into <= 5 outputs). Avoids false-positives on batch payouts or CoinJoins.
 - **`FanOutDetector`**: Emits `EventType::FanOut` when transactions distribute funds across an unusually high number of outputs (`OBSCHAIN_FANOUT_MIN_OUTPUTS`, default: 50 outputs).
@@ -138,10 +157,25 @@ Key environment variables:
 | `OBSCHAIN_ACTIVITY_STORE_LIMIT` | `10000` | Maximum recent incident activities in circular memory store |
 | `OBSCHAIN_INCIDENT_FOLLOW_DEPTH` | `3` | Maximum hop depth for tracking UTXO descendants (bounded 1-5) |
 | `OBSCHAIN_MOCK_FEED` | `false` | Run live ingestion (`false`) or mock demo data (`true`) |
+| `OBSCHAIN_BITCOIN_CORE_ENABLED` | `false` | Enable sovereign Bitcoin Core ingestion |
+| `BITCOIN_RPC_URL` | `http://127.0.0.1:8332` | Bitcoin Core JSON-RPC endpoint |
+| `BITCOIN_RPC_USER` / `BITCOIN_RPC_PASSWORD` | empty | RPC credentials (or use cookie auth) |
+| `BITCOIN_COOKIE_FILE` | empty | Path to `.cookie` file for zero-credential authentication |
+| `BITCOIN_ZMQ_RAWTX` | `tcp://127.0.0.1:28332` | ZMQ endpoint for raw transaction stream |
+| `BITCOIN_ZMQ_RAWBLOCK` | `tcp://127.0.0.1:28333` | ZMQ endpoint for raw block stream |
+| `BITCOIN_ZMQ_SEQUENCE` | `tcp://127.0.0.1:28334` | ZMQ endpoint for sequence notifications (`C`, `D`, `A`, `R`) |
+| `OBSCHAIN_BITCOIN_NETWORK` | `bitcoin` | Network validation (`bitcoin`, `testnet`, `signet`, `regtest`) |
+| `OBSCHAIN_PRIMARY_SOURCE` | `auto` | Primary ingestion source (`auto`, `bitcoin_core`, `mempool_space`) |
+| `OBSCHAIN_SOVEREIGN_ONLY` | `false` | Strict sovereign mode: disables all public mempool.space calls |
+| `OBSCHAIN_RECONCILE_MAX_BLOCKS` | `100` | Maximum chain gap blocks to replay before alerting |
 
 ### Running ObsChain
 
 ```bash
+# Sovereign Bitcoin Core mode (Mainnet or Regtest)
+OBSCHAIN_BITCOIN_CORE_ENABLED=true OBSCHAIN_SOVEREIGN_ONLY=true cargo run --bin obschain
+
+# Development mode (mempool.space default)
 cargo run --bin obschain
 ```
 
@@ -245,11 +279,48 @@ sqlx migrate run
 
 ---
 
-## Known Limitations
+## Local Bitcoin Core & Regtest Setup
 
-- **Mempool.space Dependency**: Initial live observation relies on mempool.space REST and WebSocket APIs. Direct validation against a local Bitcoin Core full node (RPC/ZMQ) is in development.
+ObsChain can operate directly against a local full node (Mainnet or Regtest) without any external third-party dependencies.
 
----
+### 1. Using the Regtest Helper Script
+
+A convenience management script is provided in `scripts/regtest-node.sh`:
+
+```bash
+# Start local bitcoind on regtest (RPC 18443, ZMQ 28332-28334, txindex=1)
+./scripts/regtest-node.sh start
+
+# Mine 101 blocks to mature coinbase rewards
+./scripts/regtest-node.sh mine 101
+
+# Inspect node status
+./scripts/regtest-node.sh status
+
+# Stop daemon when finished
+./scripts/regtest-node.sh stop
+```
+
+### 2. Using Docker Compose for Bitcoin Core
+
+Alternatively, run an isolated Bitcoin Core regtest container via `docker-compose.bitcoin.yml`:
+
+```bash
+docker compose -f docker-compose.bitcoin.yml up -d
+```
+
+### 3. Sovereign-Only Privacy Operation
+
+In sovereign-only mode (`OBSCHAIN_SOVEREIGN_ONLY=true`), ObsChain guarantees:
+- **Zero Third-Party Calls**: Disables all outgoing connections to public `mempool.space` REST and WebSocket endpoints.
+- **Privacy Preservation**: Watched addresses, transaction outpoints, and queries are never leaked to external public infrastructure.
+- **Authoritative Consensus**: Validates all incoming blocks and transactions directly against your local node's consensus rules.
+
+### 4. Node Capability & Pruning Behavior
+
+- **txindex**: Recommended (`txindex=1`). If disabled, historical UTXO lookups for dormant coin enrichment fall back to configured archival sources or fail gracefully without panicking.
+- **Pruned Nodes**: Detected on startup via `pruned: true` in `getblockchaininfo`. Missing historical transactions in pruned blocks are handled gracefully as non-fatal lookups.
+- **IBD (Initial Block Download)**: If the node is synchronizing (`initialblockdownload: true`), ObsChain status displays `syncing` with progress percentage and will not report `live` until catchup is complete.
 
 ## Testing & Quality
 

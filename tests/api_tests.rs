@@ -55,6 +55,13 @@ async fn test_status_endpoint() {
     assert!(status_json["sources"].is_object());
     assert_eq!(status_json["tip_height"], 0);
     assert_eq!(status_json["events_detected"], 0);
+    assert!(status_json["bitcoin_core"].is_object());
+    assert_eq!(status_json["bitcoin_core"]["enabled"], false);
+    assert_eq!(status_json["bitcoin_core"]["connected"], false);
+    assert_eq!(
+        status_json["bitcoin_core"]["zmq"]["rawtx"],
+        "not_configured"
+    );
 }
 
 #[tokio::test]

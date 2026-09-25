@@ -32,6 +32,40 @@ impl FromStr for StorageBackendConfig {
     }
 }
 
+/// Primary authoritative data source preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrimarySourceConfig {
+    BitcoinCore,
+    MempoolSpace,
+    Auto,
+}
+
+impl std::fmt::Display for PrimarySourceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BitcoinCore => write!(f, "bitcoin_core"),
+            Self::MempoolSpace => write!(f, "mempool_space"),
+            Self::Auto => write!(f, "auto"),
+        }
+    }
+}
+
+impl FromStr for PrimarySourceConfig {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "bitcoin_core" | "bitcoind" | "core" => Ok(Self::BitcoinCore),
+            "mempool_space" | "mempool" => Ok(Self::MempoolSpace),
+            "auto" | "" => Ok(Self::Auto),
+            other => Err(format!(
+                "Invalid OBSCHAIN_PRIMARY_SOURCE '{other}'. Supported values: 'bitcoin_core', 'mempool_space', 'auto'"
+            )),
+        }
+    }
+}
+
 /// Helper function to safely redact passwords from database connection URLs before logging.
 pub fn redact_database_url(url: &str) -> String {
     let (scheme, rest) = match url.split_once("://") {
@@ -49,6 +83,23 @@ pub fn redact_database_url(url: &str) -> String {
     }
 }
 
+/// Helper function to safely redact credentials from an RPC URL before logging.
+pub fn redact_rpc_url(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some((s, r)) => (s, r),
+        None => return "<redacted>".to_string(),
+    };
+    if let Some((user_pass, host_port)) = rest.split_once('@') {
+        if let Some((user, _pass)) = user_pass.split_once(':') {
+            format!("{}://{}:***@{}", scheme, user, host_port)
+        } else {
+            format!("{}://***@{}", scheme, host_port)
+        }
+    } else {
+        format!("{}://{}", scheme, rest)
+    }
+}
+
 pub struct AppConfig {
     pub host: String,
     pub port: u16,
@@ -59,9 +110,19 @@ pub struct AppConfig {
     pub db_acquire_timeout_seconds: u64,
     pub mempool_api_url: String,
     pub mempool_ws_url: String,
-    pub bitcoin_rpc_url: Option<String>,
+    // Phase 5 Sovereign Bitcoin Core Configuration
+    pub bitcoin_core_enabled: bool,
+    pub bitcoin_rpc_url: String,
     pub bitcoin_rpc_user: Option<String>,
     pub bitcoin_rpc_password: Option<String>,
+    pub bitcoin_cookie_file: Option<std::path::PathBuf>,
+    pub bitcoin_zmq_rawtx: Option<String>,
+    pub bitcoin_zmq_rawblock: Option<String>,
+    pub bitcoin_zmq_sequence: Option<String>,
+    pub bitcoin_network: String,
+    pub primary_source: PrimarySourceConfig,
+    pub sovereign_only: bool,
+    pub reconcile_max_blocks: u64,
     pub large_tx_threshold_sats: u64,
     pub long_block_interval_seconds: u64,
     pub event_store_limit: usize,
@@ -225,6 +286,56 @@ impl AppConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(1800); // 30 mins
 
+        let bitcoin_core_enabled = std::env::var("OBSCHAIN_BITCOIN_CORE_ENABLED")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false);
+
+        let bitcoin_rpc_url = std::env::var("BITCOIN_RPC_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8332".to_string());
+
+        let bitcoin_rpc_user = std::env::var("BITCOIN_RPC_USER")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let bitcoin_rpc_password = std::env::var("BITCOIN_RPC_PASSWORD")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let bitcoin_cookie_file = std::env::var("BITCOIN_COOKIE_FILE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from);
+
+        let bitcoin_zmq_rawtx = std::env::var("BITCOIN_ZMQ_RAWTX")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| Some("tcp://127.0.0.1:28332".to_string()));
+
+        let bitcoin_zmq_rawblock = std::env::var("BITCOIN_ZMQ_RAWBLOCK")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| Some("tcp://127.0.0.1:28333".to_string()));
+
+        let bitcoin_zmq_sequence = std::env::var("BITCOIN_ZMQ_SEQUENCE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| Some("tcp://127.0.0.1:28334".to_string()));
+
+        let bitcoin_network =
+            std::env::var("OBSCHAIN_BITCOIN_NETWORK").unwrap_or_else(|_| "bitcoin".to_string());
+
+        let primary_source = std::env::var("OBSCHAIN_PRIMARY_SOURCE")
+            .ok()
+            .and_then(|v| PrimarySourceConfig::from_str(&v).ok())
+            .unwrap_or(PrimarySourceConfig::Auto);
+
+        let sovereign_only = std::env::var("OBSCHAIN_SOVEREIGN_ONLY")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false);
+
+        let reconcile_max_blocks = std::env::var("OBSCHAIN_RECONCILE_MAX_BLOCKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+
         Self {
             host,
             port,
@@ -237,9 +348,18 @@ impl AppConfig {
                 .unwrap_or_else(|_| "https://mempool.space/api".to_string()),
             mempool_ws_url: std::env::var("MEMPOOL_WS_URL")
                 .unwrap_or_else(|_| "wss://mempool.space/api/v1/ws".to_string()),
-            bitcoin_rpc_url: std::env::var("BITCOIN_RPC_URL").ok(),
-            bitcoin_rpc_user: std::env::var("BITCOIN_RPC_USER").ok(),
-            bitcoin_rpc_password: std::env::var("BITCOIN_RPC_PASSWORD").ok(),
+            bitcoin_core_enabled,
+            bitcoin_rpc_url,
+            bitcoin_rpc_user,
+            bitcoin_rpc_password,
+            bitcoin_cookie_file,
+            bitcoin_zmq_rawtx,
+            bitcoin_zmq_rawblock,
+            bitcoin_zmq_sequence,
+            bitcoin_network,
+            primary_source,
+            sovereign_only,
+            reconcile_max_blocks,
             large_tx_threshold_sats,
             long_block_interval_seconds,
             event_store_limit,
@@ -264,5 +384,42 @@ impl AppConfig {
 
     pub fn socket_addr(&self) -> Result<SocketAddr, std::net::AddrParseError> {
         format!("{}:{}", self.host, self.port).parse()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_redact_rpc_url_with_credentials() {
+        let raw = "http://myuser:secretpassword123@127.0.0.1:8332";
+        let redacted = redact_rpc_url(raw);
+        assert_eq!(redacted, "http://myuser:***@127.0.0.1:8332");
+        assert!(!redacted.contains("secretpassword123"));
+    }
+
+    #[test]
+    fn test_redact_rpc_url_without_credentials() {
+        let raw = "http://127.0.0.1:8332";
+        let redacted = redact_rpc_url(raw);
+        assert_eq!(redacted, "http://127.0.0.1:8332");
+    }
+
+    #[test]
+    fn test_primary_source_parsing() {
+        assert_eq!(
+            PrimarySourceConfig::from_str("bitcoin_core").unwrap(),
+            PrimarySourceConfig::BitcoinCore
+        );
+        assert_eq!(
+            PrimarySourceConfig::from_str("mempool_space").unwrap(),
+            PrimarySourceConfig::MempoolSpace
+        );
+        assert_eq!(
+            PrimarySourceConfig::from_str("auto").unwrap(),
+            PrimarySourceConfig::Auto
+        );
+        assert!(PrimarySourceConfig::from_str("invalid_source").is_err());
     }
 }

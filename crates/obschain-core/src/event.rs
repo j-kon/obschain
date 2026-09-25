@@ -58,6 +58,8 @@ pub struct ChainEvent {
     pub txid: Option<String>,
     #[serde(default)]
     pub source: Option<crate::source::ObservationSource>,
+    #[serde(default)]
+    pub witnesses: Vec<crate::source::ObservationWitness>,
     pub metadata: serde_json::Value,
 }
 
@@ -81,7 +83,15 @@ impl ChainEvent {
             block_hash: None,
             txid: None,
             source: None,
+            witnesses: Vec::new(),
             metadata: serde_json::json!({}),
+        }
+    }
+
+    /// Appends an independent observation witness if not already present.
+    pub fn add_witness(&mut self, witness: crate::source::ObservationWitness) {
+        if !self.witnesses.iter().any(|w| w.source == witness.source) {
+            self.witnesses.push(witness);
         }
     }
 

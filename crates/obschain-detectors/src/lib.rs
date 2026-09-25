@@ -7,6 +7,7 @@ pub mod fan_out;
 pub mod large_tx;
 pub mod long_interval;
 pub mod rbf;
+pub mod reorg;
 
 pub use consolidation::ConsolidationDetector;
 pub use dedup::EventDeduplicator;
@@ -18,6 +19,7 @@ pub use large_tx::LargeTransactionDetector;
 pub use long_interval::LongBlockIntervalDetector;
 use obschain_core::{ChainEvent, Observation};
 pub use rbf::RbfDetector;
+pub use reorg::ReorgDetector;
 
 /// Pluggable detection interface for observing Bitcoin transactions and blocks.
 pub trait Detector: Send + Sync {
