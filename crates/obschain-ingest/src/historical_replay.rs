@@ -9,9 +9,9 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use obschain_core::{
-    calculate_fee_rate_sat_vb, BlockObservation, ChainEvent, Observation, ObservationContext,
-    ObservationSource, ReplayCheckpoint, ReplayJob, ReplayJobStatus, SpentOutputContext,
-    TransactionObservation, TxInputObservation, TxOutputObservation,
+    calculate_fee_rate_sat_vb, BlockObservation, ChainEvent, EventObservation, Observation,
+    ObservationContext, ObservationSource, ReplayCheckpoint, ReplayJob, ReplayJobStatus,
+    SpentOutputContext, TransactionObservation, TxInputObservation, TxOutputObservation,
 };
 use obschain_detectors::DetectorEngine;
 use obschain_intelligence::IncidentWatchEngine;
@@ -501,12 +501,22 @@ impl HistoricalReplayEngine {
 
             // Process single block
             match self.process_block(&mut job, height, prev_block_time).await {
-                Ok((block_time, tx_count, event_count)) => {
+                Ok((
+                    block_time,
+                    tx_count,
+                    event_count,
+                    created_count,
+                    existing_count,
+                    obs_count,
+                )) => {
                     prev_block_time = Some(block_time);
                     job.current_height = height;
                     job.blocks_processed += 1;
                     job.transactions_processed += tx_count as u64;
                     job.events_generated += event_count as u64;
+                    job.events_created += created_count;
+                    job.events_existing += existing_count;
+                    job.observations_recorded += obs_count;
 
                     // Checkpoint every checkpoint_interval or at final block
                     let is_checkpoint = (job.blocks_processed % self.config.checkpoint_interval
@@ -520,6 +530,11 @@ impl HistoricalReplayEngine {
                             job.blocks_processed,
                             job.transactions_processed,
                             job.events_generated,
+                        )
+                        .with_provenance_counts(
+                            job.events_created,
+                            job.events_existing,
+                            job.observations_recorded,
                         );
                         self.storage.save_checkpoint(&checkpoint).await?;
                         self.storage.update_job(&job).await?;
@@ -592,7 +607,7 @@ impl HistoricalReplayEngine {
         job: &mut ReplayJob,
         height: u64,
         prev_block_time: Option<DateTime<Utc>>,
-    ) -> Result<(DateTime<Utc>, usize, usize), ReplayError> {
+    ) -> Result<(DateTime<Utc>, usize, usize, u64, u64, u64), ReplayError> {
         // 1. Fetch block hash and raw block hex
         let block_hash = self.rpc_client.get_block_hash(height).await?;
         let raw_hex = self.rpc_client.get_block_raw_hex(&block_hash).await?;
@@ -912,9 +927,36 @@ impl HistoricalReplayEngine {
         }
         drop(detector_engine);
 
-        // 9. Persist events idempotently
+        // 9. Persist events and record observation provenance
+        let mut created_count = 0u64;
+        let mut existing_count = 0u64;
+        let mut obs_count = 0u64;
+        let now = Utc::now();
+        let obs_source = ObservationSource::new("bitcoin_core", "rpc_historical_replay", None);
+
         for event in &events {
+            let already_exists = self.storage.get_event_by_id(event.id).await?.is_some();
+            if already_exists {
+                existing_count += 1;
+            } else {
+                created_count += 1;
+            }
+
+            // 1. Save canonical event (conservative upsert: preserves provenance)
             self.storage.save_event(event).await?;
+
+            // 2. Record this replay job's observation
+            let obs = EventObservation::historical_replay(
+                event.id,
+                job.id,
+                obs_source.clone(),
+                now,
+                Some(event.event_time),
+                Some(height),
+                Some(block_hash.clone()),
+            );
+            self.storage.save_event_observation(&obs).await?;
+            obs_count += 1;
         }
 
         // 10. Pass to IncidentWatchEngine if configured
@@ -943,6 +985,13 @@ impl HistoricalReplayEngine {
             }
         }
 
-        Ok((block_time, block.txdata.len(), events.len()))
+        Ok((
+            block_time,
+            block.txdata.len(),
+            events.len(),
+            created_count,
+            existing_count,
+            obs_count,
+        ))
     }
 }

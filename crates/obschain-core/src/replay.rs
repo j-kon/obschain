@@ -118,6 +118,12 @@ pub struct ReplayJob {
     pub blocks_processed: u64,
     pub transactions_processed: u64,
     pub events_generated: u64,
+    #[serde(default)]
+    pub events_created: u64,
+    #[serde(default)]
+    pub events_existing: u64,
+    #[serde(default)]
+    pub observations_recorded: u64,
     pub error_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
@@ -144,6 +150,9 @@ impl ReplayJob {
             blocks_processed: 0,
             transactions_processed: 0,
             events_generated: 0,
+            events_created: 0,
+            events_existing: 0,
+            observations_recorded: 0,
             error_count: 0,
             last_error: None,
         }
@@ -175,6 +184,12 @@ pub struct ReplayCheckpoint {
     pub blocks_processed: u64,
     pub transactions_processed: u64,
     pub events_generated: u64,
+    #[serde(default)]
+    pub events_created: u64,
+    #[serde(default)]
+    pub events_existing: u64,
+    #[serde(default)]
+    pub observations_recorded: u64,
     pub checkpointed_at: DateTime<Utc>,
 }
 
@@ -193,7 +208,22 @@ impl ReplayCheckpoint {
             blocks_processed,
             transactions_processed,
             events_generated,
+            events_created: 0,
+            events_existing: 0,
+            observations_recorded: events_generated,
             checkpointed_at: Utc::now(),
         }
+    }
+
+    pub fn with_provenance_counts(
+        mut self,
+        events_created: u64,
+        events_existing: u64,
+        observations_recorded: u64,
+    ) -> Self {
+        self.events_created = events_created;
+        self.events_existing = events_existing;
+        self.observations_recorded = observations_recorded;
+        self
     }
 }

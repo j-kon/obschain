@@ -5,8 +5,9 @@ use std::{
 
 use chrono::Utc;
 use obschain_core::{
-    ActivityStatus, ChainEvent, ConfidenceLevel, EventSeverity, EventType, Incident,
-    IncidentActivity, IncidentAlert, ObservationMode, ReplayCheckpoint, ReplayJob, WatchTarget,
+    ActivityStatus, ChainEvent, ConfidenceLevel, EventObservation, EventSeverity, EventType,
+    Incident, IncidentActivity, IncidentAlert, ObservationMode, ReplayCheckpoint, ReplayJob,
+    WatchTarget,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -64,6 +65,16 @@ pub trait EventRepository: Send + Sync {
     ) -> Result<Vec<ChainEvent>, StorageError>;
     async fn get_event_by_id(&self, id: Uuid) -> Result<Option<ChainEvent>, StorageError>;
     async fn query_events(&self, filter: &EventFilter) -> Result<Vec<ChainEvent>, StorageError>;
+    async fn save_event_observation(
+        &self,
+        observation: &EventObservation,
+    ) -> Result<(), StorageError>;
+    async fn list_event_observations(
+        &self,
+        event_id: Uuid,
+    ) -> Result<Vec<EventObservation>, StorageError>;
+    async fn count_event_observations(&self, event_id: Option<Uuid>)
+        -> Result<usize, StorageError>;
 }
 
 #[async_trait::async_trait]
@@ -140,6 +151,7 @@ pub trait IncidentAlertRepository: Send + Sync {
 #[derive(Clone)]
 pub struct InMemoryStorage {
     events: Arc<RwLock<VecDeque<ChainEvent>>>,
+    event_observations: Arc<RwLock<Vec<EventObservation>>>,
     incidents: Arc<RwLock<Vec<Incident>>>,
     watch_targets: Arc<RwLock<Vec<WatchTarget>>>,
     activities: Arc<RwLock<VecDeque<IncidentActivity>>>,
@@ -171,6 +183,7 @@ impl InMemoryStorage {
     pub fn with_limits(max_events: usize, max_activities: usize) -> Self {
         let storage = Self {
             events: Arc::new(RwLock::new(VecDeque::with_capacity(max_events.min(1000)))),
+            event_observations: Arc::new(RwLock::new(Vec::new())),
             incidents: Arc::new(RwLock::new(Vec::new())),
             watch_targets: Arc::new(RwLock::new(Vec::new())),
             activities: Arc::new(RwLock::new(VecDeque::with_capacity(
@@ -192,6 +205,7 @@ impl InMemoryStorage {
     pub fn new_empty(max_events: usize) -> Self {
         let storage = Self {
             events: Arc::new(RwLock::new(VecDeque::with_capacity(max_events.min(1000)))),
+            event_observations: Arc::new(RwLock::new(Vec::new())),
             incidents: Arc::new(RwLock::new(Vec::new())),
             watch_targets: Arc::new(RwLock::new(Vec::new())),
             activities: Arc::new(RwLock::new(VecDeque::with_capacity(
@@ -250,6 +264,9 @@ impl InMemoryStorage {
         if let Ok(mut lock) = self.events.write() {
             lock.clear();
         }
+        if let Ok(mut lock) = self.event_observations.write() {
+            lock.clear();
+        }
     }
 
     pub fn clear_activities(&self) {
@@ -285,7 +302,9 @@ impl InMemoryStorage {
         ev1.block_height = Some(884920);
         ev1.block_hash =
             Some("000000000000000000021b34e56997427ce090ef6d38e2195ec4188b449102c1".to_string());
-        ev1.detected_at = now - chrono::Duration::minutes(15);
+        ev1.event_time = now - chrono::Duration::minutes(15);
+        ev1.first_observed_at = now - chrono::Duration::minutes(15);
+        ev1.detected_at = ev1.event_time;
         ev1.metadata = serde_json::json!({
             "is_mock": true,
             "btc_volume": 2450.0,
@@ -305,7 +324,9 @@ impl InMemoryStorage {
         ev2.block_height = Some(884918);
         ev2.block_hash =
             Some("00000000000000000001f37e42d87e07663f73367809bfccb34ba85df1176b66".to_string());
-        ev2.detected_at = now - chrono::Duration::hours(2);
+        ev2.event_time = now - chrono::Duration::hours(2);
+        ev2.first_observed_at = now - chrono::Duration::hours(2);
+        ev2.detected_at = ev2.event_time;
         ev2.metadata = serde_json::json!({
             "is_mock": true,
             "interval_seconds": 4440,
@@ -322,7 +343,9 @@ impl InMemoryStorage {
             "Mempool congestion spike observed following rapid sequential transactions.",
         );
         ev3.id = Uuid::parse_str("a0000000-0000-0000-0000-000000000003").unwrap();
-        ev3.detected_at = now - chrono::Duration::hours(5);
+        ev3.event_time = now - chrono::Duration::hours(5);
+        ev3.first_observed_at = now - chrono::Duration::hours(5);
+        ev3.detected_at = ev3.event_time;
         ev3.metadata = serde_json::json!({
             "is_mock": true,
             "median_fee_rate": 85.4,
@@ -330,9 +353,36 @@ impl InMemoryStorage {
         });
 
         if let Ok(mut lock) = self.events.write() {
-            lock.push_back(ev1);
-            lock.push_back(ev2);
-            lock.push_back(ev3);
+            lock.push_back(ev1.clone());
+            lock.push_back(ev2.clone());
+            lock.push_back(ev3.clone());
+        }
+
+        if let Ok(mut lock) = self.event_observations.write() {
+            lock.push(EventObservation::live(
+                ev1.id,
+                obschain_core::ObservationSource::bitcoin_core_rpc("http://127.0.0.1:18443"),
+                ev1.detected_at,
+                Some(ev1.detected_at),
+                ev1.block_height,
+                ev1.block_hash.clone(),
+            ));
+            lock.push(EventObservation::live(
+                ev2.id,
+                obschain_core::ObservationSource::bitcoin_core_rpc("http://127.0.0.1:18443"),
+                ev2.detected_at,
+                Some(ev2.detected_at),
+                ev2.block_height,
+                ev2.block_hash.clone(),
+            ));
+            lock.push(EventObservation::live(
+                ev3.id,
+                obschain_core::ObservationSource::bitcoin_core_rpc("http://127.0.0.1:18443"),
+                ev3.detected_at,
+                Some(ev3.detected_at),
+                ev3.block_height,
+                ev3.block_hash.clone(),
+            ));
         }
     }
 }
@@ -345,15 +395,25 @@ impl EventRepository for InMemoryStorage {
             .write()
             .map_err(|e| StorageError::Database(e.to_string()))?;
 
-        // Idempotent update if event already exists
+        // Idempotent update if event already exists:
+        // Conservative merge rule: update title, description, and metadata if needed.
+        // DO NOT overwrite observation_mode, replay_job_id, or first_observed_at!
         if let Some(pos) = lock.iter().position(|e| e.id == event.id) {
-            lock[pos] = event.clone();
+            let existing = &mut lock[pos];
+            existing.title = event.title.clone();
+            existing.description = event.description.clone();
+            existing.metadata = event.metadata.clone();
             return Ok(());
         }
 
         // Enforce bounded memory retention
         if lock.len() >= self.max_events {
-            lock.pop_front();
+            let popped = lock.pop_front();
+            if let Some(p) = popped {
+                if let Ok(mut obs_lock) = self.event_observations.write() {
+                    obs_lock.retain(|o| o.event_id != p.id);
+                }
+            }
         }
 
         lock.push_back(event.clone());
@@ -384,12 +444,29 @@ impl EventRepository for InMemoryStorage {
             .events
             .read()
             .map_err(|e| StorageError::Database(e.to_string()))?;
-        Ok(lock.iter().find(|e| e.id == id).cloned())
+        if let Some(mut event) = lock.iter().find(|e| e.id == id).cloned() {
+            let obs_lock = self
+                .event_observations
+                .read()
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+            event.observations = obs_lock
+                .iter()
+                .filter(|o| o.event_id == id)
+                .cloned()
+                .collect();
+            Ok(Some(event))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn query_events(&self, filter: &EventFilter) -> Result<Vec<ChainEvent>, StorageError> {
         let lock = self
             .events
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let obs_lock = self
+            .event_observations
             .read()
             .map_err(|e| StorageError::Database(e.to_string()))?;
 
@@ -430,13 +507,23 @@ impl EventRepository for InMemoryStorage {
                         return false;
                     }
                 }
+                // Observation mode: match via EventObservation provenance, falling back to legacy field
                 if let Some(mode) = filter.observation_mode {
-                    if e.observation_mode != mode {
+                    let has_obs_mode = obs_lock
+                        .iter()
+                        .any(|o| o.event_id == e.id && o.mode == mode)
+                        || e.observation_mode == mode;
+                    if !has_obs_mode {
                         return false;
                     }
                 }
+                // Replay job ID: match via EventObservation provenance, falling back to legacy field
                 if let Some(job_id) = filter.replay_job_id {
-                    if e.replay_job_id != Some(job_id) {
+                    let has_job = obs_lock
+                        .iter()
+                        .any(|o| o.event_id == e.id && o.replay_job_id == Some(job_id))
+                        || e.replay_job_id == Some(job_id);
+                    if !has_job {
                         return false;
                     }
                 }
@@ -458,6 +545,67 @@ impl EventRepository for InMemoryStorage {
             .collect();
 
         Ok(filtered)
+    }
+
+    async fn save_event_observation(
+        &self,
+        observation: &EventObservation,
+    ) -> Result<(), StorageError> {
+        let mut lock = self
+            .event_observations
+            .write()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        // Uniqueness check:
+        // Replay: (event_id, replay_job_id)
+        // Live: (event_id, provider, transport)
+        if let Some(pos) = lock.iter().position(|o| {
+            o.id == observation.id
+                || (observation.mode == ObservationMode::HistoricalReplay
+                    && o.event_id == observation.event_id
+                    && o.replay_job_id == observation.replay_job_id
+                    && observation.replay_job_id.is_some())
+                || (observation.mode == ObservationMode::Live
+                    && o.event_id == observation.event_id
+                    && o.mode == ObservationMode::Live
+                    && o.source.provider == observation.source.provider
+                    && o.source.transport == observation.source.transport)
+        }) {
+            lock[pos] = observation.clone();
+            return Ok(());
+        }
+
+        lock.push(observation.clone());
+        Ok(())
+    }
+
+    async fn list_event_observations(
+        &self,
+        event_id: Uuid,
+    ) -> Result<Vec<EventObservation>, StorageError> {
+        let lock = self
+            .event_observations
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(lock
+            .iter()
+            .filter(|o| o.event_id == event_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn count_event_observations(
+        &self,
+        event_id: Option<Uuid>,
+    ) -> Result<usize, StorageError> {
+        let lock = self
+            .event_observations
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        match event_id {
+            Some(eid) => Ok(lock.iter().filter(|o| o.event_id == eid).count()),
+            None => Ok(lock.len()),
+        }
     }
 }
 

@@ -473,10 +473,14 @@ async fn test_replay_jobs_listing_and_not_found() {
 #[tokio::test]
 async fn test_events_research_filter_query() {
     use chrono::Utc;
-    use obschain_core::{ChainEvent, ConfidenceLevel, EventSeverity, EventType, ObservationMode};
+    use obschain_core::{
+        ChainEvent, ConfidenceLevel, EventObservation, EventSeverity, EventType, ObservationMode,
+        ObservationSource,
+    };
     use obschain_storage::EventRepository;
 
     let storage = InMemoryStorage::new_empty(1000);
+    let now = Utc::now();
 
     let ev1 = ChainEvent {
         id: Uuid::new_v4(),
@@ -485,7 +489,9 @@ async fn test_events_research_filter_query() {
         confidence: ConfidenceLevel::High,
         title: "Large Transfer 1".to_string(),
         description: "100 BTC".to_string(),
-        detected_at: Utc::now(),
+        event_time: now,
+        first_observed_at: now,
+        detected_at: now,
         block_height: Some(150),
         block_hash: None,
         txid: Some("tx1".to_string()),
@@ -494,8 +500,10 @@ async fn test_events_research_filter_query() {
         metadata: serde_json::json!({}),
         observation_mode: ObservationMode::Live,
         replay_job_id: None,
+        observations: vec![],
     };
 
+    let replay_job_id = Uuid::new_v4();
     let ev2 = ChainEvent {
         id: Uuid::new_v4(),
         event_type: EventType::LongBlockInterval,
@@ -503,7 +511,9 @@ async fn test_events_research_filter_query() {
         confidence: ConfidenceLevel::High,
         title: "Long Interval".to_string(),
         description: "45 mins".to_string(),
-        detected_at: Utc::now(),
+        event_time: now,
+        first_observed_at: now,
+        detected_at: now,
         block_height: Some(250),
         block_hash: None,
         txid: None,
@@ -511,11 +521,32 @@ async fn test_events_research_filter_query() {
         witnesses: vec![],
         metadata: serde_json::json!({}),
         observation_mode: ObservationMode::HistoricalReplay,
-        replay_job_id: Some(Uuid::new_v4()),
+        replay_job_id: Some(replay_job_id),
+        observations: vec![],
     };
 
     storage.save_event(&ev1).await.unwrap();
     storage.save_event(&ev2).await.unwrap();
+
+    let obs1 = EventObservation::live(
+        ev1.id,
+        ObservationSource::new("bitcoin_core", "zmq", None),
+        now,
+        Some(ev1.event_time),
+        ev1.block_height,
+        ev1.block_hash.clone(),
+    );
+    let obs2 = EventObservation::historical_replay(
+        ev2.id,
+        replay_job_id,
+        ObservationSource::new("bitcoin_core", "rpc_historical_replay", None),
+        now,
+        Some(ev2.event_time),
+        ev2.block_height,
+        ev2.block_hash.clone(),
+    );
+    storage.save_event_observation(&obs1).await.unwrap();
+    storage.save_event_observation(&obs2).await.unwrap();
 
     let detectors: Vec<Arc<dyn obschain_detectors::Detector>> = vec![];
     let (state, _) = AppState::new(storage, detectors, false);

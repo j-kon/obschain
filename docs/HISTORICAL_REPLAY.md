@@ -205,19 +205,52 @@ During historical replay, non-replayable detectors are cleanly bypassed.
 
 ---
 
-## 9. Event Identity & Idempotency
+## 9. Event Identity & Provenance Hardening (Phase 6A.1)
 
-Running a replay of blocks `900000 -> 901000` twice must **never** create duplicate `ChainEvents` or inflate incident metrics.
+Running a replay of blocks `900000 -> 901000` twice must **never** create duplicate `ChainEvents`, overwrite live observation provenance, or distort baseline statistics.
 
-### Deterministic UUID v5 Event Identity
+### Separation of Canonical Event and Observation Provenance
 
-Logical event IDs are generated deterministically using UUID v5 (SHA-1 hashing over a dedicated DNS/ObsChain namespace):
+ObsChain enforces a strict architectural boundary:
+- **`ChainEvent` = What happened on the Bitcoin network.**
+  Intrinsic to the Bitcoin event: `id`, `event_type`, `severity`, `confidence`, `title`, `description`, `txid`, `block_hash`, `block_height`, `event_time`.
+- **`EventObservation` = How and when ObsChain learned about it.**
+  Provenance metadata: `mode` (Live vs HistoricalReplay), `source` (`ObservationSource`), `observed_at`, `bitcoin_time`, `replay_job_id`, `witness`.
 
-$$\text{Event ID} = \text{UUIDv5}(\text{Namespace}, \text{event\_type} + \text{":"} + (\text{txid} \mid \text{block\_hash} \mid \text{height}))$$
+```text
+Canonical ChainEvent (What Happened)
+        │
+        ├── EventObservation (LIVE, Bitcoin Core ZMQ, 25 Sep 2026 12:04:31 UTC)
+        ├── EventObservation (LIVE, mempool.space WebSocket, 25 Sep 2026 12:04:32 UTC)
+        ├── EventObservation (HISTORICAL_REPLAY, Replay Job A, 27 Sep 2026)
+        └── EventObservation (HISTORICAL_REPLAY, Replay Job B, 05 Oct 2026)
+```
 
-- A large transaction at block `900123` with txid `abc...` will produce the **exact same** UUID v5 whether observed live in 2026 or replayed in 2028.
-- PostgreSQL table `chain_events` enforces a primary key on `id`.
-- Insertion uses `ON CONFLICT (id) DO UPDATE SET detected_at = EXCLUDED.detected_at, observation_mode = EXCLUDED.observation_mode`, guaranteeing complete database idempotency.
+### Deterministic UUID v5 Event & Observation Identity
+
+1. **Logical Event ID**:
+   Generated deterministically via UUID v5 (SHA-1 hashing over a dedicated namespace):
+   $$\text{Event ID} = \text{UUIDv5}(\text{Namespace}, \text{event\_type} + \text{":"} + (\text{txid} \mid \text{block\_hash} \mid \text{height}))$$
+   A transaction at block `900123` with txid `abc...` produces the **exact same** UUID v5 whether observed live in 2026 or replayed in 2028.
+
+2. **Conservative Merge Rule**:
+   PostgreSQL `chain_events` enforces a primary key on `id`. Insertion uses:
+   ```sql
+   ON CONFLICT (id) DO UPDATE SET
+       title = EXCLUDED.title,
+       description = EXCLUDED.description,
+       metadata = EXCLUDED.metadata;
+   ```
+   Crucially, this **never** overwrites `first_observed_at`, `observation_mode`, or `replay_job_id`.
+
+3. **Deterministic Observation ID**:
+   Each observation record receives a deterministic UUID v5:
+   - Historical replay: `UUIDv5("obs:{event_id}:replay:{job_id}")`
+   - Live witnesses: `UUIDv5("obs:{event_id}:{mode}:{provider}:{transport}")`
+
+4. **Dedup Invariant for Baselines**:
+   Replaying the same block range across 10 jobs yields 10 discrete `event_observations` rows, but exactly 1 canonical `chain_events` row. Statistical baselines query canonical events, guaranteeing statistical distributions are never inflated.
+
 
 ---
 

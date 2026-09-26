@@ -303,9 +303,14 @@ cargo install sqlx-cli --no-default-features --features rustls,postgres
 sqlx migrate run
 ```
 
-### Persistence Guarantees
+### Persistence Guarantees & Provenance Hardening (Phase 6A.1)
 
-- **Event Idempotency**: Anomaly detections and activities employ deterministic deduplication keys and `ON CONFLICT` database constraints. Replaying observations will never create duplicate records.
+- **Event = What happened; Observation = How/when ObsChain learned about it**: A logical Bitcoin event exists once in `chain_events`, but can possess multiple discrete `event_observations` records (e.g. observed live via ZMQ, witnessed via mempool.space, and reconstructed across replay jobs).
+- **Conservative Merge Rule**: Upserting a canonical event updates only event-intrinsic fields (`title`, `description`, `metadata`). It NEVER overwrites live observation provenance (`observation_mode`, `replay_job_id`, `first_observed_at`).
+- **Observation Uniqueness**: Observations enforce deterministic UUID v5 IDs and partial unique indexes:
+  - Replay: unique per `(event_id, replay_job_id)`.
+  - Live: unique per `(event_id, observation_mode, provider, transport)`.
+- **Baseline Statistical Safety**: Statistical baselines query canonical `chain_events` directly, never counting duplicate observations. Replaying a 4,000 BTC transaction 10 times counts exactly once in historical statistics.
 - **Historical Recovery Preservation**: Incident recovery state is append-only (`incident_recovery_snapshots`). Historical recovery figures are never overwritten, maintaining full audit trails.
 - **Rule 19 (Movement != Recovery)**: Observed on-chain activity movements never automatically mutate incident recovery balances. Recovery balances change only via explicit verified recovery updates.
 - **Satoshi Precision**: All satoshi values are validated against signed 64-bit bounds (`BIGINT`) with checked Rust `u64` <-> SQL `i64` conversions.

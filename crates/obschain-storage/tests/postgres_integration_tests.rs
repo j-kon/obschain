@@ -1,9 +1,9 @@
 use chrono::Utc;
 use obschain_core::{
-    ActivityStatus, ChainEvent, ConfidenceLevel, CorrelationStrength, EventSeverity, EventType,
-    IncidentActivity, IncidentActivityType, IncidentAlert, ObservationMode, ObservationSource,
-    ProvenanceClassification, ReplayCheckpoint, ReplayJob, ReplayJobStatus, WatchTarget,
-    WatchTargetKind,
+    ActivityStatus, ChainEvent, ConfidenceLevel, CorrelationStrength, EventObservation,
+    EventSeverity, EventType, IncidentActivity, IncidentActivityType, IncidentAlert,
+    ObservationMode, ObservationSource, ProvenanceClassification, ReplayCheckpoint, ReplayJob,
+    ReplayJobStatus, WatchTarget, WatchTargetKind,
 };
 use obschain_storage::{
     EventFilter, EventRepository, IncidentActivityRepository, IncidentAlertRepository,
@@ -49,6 +49,7 @@ async fn test_postgres_event_insertion_and_idempotency() {
 
     let event_id = Uuid::new_v4();
     let txid = format!("{:064x}", 42);
+    let now = Utc::now();
     let event = ChainEvent {
         id: event_id,
         event_type: EventType::LargeTransfer,
@@ -56,7 +57,9 @@ async fn test_postgres_event_insertion_and_idempotency() {
         confidence: ConfidenceLevel::VerifiedOnChain,
         title: "Test 100 BTC Whale Movement".to_string(),
         description: "100.00 BTC transferred in test transaction".to_string(),
-        detected_at: Utc::now(),
+        event_time: now,
+        first_observed_at: now,
+        detected_at: now,
         txid: Some(txid.clone()),
         block_hash: None,
         block_height: None,
@@ -73,6 +76,7 @@ async fn test_postgres_event_insertion_and_idempotency() {
         witnesses: Vec::new(),
         observation_mode: obschain_core::ObservationMode::Live,
         replay_job_id: None,
+        observations: Vec::new(),
     };
 
     // 1. Initial insert
@@ -655,6 +659,7 @@ async fn test_postgres_event_filter_query() {
     };
 
     let replay_job_id = Uuid::new_v4();
+    let time1 = Utc::now() - chrono::Duration::hours(1);
     let ev1 = ChainEvent {
         id: Uuid::new_v4(),
         event_type: EventType::LargeTransfer,
@@ -662,7 +667,9 @@ async fn test_postgres_event_filter_query() {
         confidence: ConfidenceLevel::VerifiedOnChain,
         title: "Replay Event 1".to_string(),
         description: "Replayed block 500".to_string(),
-        detected_at: Utc::now() - chrono::Duration::hours(1),
+        event_time: time1,
+        first_observed_at: time1,
+        detected_at: time1,
         block_height: Some(500),
         block_hash: Some("0000000000000000000500".to_string()),
         txid: Some("tx_500_a".to_string()),
@@ -671,8 +678,10 @@ async fn test_postgres_event_filter_query() {
         source: None,
         observation_mode: ObservationMode::HistoricalReplay,
         replay_job_id: Some(replay_job_id),
+        observations: vec![],
     };
 
+    let time2 = Utc::now() - chrono::Duration::minutes(30);
     let ev2 = ChainEvent {
         id: Uuid::new_v4(),
         event_type: EventType::DormantCoinsMoved,
@@ -680,7 +689,9 @@ async fn test_postgres_event_filter_query() {
         confidence: ConfidenceLevel::VerifiedOnChain,
         title: "Replay Event 2".to_string(),
         description: "Replayed block 505".to_string(),
-        detected_at: Utc::now() - chrono::Duration::minutes(30),
+        event_time: time2,
+        first_observed_at: time2,
+        detected_at: time2,
         block_height: Some(505),
         block_hash: Some("0000000000000000000505".to_string()),
         txid: Some("tx_505_b".to_string()),
@@ -689,10 +700,38 @@ async fn test_postgres_event_filter_query() {
         source: None,
         observation_mode: ObservationMode::HistoricalReplay,
         replay_job_id: Some(replay_job_id),
+        observations: vec![],
     };
 
     storage.save_event(&ev1).await.expect("Save ev1");
     storage.save_event(&ev2).await.expect("Save ev2");
+
+    let obs1 = EventObservation::historical_replay(
+        ev1.id,
+        replay_job_id,
+        ObservationSource::new("bitcoin_core", "rpc_historical_replay", None),
+        Utc::now(),
+        Some(ev1.event_time),
+        ev1.block_height,
+        ev1.block_hash.clone(),
+    );
+    let obs2 = EventObservation::historical_replay(
+        ev2.id,
+        replay_job_id,
+        ObservationSource::new("bitcoin_core", "rpc_historical_replay", None),
+        Utc::now(),
+        Some(ev2.event_time),
+        ev2.block_height,
+        ev2.block_hash.clone(),
+    );
+    storage
+        .save_event_observation(&obs1)
+        .await
+        .expect("Save obs1");
+    storage
+        .save_event_observation(&obs2)
+        .await
+        .expect("Save obs2");
 
     // Filter by replay_job_id
     let res = storage

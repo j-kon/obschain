@@ -15,8 +15,8 @@ pub use amount::{
 pub use error::CoreError;
 pub use event::{
     ChainEvent, ConfidenceLevel, ConsolidationMetadata, DormantClassification,
-    DormantCoinsMetadata, EventSeverity, EventType, ExtremeFeeMetadata, ExtremeFeeTriggerType,
-    FanOutMetadata, ReplacementMetadata,
+    DormantCoinsMetadata, EventObservation, EventSeverity, EventType, ExtremeFeeMetadata,
+    ExtremeFeeTriggerType, FanOutMetadata, ReplacementMetadata,
 };
 pub use fee::{calculate_fee_rate_sat_vb, calculate_vsize_from_weight};
 pub use incident::{

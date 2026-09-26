@@ -867,7 +867,45 @@ async fn save_event_with_retry(storage: &Storage, event: &ChainEvent, metrics: &
     loop {
         attempts += 1;
         match storage.save_event(event).await {
-            Ok(()) => return,
+            Ok(()) => {
+                // Record live observation provenance for canonical event and witnesses
+                if event.witnesses.is_empty() {
+                    let source = event.source.clone().unwrap_or_else(|| {
+                        obschain_core::ObservationSource::new("bitcoin_core", "zmq", None)
+                    });
+                    let obs = obschain_core::EventObservation::live(
+                        event.id,
+                        source,
+                        chrono::Utc::now(),
+                        Some(event.event_time),
+                        event.block_height,
+                        event.block_hash.clone(),
+                    );
+                    let _ = storage.save_event_observation(&obs).await;
+                } else {
+                    for witness in &event.witnesses {
+                        let obs = obschain_core::EventObservation {
+                            id: obschain_core::EventObservation::deterministic_id(
+                                event.id,
+                                obschain_core::ObservationMode::Live,
+                                &witness.source,
+                                None,
+                            ),
+                            event_id: event.id,
+                            mode: obschain_core::ObservationMode::Live,
+                            source: witness.source.clone(),
+                            observed_at: witness.observed_at,
+                            bitcoin_time: Some(event.event_time),
+                            replay_job_id: None,
+                            block_height: event.block_height,
+                            block_hash: event.block_hash.clone(),
+                            witness: Some(witness.clone()),
+                        };
+                        let _ = storage.save_event_observation(&obs).await;
+                    }
+                }
+                return;
+            }
             Err(e) => {
                 if attempts >= max_attempts {
                     error!(

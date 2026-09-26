@@ -1,12 +1,12 @@
 use chrono::{DateTime, Utc};
 use obschain_core::{
-    ActivityStatus, Chain, ChainEvent, ConfidenceLevel, CorrelationStrength, EventSeverity,
-    EventType, Evidence, EvidenceType, GraphEdge, GraphEdgeType, GraphNode, GraphNodeType,
-    Incident, IncidentActivity, IncidentActivityType, IncidentAlert, IncidentBlock, IncidentEntity,
-    IncidentGraph, IncidentStatus, IncidentTransaction, IncidentUpdate, ObservationMode,
-    ObservationSource, OnChainMessage, ProvenanceClassification, RecoverySummary, ReplayCheckpoint,
-    ReplayJob, ReplayJobStatus, Source, SourceCategory, TechnicalFinding, TimelineCategory,
-    TimelineEntry, TransactionRole, WatchTarget, WatchTargetKind,
+    ActivityStatus, Chain, ChainEvent, ConfidenceLevel, CorrelationStrength, EventObservation,
+    EventSeverity, EventType, Evidence, EvidenceType, GraphEdge, GraphEdgeType, GraphNode,
+    GraphNodeType, Incident, IncidentActivity, IncidentActivityType, IncidentAlert, IncidentBlock,
+    IncidentEntity, IncidentGraph, IncidentStatus, IncidentTransaction, IncidentUpdate,
+    ObservationMode, ObservationSource, OnChainMessage, ProvenanceClassification, RecoverySummary,
+    ReplayCheckpoint, ReplayJob, ReplayJobStatus, Source, SourceCategory, TechnicalFinding,
+    TimelineCategory, TimelineEntry, TransactionRole, WatchTarget, WatchTargetKind,
 };
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -143,6 +143,26 @@ impl PostgresStorage {
         let count: i64 = row.get("count");
         Ok(count as usize)
     }
+
+    pub async fn count_event_observations(
+        &self,
+        event_id: Option<Uuid>,
+    ) -> Result<usize, StorageError> {
+        let row = if let Some(eid) = event_id {
+            sqlx::query("SELECT COUNT(*) as count FROM event_observations WHERE event_id = $1")
+                .bind(eid)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| StorageError::Database(e.to_string()))?
+        } else {
+            sqlx::query("SELECT COUNT(*) as count FROM event_observations")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| StorageError::Database(e.to_string()))?
+        };
+        let count: i64 = row.get("count");
+        Ok(count as usize)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -177,21 +197,20 @@ impl EventRepository for PostgresStorage {
 
         let mode_str = event.observation_mode.as_str();
 
+        // Canonical event upsert preserves intrinsic event details.
+        // It NEVER overwrites provenance fields (observation_mode, replay_job_id, first_observed_at, detected_at).
         sqlx::query(
             r#"
             INSERT INTO chain_events (
                 id, event_type, severity, confidence, title, description,
-                detected_at, block_height, block_hash, txid, metadata, source,
+                event_time, first_observed_at, detected_at, block_height, block_hash, txid, metadata, source,
                 observation_mode, replay_job_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
             ON CONFLICT (id) DO UPDATE SET
                 title = EXCLUDED.title,
                 description = EXCLUDED.description,
-                metadata = EXCLUDED.metadata,
-                source = EXCLUDED.source,
-                observation_mode = EXCLUDED.observation_mode,
-                replay_job_id = EXCLUDED.replay_job_id
+                metadata = EXCLUDED.metadata
             "#,
         )
         .bind(event.id)
@@ -200,6 +219,8 @@ impl EventRepository for PostgresStorage {
         .bind(confidence_str)
         .bind(&event.title)
         .bind(&event.description)
+        .bind(event.event_time)
+        .bind(event.first_observed_at)
         .bind(event.detected_at)
         .bind(block_height_i64)
         .bind(&event.block_hash)
@@ -227,10 +248,12 @@ impl EventRepository for PostgresStorage {
         let rows = sqlx::query(
             r#"
             SELECT id, event_type, severity, confidence, title, description,
+                   COALESCE(event_time, detected_at) as event_time,
+                   COALESCE(first_observed_at, detected_at) as first_observed_at,
                    detected_at, block_height, block_hash, txid, metadata, source,
                    observation_mode, replay_job_id
             FROM chain_events
-            ORDER BY detected_at DESC
+            ORDER BY COALESCE(event_time, detected_at) DESC
             LIMIT $1 OFFSET $2
             "#,
         )
@@ -275,6 +298,11 @@ impl EventRepository for PostgresStorage {
                 .unwrap_or(ObservationMode::Live);
             let replay_job_id: Option<Uuid> = row.try_get("replay_job_id").ok().flatten();
 
+            let detected_at: DateTime<Utc> = row.get("detected_at");
+            let event_time: DateTime<Utc> = row.try_get("event_time").unwrap_or(detected_at);
+            let first_observed_at: DateTime<Utc> =
+                row.try_get("first_observed_at").unwrap_or(detected_at);
+
             events.push(ChainEvent {
                 id: row.get("id"),
                 event_type,
@@ -282,7 +310,9 @@ impl EventRepository for PostgresStorage {
                 confidence,
                 title: row.get("title"),
                 description: row.get("description"),
-                detected_at: row.get("detected_at"),
+                event_time,
+                first_observed_at,
+                detected_at,
                 block_height,
                 block_hash: row.get("block_hash"),
                 txid: row.get("txid"),
@@ -294,6 +324,7 @@ impl EventRepository for PostgresStorage {
                 source,
                 observation_mode,
                 replay_job_id,
+                observations: Vec::new(),
             });
         }
 
@@ -304,6 +335,8 @@ impl EventRepository for PostgresStorage {
         let row_opt = sqlx::query(
             r#"
             SELECT id, event_type, severity, confidence, title, description,
+                   COALESCE(event_time, detected_at) as event_time,
+                   COALESCE(first_observed_at, detected_at) as first_observed_at,
                    detected_at, block_height, block_hash, txid, metadata, source,
                    observation_mode, replay_job_id
             FROM chain_events
@@ -351,6 +384,13 @@ impl EventRepository for PostgresStorage {
             .unwrap_or(ObservationMode::Live);
         let replay_job_id: Option<Uuid> = row.try_get("replay_job_id").ok().flatten();
 
+        let detected_at: DateTime<Utc> = row.get("detected_at");
+        let event_time: DateTime<Utc> = row.try_get("event_time").unwrap_or(detected_at);
+        let first_observed_at: DateTime<Utc> =
+            row.try_get("first_observed_at").unwrap_or(detected_at);
+
+        let observations = self.list_event_observations(id).await?;
+
         Ok(Some(ChainEvent {
             id: row.get("id"),
             event_type,
@@ -358,7 +398,9 @@ impl EventRepository for PostgresStorage {
             confidence,
             title: row.get("title"),
             description: row.get("description"),
-            detected_at: row.get("detected_at"),
+            event_time,
+            first_observed_at,
+            detected_at,
             block_height,
             block_hash: row.get("block_hash"),
             txid: row.get("txid"),
@@ -370,6 +412,7 @@ impl EventRepository for PostgresStorage {
             source,
             observation_mode,
             replay_job_id,
+            observations,
         }))
     }
 
@@ -403,20 +446,28 @@ impl EventRepository for PostgresStorage {
         let rows = sqlx::query(
             r#"
             SELECT id, event_type, severity, confidence, title, description,
+                   COALESCE(event_time, detected_at) as event_time,
+                   COALESCE(first_observed_at, detected_at) as first_observed_at,
                    detected_at, block_height, block_hash, txid, metadata, source,
                    observation_mode, replay_job_id
             FROM chain_events
             WHERE ($1::BIGINT IS NULL OR block_height >= $1)
               AND ($2::BIGINT IS NULL OR block_height <= $2)
-              AND ($3::TIMESTAMPTZ IS NULL OR detected_at >= $3)
-              AND ($4::TIMESTAMPTZ IS NULL OR detected_at <= $4)
+              AND ($3::TIMESTAMPTZ IS NULL OR COALESCE(event_time, detected_at) >= $3)
+              AND ($4::TIMESTAMPTZ IS NULL OR COALESCE(event_time, detected_at) <= $4)
               AND ($5::VARCHAR IS NULL OR event_type = $5)
               AND ($6::VARCHAR IS NULL OR severity = $6)
-              AND ($7::VARCHAR IS NULL OR observation_mode = $7)
-              AND ($8::UUID IS NULL OR replay_job_id = $8)
+              AND ($7::VARCHAR IS NULL OR EXISTS (
+                  SELECT 1 FROM event_observations eo
+                  WHERE eo.event_id = chain_events.id AND eo.observation_mode = $7
+              ) OR observation_mode = $7)
+              AND ($8::UUID IS NULL OR EXISTS (
+                  SELECT 1 FROM event_observations eo
+                  WHERE eo.event_id = chain_events.id AND eo.replay_job_id = $8
+              ) OR replay_job_id = $8)
               AND ($9::VARCHAR IS NULL OR txid = $9)
               AND ($10::VARCHAR IS NULL OR block_hash = $10)
-            ORDER BY detected_at DESC
+            ORDER BY COALESCE(event_time, detected_at) DESC
             LIMIT $11 OFFSET $12
             "#,
         )
@@ -471,6 +522,11 @@ impl EventRepository for PostgresStorage {
                 .unwrap_or(ObservationMode::Live);
             let replay_job_id: Option<Uuid> = row.try_get("replay_job_id").ok().flatten();
 
+            let detected_at: DateTime<Utc> = row.get("detected_at");
+            let event_time: DateTime<Utc> = row.try_get("event_time").unwrap_or(detected_at);
+            let first_observed_at: DateTime<Utc> =
+                row.try_get("first_observed_at").unwrap_or(detected_at);
+
             events.push(ChainEvent {
                 id: row.get("id"),
                 event_type,
@@ -478,7 +534,9 @@ impl EventRepository for PostgresStorage {
                 confidence,
                 title: row.get("title"),
                 description: row.get("description"),
-                detected_at: row.get("detected_at"),
+                event_time,
+                first_observed_at,
+                detected_at,
                 block_height,
                 block_hash: row.get("block_hash"),
                 txid: row.get("txid"),
@@ -490,10 +548,114 @@ impl EventRepository for PostgresStorage {
                 source,
                 observation_mode,
                 replay_job_id,
+                observations: Vec::new(),
             });
         }
 
         Ok(events)
+    }
+
+    async fn save_event_observation(
+        &self,
+        observation: &EventObservation,
+    ) -> Result<(), StorageError> {
+        let source_json = serde_json::to_value(&observation.source)?;
+        let witness_json = match &observation.witness {
+            Some(w) => Some(serde_json::to_value(w)?),
+            None => None,
+        };
+        let block_height_i64 = match observation.block_height {
+            Some(h) => Some(u64_to_i64_checked(h)?),
+            None => None,
+        };
+        let mode_str = observation.mode.as_str();
+
+        sqlx::query(
+            r#"
+            INSERT INTO event_observations (
+                id, event_id, observation_mode, source, observed_at,
+                bitcoin_time, replay_job_id, block_height, block_hash, witness
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ON CONFLICT (id) DO UPDATE SET
+                source = EXCLUDED.source,
+                witness = EXCLUDED.witness
+            "#,
+        )
+        .bind(observation.id)
+        .bind(observation.event_id)
+        .bind(mode_str)
+        .bind(source_json)
+        .bind(observation.observed_at)
+        .bind(observation.bitcoin_time)
+        .bind(observation.replay_job_id)
+        .bind(block_height_i64)
+        .bind(&observation.block_hash)
+        .bind(witness_json)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn list_event_observations(
+        &self,
+        event_id: Uuid,
+    ) -> Result<Vec<EventObservation>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, event_id, observation_mode, source, observed_at,
+                   bitcoin_time, replay_job_id, block_height, block_hash, witness
+            FROM event_observations
+            WHERE event_id = $1
+            ORDER BY observed_at ASC
+            "#,
+        )
+        .bind(event_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut observations = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mode_str: String = row.get("observation_mode");
+            let mode = match mode_str.to_lowercase().as_str() {
+                "historical_replay" => ObservationMode::HistoricalReplay,
+                _ => ObservationMode::Live,
+            };
+            let source_json: serde_json::Value = row.get("source");
+            let source: ObservationSource = serde_json::from_value(source_json)
+                .unwrap_or_else(|_| ObservationSource::new("bitcoin_core", "zmq", None));
+            let witness_json: Option<serde_json::Value> = row.get("witness");
+            let witness = witness_json.and_then(|v| serde_json::from_value(v).ok());
+            let block_height_i64: Option<i64> = row.get("block_height");
+            let block_height = match block_height_i64 {
+                Some(h) => Some(i64_to_u64_checked(h)?),
+                None => None,
+            };
+
+            observations.push(EventObservation {
+                id: row.get("id"),
+                event_id: row.get("event_id"),
+                mode,
+                source,
+                observed_at: row.get("observed_at"),
+                bitcoin_time: row.get("bitcoin_time"),
+                replay_job_id: row.get("replay_job_id"),
+                block_height,
+                block_hash: row.get("block_hash"),
+                witness,
+            });
+        }
+        Ok(observations)
+    }
+
+    async fn count_event_observations(
+        &self,
+        event_id: Option<Uuid>,
+    ) -> Result<usize, StorageError> {
+        self.count_event_observations(event_id).await
     }
 }
 
@@ -2311,6 +2473,9 @@ impl ReplayRepository for PostgresStorage {
         let blocks_i64 = u64_to_i64_checked(job.blocks_processed)?;
         let txs_i64 = u64_to_i64_checked(job.transactions_processed)?;
         let events_i64 = u64_to_i64_checked(job.events_generated)?;
+        let events_created_i64 = u64_to_i64_checked(job.events_created)?;
+        let events_existing_i64 = u64_to_i64_checked(job.events_existing)?;
+        let obs_recorded_i64 = u64_to_i64_checked(job.observations_recorded)?;
         let errors_i64 = u64_to_i64_checked(job.error_count)?;
         let status_str = job.status.as_str();
 
@@ -2319,9 +2484,10 @@ impl ReplayRepository for PostgresStorage {
             INSERT INTO replay_jobs (
                 id, network, start_height, end_height, current_height, status, source_type,
                 created_at, started_at, completed_at, blocks_processed, transactions_processed,
-                events_generated, error_count, last_error
+                events_generated, events_created, events_existing, observations_recorded,
+                error_count, last_error
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
             ON CONFLICT (id) DO UPDATE SET
                 current_height = EXCLUDED.current_height,
                 status = EXCLUDED.status,
@@ -2330,6 +2496,9 @@ impl ReplayRepository for PostgresStorage {
                 blocks_processed = EXCLUDED.blocks_processed,
                 transactions_processed = EXCLUDED.transactions_processed,
                 events_generated = EXCLUDED.events_generated,
+                events_created = EXCLUDED.events_created,
+                events_existing = EXCLUDED.events_existing,
+                observations_recorded = EXCLUDED.observations_recorded,
                 error_count = EXCLUDED.error_count,
                 last_error = EXCLUDED.last_error
             "#,
@@ -2347,6 +2516,9 @@ impl ReplayRepository for PostgresStorage {
         .bind(blocks_i64)
         .bind(txs_i64)
         .bind(events_i64)
+        .bind(events_created_i64)
+        .bind(events_existing_i64)
+        .bind(obs_recorded_i64)
         .bind(errors_i64)
         .bind(&job.last_error)
         .execute(&self.pool)
@@ -2361,7 +2533,11 @@ impl ReplayRepository for PostgresStorage {
             r#"
             SELECT id, network, start_height, end_height, current_height, status, source_type,
                    created_at, started_at, completed_at, blocks_processed, transactions_processed,
-                   events_generated, error_count, last_error
+                   events_generated,
+                   COALESCE(events_created, 0) as events_created,
+                   COALESCE(events_existing, 0) as events_existing,
+                   COALESCE(observations_recorded, 0) as observations_recorded,
+                   error_count, last_error
             FROM replay_jobs
             WHERE id = $1
             "#,
@@ -2392,6 +2568,9 @@ impl ReplayRepository for PostgresStorage {
         let blocks_processed: i64 = row.get("blocks_processed");
         let transactions_processed: i64 = row.get("transactions_processed");
         let events_generated: i64 = row.get("events_generated");
+        let events_created: i64 = row.get("events_created");
+        let events_existing: i64 = row.get("events_existing");
+        let observations_recorded: i64 = row.get("observations_recorded");
         let error_count: i64 = row.get("error_count");
 
         Ok(Some(ReplayJob {
@@ -2408,6 +2587,9 @@ impl ReplayRepository for PostgresStorage {
             blocks_processed: i64_to_u64_checked(blocks_processed)?,
             transactions_processed: i64_to_u64_checked(transactions_processed)?,
             events_generated: i64_to_u64_checked(events_generated)?,
+            events_created: i64_to_u64_checked(events_created)?,
+            events_existing: i64_to_u64_checked(events_existing)?,
+            observations_recorded: i64_to_u64_checked(observations_recorded)?,
             error_count: i64_to_u64_checked(error_count)?,
             last_error: row.get("last_error"),
         }))
@@ -2425,7 +2607,11 @@ impl ReplayRepository for PostgresStorage {
             r#"
             SELECT id, network, start_height, end_height, current_height, status, source_type,
                    created_at, started_at, completed_at, blocks_processed, transactions_processed,
-                   events_generated, error_count, last_error
+                   events_generated,
+                   COALESCE(events_created, 0) as events_created,
+                   COALESCE(events_existing, 0) as events_existing,
+                   COALESCE(observations_recorded, 0) as observations_recorded,
+                   error_count, last_error
             FROM replay_jobs
             ORDER BY created_at DESC
             LIMIT $1 OFFSET $2
@@ -2456,6 +2642,9 @@ impl ReplayRepository for PostgresStorage {
             let blocks_processed: i64 = row.get("blocks_processed");
             let transactions_processed: i64 = row.get("transactions_processed");
             let events_generated: i64 = row.get("events_generated");
+            let events_created: i64 = row.get("events_created");
+            let events_existing: i64 = row.get("events_existing");
+            let observations_recorded: i64 = row.get("observations_recorded");
             let error_count: i64 = row.get("error_count");
 
             jobs.push(ReplayJob {
@@ -2472,6 +2661,9 @@ impl ReplayRepository for PostgresStorage {
                 blocks_processed: i64_to_u64_checked(blocks_processed)?,
                 transactions_processed: i64_to_u64_checked(transactions_processed)?,
                 events_generated: i64_to_u64_checked(events_generated)?,
+                events_created: i64_to_u64_checked(events_created)?,
+                events_existing: i64_to_u64_checked(events_existing)?,
+                observations_recorded: i64_to_u64_checked(observations_recorded)?,
                 error_count: i64_to_u64_checked(error_count)?,
                 last_error: row.get("last_error"),
             });
@@ -2485,14 +2677,18 @@ impl ReplayRepository for PostgresStorage {
         let blocks_i64 = u64_to_i64_checked(checkpoint.blocks_processed)?;
         let txs_i64 = u64_to_i64_checked(checkpoint.transactions_processed)?;
         let events_i64 = u64_to_i64_checked(checkpoint.events_generated)?;
+        let events_created_i64 = u64_to_i64_checked(checkpoint.events_created)?;
+        let events_existing_i64 = u64_to_i64_checked(checkpoint.events_existing)?;
+        let obs_recorded_i64 = u64_to_i64_checked(checkpoint.observations_recorded)?;
 
         sqlx::query(
             r#"
             INSERT INTO replay_checkpoints (
                 id, job_id, completed_height, blocks_processed, transactions_processed,
-                events_generated, checkpointed_at
+                events_generated, events_created, events_existing, observations_recorded,
+                checkpointed_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             ON CONFLICT (id) DO NOTHING
             "#,
         )
@@ -2502,6 +2698,9 @@ impl ReplayRepository for PostgresStorage {
         .bind(blocks_i64)
         .bind(txs_i64)
         .bind(events_i64)
+        .bind(events_created_i64)
+        .bind(events_existing_i64)
+        .bind(obs_recorded_i64)
         .bind(checkpoint.checkpointed_at)
         .execute(&self.pool)
         .await
@@ -2517,7 +2716,11 @@ impl ReplayRepository for PostgresStorage {
         let row_opt = sqlx::query(
             r#"
             SELECT id, job_id, completed_height, blocks_processed, transactions_processed,
-                   events_generated, checkpointed_at
+                   events_generated,
+                   COALESCE(events_created, 0) as events_created,
+                   COALESCE(events_existing, 0) as events_existing,
+                   COALESCE(observations_recorded, 0) as observations_recorded,
+                   checkpointed_at
             FROM replay_checkpoints
             WHERE job_id = $1
             ORDER BY completed_height DESC
@@ -2537,6 +2740,9 @@ impl ReplayRepository for PostgresStorage {
         let blocks_processed: i64 = row.get("blocks_processed");
         let transactions_processed: i64 = row.get("transactions_processed");
         let events_generated: i64 = row.get("events_generated");
+        let events_created: i64 = row.get("events_created");
+        let events_existing: i64 = row.get("events_existing");
+        let observations_recorded: i64 = row.get("observations_recorded");
 
         Ok(Some(ReplayCheckpoint {
             id: row.get("id"),
@@ -2545,6 +2751,9 @@ impl ReplayRepository for PostgresStorage {
             blocks_processed: i64_to_u64_checked(blocks_processed)?,
             transactions_processed: i64_to_u64_checked(transactions_processed)?,
             events_generated: i64_to_u64_checked(events_generated)?,
+            events_created: i64_to_u64_checked(events_created)?,
+            events_existing: i64_to_u64_checked(events_existing)?,
+            observations_recorded: i64_to_u64_checked(observations_recorded)?,
             checkpointed_at: row.get("checkpointed_at"),
         }))
     }

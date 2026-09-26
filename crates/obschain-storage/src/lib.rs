@@ -9,8 +9,8 @@ pub use repository::{
 };
 
 use obschain_core::{
-    ActivityStatus, ChainEvent, Incident, IncidentActivity, IncidentAlert, ReplayCheckpoint,
-    ReplayJob, WatchTarget,
+    ActivityStatus, ChainEvent, EventObservation, Incident, IncidentActivity, IncidentAlert,
+    ReplayCheckpoint, ReplayJob, WatchTarget,
 };
 use uuid::Uuid;
 
@@ -121,6 +121,13 @@ impl Storage {
             Self::Postgres(p) => p.count_replay_jobs().await.unwrap_or(0),
         }
     }
+
+    pub async fn count_event_observations(&self, event_id: Option<Uuid>) -> usize {
+        match self {
+            Self::Memory(m) => m.count_event_observations(event_id).await.unwrap_or(0),
+            Self::Postgres(p) => p.count_event_observations(event_id).await.unwrap_or(0),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -154,6 +161,36 @@ impl EventRepository for Storage {
         match self {
             Self::Memory(m) => m.query_events(filter).await,
             Self::Postgres(p) => p.query_events(filter).await,
+        }
+    }
+
+    async fn save_event_observation(
+        &self,
+        observation: &EventObservation,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Memory(m) => m.save_event_observation(observation).await,
+            Self::Postgres(p) => p.save_event_observation(observation).await,
+        }
+    }
+
+    async fn list_event_observations(
+        &self,
+        event_id: Uuid,
+    ) -> Result<Vec<EventObservation>, StorageError> {
+        match self {
+            Self::Memory(m) => m.list_event_observations(event_id).await,
+            Self::Postgres(p) => p.list_event_observations(event_id).await,
+        }
+    }
+
+    async fn count_event_observations(
+        &self,
+        event_id: Option<Uuid>,
+    ) -> Result<usize, StorageError> {
+        match self {
+            Self::Memory(m) => m.count_event_observations(event_id).await,
+            Self::Postgres(p) => p.count_event_observations(event_id).await,
         }
     }
 }

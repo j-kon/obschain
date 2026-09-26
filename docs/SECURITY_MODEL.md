@@ -99,6 +99,25 @@ ObsChain processes data from untrusted network sources (peer-to-peer gossip, ext
   - Replay queries are bounded to dedicated connections (`OBSCHAIN_REPLAY_DB_CONCURRENCY`, default 2) to prevent starvations in live ingestion and dashboard API pools.
   - Replay commits at atomic checkpoint intervals (`OBSCHAIN_REPLAY_CHECKPOINT_INTERVAL`, default 25 blocks) with deterministic UUID v5 event IDs (`ON CONFLICT (id) DO UPDATE`), guaranteeing complete crash recovery and idempotency without duplicate event amplification.
 
+### 11. Observation Provenance & Baseline Security (Phase 6A.1)
+- **Unbounded Observation History & Unique Index Constraints**:
+  - `event_observations` enforces partial unique indexes:
+    - `idx_event_obs_replay_uniq` on `(event_id, replay_job_id)` WHERE `replay_job_id IS NOT NULL` prevents duplicate observation rows if a replay job restarts or re-evaluates blocks.
+    - `idx_event_obs_live_source_uniq` on `(event_id, observation_mode, provider, transport)` WHERE `replay_job_id IS NULL` prevents duplicate witness rows from identical network sockets.
+- **Duplicate Witness Amplification Prevention**:
+  - Ingestion processes each unique witness origin deterministically. Multiple live witnesses (e.g., Bitcoin Core ZMQ + mempool.space WebSocket) record distinct provenance without duplicating the canonical `ChainEvent`.
+- **Malformed Source Metadata Sanitization**:
+  - Sources are strongly typed via `ObservationSource`. Arbitrary JSON injection is prevented; internal node credentials (passwords, auth cookies, internal RPC endpoints) are never stored in `source` metadata.
+- **Replay Abuse & Observation Spam Defense**:
+  - Replay job range boundaries (`OBSCHAIN_REPLAY_MAX_RANGE`) and authorization controls prevent unbounded observation generation.
+  - Replay jobs operate under cooperative yield (`tokio::task::yield_now`) to prevent CPU starvation.
+- **Large API Provenance Payloads Mitigation**:
+  - Event list queries (`GET /api/v1/events`) intentionally omit the nested `observations` array to protect client bandwidth and memory.
+  - Full observation provenance is exposed strictly on individual event detail views (`GET /api/v1/events/:id`) or the dedicated observation subresource (`GET /api/v1/events/:id/observations`).
+- **Baseline Statistical Integrity**:
+  - Rarity scoring and baseline calculations in Phase 6B query canonical `chain_events` directly. Replaying the same range multiple times records observation provenance without inflating or distorting historical sample distributions.
+
+
 
 
 

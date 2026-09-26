@@ -439,6 +439,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/status", get(status_handler))
         .route("/api/v1/events", get(list_events_handler))
         .route("/api/v1/events/{id}", get(get_event_handler))
+        .route(
+            "/api/v1/events/{id}/observations",
+            get(get_event_observations_handler),
+        )
         .route("/api/v1/incidents", get(list_incidents_handler))
         .route("/api/v1/incidents/{id}", get(get_incident_handler))
         .route(
@@ -696,6 +700,39 @@ async fn get_event_handler(
             }),
         )),
     }
+}
+
+async fn get_event_observations_handler(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
+    let event_opt = state
+        .storage
+        .get_event_by_id(id)
+        .await
+        .map_err(map_storage_error)?;
+
+    if event_opt.is_none() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiErrorResponse {
+                error: format!("Event {id} not found"),
+                code: 404,
+            }),
+        ));
+    }
+
+    let observations = state
+        .storage
+        .list_event_observations(id)
+        .await
+        .map_err(map_storage_error)?;
+
+    Ok(Json(serde_json::json!({
+        "event_id": id,
+        "observations": observations,
+        "count": observations.len(),
+    })))
 }
 
 async fn list_incidents_handler(

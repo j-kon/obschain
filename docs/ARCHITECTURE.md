@@ -455,5 +455,37 @@ Detectors advertise explicit operational suitability via `DetectorAvailability`:
 ### 3. Idempotent Storage & Resumable Checkpoints
 Every replayed event receives a deterministic UUID v5 derived from `(event_type, txid/block_hash/height)`. Re-running identical block ranges updates existing records without duplicating events or inflating event metrics. Replay jobs persist progress every `OBSCHAIN_REPLAY_CHECKPOINT_INTERVAL` blocks and resume seamlessly upon daemon restart.
 
+---
+
+## Canonical Events vs Event Observations (Phase 6A.1 Provenance Hardening)
+
+### Core Architectural Rule
+- **ChainEvent = What happened on the Bitcoin network.**
+  Represents an immutable, logical on-chain event (e.g., a 4,000 BTC transfer, a long block interval, or dormant coins moving).
+- **EventObservation = How and when ObsChain learned about it.**
+  Represents a discrete observation occurrence with its specific source, ingestion mode, and wall-clock ingestion timestamp.
+
+```text
+Canonical ChainEvent (What Happened)
+        │
+        ├── EventObservation (LIVE, Bitcoin Core ZMQ, 25 Sep 2026 12:04:31 UTC)
+        ├── EventObservation (LIVE, mempool.space WebSocket, 25 Sep 2026 12:04:32 UTC)
+        ├── EventObservation (HISTORICAL_REPLAY, Replay Job A, 27 Sep 2026)
+        └── EventObservation (HISTORICAL_REPLAY, Replay Job B, 05 Oct 2026)
+```
+
+### Provenance Separation & Invariants
+1. **No Provenance Overwrites**:
+   Replaying historical blocks or receiving subsequent witness notifications does not overwrite `observation_mode`, `replay_job_id`, or `first_observed_at` on the canonical `chain_events` record.
+2. **Conservative Merge Rule**:
+   Upserting canonical events on conflict (`ON CONFLICT (id) DO UPDATE SET`) only updates event-intrinsic fields (`title`, `description`, `metadata`). Observation provenance is strictly append-only into `event_observations`.
+3. **Deterministic Observation Identity**:
+   Observations generate deterministic UUID v5 identities based on:
+   - Historical replay: `(event_id, replay_job_id)`
+   - Live witnesses: `(event_id, mode, provider, transport)`
+4. **Baseline Population Safety**:
+   Phase 6B statistical baselines and rarity metrics query `chain_events` directly, never counting duplicate observations. Replaying a 4,000 BTC transaction 10 times counts exactly once in statistical distributions.
+
+
 
 
