@@ -457,34 +457,69 @@ Every replayed event receives a deterministic UUID v5 derived from `(event_type,
 
 ---
 
-## Canonical Events vs Event Observations (Phase 6A.1 Provenance Hardening)
+## Canonical Events vs Event Observations & Lifecycle Integrity (Phase 6A.1 & 6A.2)
 
-### Core Architectural Rule
-- **ChainEvent = What happened on the Bitcoin network.**
-  Represents an immutable, logical on-chain event (e.g., a 4,000 BTC transfer, a long block interval, or dormant coins moving).
-- **EventObservation = How and when ObsChain learned about it.**
-  Represents a discrete observation occurrence with its specific source, ingestion mode, and wall-clock ingestion timestamp.
+### Core Architectural Invariants
+
+1. **Event ≠ Observation**:
+   - **`ChainEvent` = What happened on the Bitcoin network.**
+     Represents an immutable, logical on-chain event (e.g., a 4,000 BTC transfer, a long block interval, or dormant coins moving).
+   - **`EventObservation` = How, when, and in what lifecycle state ObsChain learned about it.**
+     Represents a discrete observation occurrence with its specific source, ingestion mode, lifecycle kind, and wall-clock ingestion timestamp.
+
+2. **Source ≠ Observation Lifecycle**:
+   A single source (e.g. Bitcoin Core ZMQ) can observe the same logical event across multiple meaningful lifecycle stages. Source identity does not imply lifecycle identity.
 
 ```text
-Canonical ChainEvent (What Happened)
+Canonical ChainEvent (What Happened: 1 logical event)
         │
-        ├── EventObservation (LIVE, Bitcoin Core ZMQ, 25 Sep 2026 12:04:31 UTC)
-        ├── EventObservation (LIVE, mempool.space WebSocket, 25 Sep 2026 12:04:32 UTC)
-        ├── EventObservation (HISTORICAL_REPLAY, Replay Job A, 27 Sep 2026)
-        └── EventObservation (HISTORICAL_REPLAY, Replay Job B, 05 Oct 2026)
+        ├── EventObservation (LIVE, BitcoinCoreZmq, MEMPOOL_SEEN, tx enters mempool)
+        ├── EventObservation (LIVE, MempoolSpaceWebSocket, WITNESSED, secondary observer)
+        ├── EventObservation (LIVE, BitcoinCoreZmq, CONFIRMED, confirmed in block 968000)
+        ├── EventObservation (LIVE, BitcoinCoreZmq, REORGED_OUT, 1-block reorg disconnected block)
+        ├── EventObservation (LIVE, BitcoinCoreZmq, MEMPOOL_SEEN, re-accepted into mempool)
+        ├── EventObservation (HISTORICAL_REPLAY, CoreRpc, HISTORICAL_REPLAY, Replay Job A)
+        └── EventObservation (HISTORICAL_REPLAY, CoreRpc, HISTORICAL_REPLAY, Replay Job B)
 ```
 
-### Provenance Separation & Invariants
-1. **No Provenance Overwrites**:
-   Replaying historical blocks or receiving subsequent witness notifications does not overwrite `observation_mode`, `replay_job_id`, or `first_observed_at` on the canonical `chain_events` record.
-2. **Conservative Merge Rule**:
-   Upserting canonical events on conflict (`ON CONFLICT (id) DO UPDATE SET`) only updates event-intrinsic fields (`title`, `description`, `metadata`). Observation provenance is strictly append-only into `event_observations`.
-3. **Deterministic Observation Identity**:
-   Observations generate deterministic UUID v5 identities based on:
-   - Historical replay: `(event_id, replay_job_id)`
-   - Live witnesses: `(event_id, mode, provider, transport)`
-4. **Baseline Population Safety**:
-   Phase 6B statistical baselines and rarity metrics query `chain_events` directly, never counting duplicate observations. Replaying a 4,000 BTC transaction 10 times counts exactly once in statistical distributions.
+### Observation Kinds (`EventObservationKind`)
+ObsChain supports strongly-typed, source-justified observation kinds:
+- **`FirstSeen`**: Initial detection when context does not differentiate mempool or block.
+- **`MempoolSeen`**: Unconfirmed transaction seen entering node mempool (e.g. via ZMQ `sequence` `'A'` or `rawtx`).
+- **`Confirmed`**: Transaction observed within a mined, connected block (e.g. via ZMQ `rawblock` or `sequence` `'C'`).
+- **`ReorgedOut`**: Previously confirmed transaction disconnected due to chain reorganization (e.g. via ZMQ `sequence` `'D'`).
+- **`Witnessed`**: Supplementary telemetry from secondary network monitors (e.g. mempool.space WebSocket).
+- **`HistoricalReplay`**: Validated observation created during historical block range replay.
+
+### Uniqueness & Deterministic Observation Identity
+- **PostgreSQL Partial Unique Index (`idx_event_obs_live_lifecycle_uniq`)**:
+  ```sql
+  CREATE UNIQUE INDEX idx_event_obs_live_lifecycle_uniq
+  ON event_observations (
+      event_id,
+      observation_mode,
+      (source->>'provider'),
+      (source->>'transport'),
+      observation_kind,
+      COALESCE(block_hash, source_sequence::text, mempool_sequence::text, confirmation_status, '')
+  ) WHERE replay_job_id IS NULL;
+  ```
+- **Deterministic Identity (`EventObservation::deterministic_id`)**:
+  Generated via UUID v5:
+  - Historical Replay: `UUIDv5("obs:{event_id}:replay:{job_id}")`
+  - Live Observations: `UUIDv5("obs:{event_id}:{mode}:{provider}:{transport}:{kind}:{discriminator}")`
+
+### Baseline Statistical Population Invariant
+Phase 6B statistical baselines and rarity metrics must **strictly** evaluate:
+```sql
+SELECT COUNT(*) FROM chain_events ...
+```
+and **NEVER**:
+```sql
+SELECT COUNT(*) FROM event_observations ...
+```
+Observation records describe provenance, independent witnesses, and lifecycle transitions. They do not constitute additional Bitcoin events. Replaying a block or observing a transaction transition through mempool, confirmation, reorg, and re-entry never inflates event rarity baselines.
+
 
 
 

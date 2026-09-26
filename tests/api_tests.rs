@@ -474,8 +474,8 @@ async fn test_replay_jobs_listing_and_not_found() {
 async fn test_events_research_filter_query() {
     use chrono::Utc;
     use obschain_core::{
-        ChainEvent, ConfidenceLevel, EventObservation, EventSeverity, EventType, ObservationMode,
-        ObservationSource,
+        ChainEvent, ConfidenceLevel, EventObservation, EventObservationKind, EventSeverity,
+        EventType, ObservationMode, ObservationSource,
     };
     use obschain_storage::EventRepository;
 
@@ -531,6 +531,7 @@ async fn test_events_research_filter_query() {
     let obs1 = EventObservation::live(
         ev1.id,
         ObservationSource::new("bitcoin_core", "zmq", None),
+        EventObservationKind::Confirmed,
         now,
         Some(ev1.event_time),
         ev1.block_height,

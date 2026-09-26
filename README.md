@@ -415,10 +415,26 @@ See [docs/HISTORICAL_REPLAY.md](docs/HISTORICAL_REPLAY.md) for full architecture
 
 ---
 
+## Canonical Events & Observation Lifecycle (Phase 6A.1 & 6A.2)
+
+ObsChain enforces a strict architectural boundary between logical on-chain events and observation provenance:
+
+- **`Event ≠ Observation`**:
+  `ChainEvent` models an immutable, logical Bitcoin event (what occurred on the Bitcoin network). `EventObservation` models an occurrence or witness of that event (how, when, and in what lifecycle state ObsChain learned about it).
+- **`Source ≠ Observation Lifecycle`**:
+  A single source (e.g. Bitcoin Core ZMQ) can observe the same canonical event across multiple lifecycle transitions (`MEMPOOL_SEEN` -> `CONFIRMED` -> `REORGED_OUT` -> `MEMPOOL_SEEN`).
+- **One Canonical Event, Multiple Observations**:
+  Lifecycle transitions and secondary witnesses (e.g. mempool.space WebSocket) append distinct observation records without creating duplicate `ChainEvent` entries or overwriting initial discovery provenance.
+- **Statistical Baseline Invariant**:
+  Statistical baselines and rarity percentiles evaluate `COUNT(chain_events)` — **never** `COUNT(event_observations)`. Provenance and lifecycle observations describe observer telemetry, not additional Bitcoin events.
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/EVENT_MODEL.md](docs/EVENT_MODEL.md) for complete details.
+
+---
+
 ## Testing & Quality
 
 Run full workspace checks:
-
 
 ```bash
 cargo fmt --check
@@ -427,6 +443,16 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 cargo audit
 ```
+
+### Authoritative Test Manifest
+
+To generate an authoritative tabular report of test suites and counts across the workspace:
+
+```bash
+./scripts/test_manifest.sh
+```
+
+See [docs/TEST_MANIFEST.md](docs/TEST_MANIFEST.md) for the complete baseline inventory and historical test audit reconciliation.
 
 ---
 

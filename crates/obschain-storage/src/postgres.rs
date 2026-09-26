@@ -1,12 +1,13 @@
 use chrono::{DateTime, Utc};
 use obschain_core::{
     ActivityStatus, Chain, ChainEvent, ConfidenceLevel, CorrelationStrength, EventObservation,
-    EventSeverity, EventType, Evidence, EvidenceType, GraphEdge, GraphEdgeType, GraphNode,
-    GraphNodeType, Incident, IncidentActivity, IncidentActivityType, IncidentAlert, IncidentBlock,
-    IncidentEntity, IncidentGraph, IncidentStatus, IncidentTransaction, IncidentUpdate,
-    ObservationMode, ObservationSource, OnChainMessage, ProvenanceClassification, RecoverySummary,
-    ReplayCheckpoint, ReplayJob, ReplayJobStatus, Source, SourceCategory, TechnicalFinding,
-    TimelineCategory, TimelineEntry, TransactionRole, WatchTarget, WatchTargetKind,
+    EventObservationKind, EventSeverity, EventType, Evidence, EvidenceType, GraphEdge,
+    GraphEdgeType, GraphNode, GraphNodeType, Incident, IncidentActivity, IncidentActivityType,
+    IncidentAlert, IncidentBlock, IncidentEntity, IncidentGraph, IncidentStatus,
+    IncidentTransaction, IncidentUpdate, ObservationMode, ObservationSource, OnChainMessage,
+    ProvenanceClassification, RecoverySummary, ReplayCheckpoint, ReplayJob, ReplayJobStatus,
+    Source, SourceCategory, TechnicalFinding, TimelineCategory, TimelineEntry, TransactionRole,
+    WatchTarget, WatchTargetKind,
 };
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -568,29 +569,43 @@ impl EventRepository for PostgresStorage {
             Some(h) => Some(u64_to_i64_checked(h)?),
             None => None,
         };
+        let mempool_seq_i64 = match observation.mempool_sequence {
+            Some(s) => Some(u64_to_i64_checked(s)?),
+            None => None,
+        };
+        let source_seq_i64 = observation.source_sequence.map(|s| s as i64);
         let mode_str = observation.mode.as_str();
+        let kind_str = observation.kind.as_str();
 
         sqlx::query(
             r#"
             INSERT INTO event_observations (
-                id, event_id, observation_mode, source, observed_at,
-                bitcoin_time, replay_job_id, block_height, block_hash, witness
+                id, event_id, observation_mode, observation_kind, source, observed_at,
+                bitcoin_time, replay_job_id, block_height, block_hash,
+                confirmation_status, source_sequence, mempool_sequence, witness
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             ON CONFLICT (id) DO UPDATE SET
                 source = EXCLUDED.source,
-                witness = EXCLUDED.witness
+                witness = EXCLUDED.witness,
+                confirmation_status = EXCLUDED.confirmation_status,
+                source_sequence = EXCLUDED.source_sequence,
+                mempool_sequence = EXCLUDED.mempool_sequence
             "#,
         )
         .bind(observation.id)
         .bind(observation.event_id)
         .bind(mode_str)
+        .bind(kind_str)
         .bind(source_json)
         .bind(observation.observed_at)
         .bind(observation.bitcoin_time)
         .bind(observation.replay_job_id)
         .bind(block_height_i64)
         .bind(&observation.block_hash)
+        .bind(&observation.confirmation_status)
+        .bind(source_seq_i64)
+        .bind(mempool_seq_i64)
         .bind(witness_json)
         .execute(&self.pool)
         .await
@@ -605,8 +620,9 @@ impl EventRepository for PostgresStorage {
     ) -> Result<Vec<EventObservation>, StorageError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, event_id, observation_mode, source, observed_at,
-                   bitcoin_time, replay_job_id, block_height, block_hash, witness
+            SELECT id, event_id, observation_mode, observation_kind, source, observed_at,
+                   bitcoin_time, replay_job_id, block_height, block_hash,
+                   confirmation_status, source_sequence, mempool_sequence, witness
             FROM event_observations
             WHERE event_id = $1
             ORDER BY observed_at ASC
@@ -624,6 +640,10 @@ impl EventRepository for PostgresStorage {
                 "historical_replay" => ObservationMode::HistoricalReplay,
                 _ => ObservationMode::Live,
             };
+            let kind_str: String = row.get("observation_kind");
+            let kind = kind_str
+                .parse::<EventObservationKind>()
+                .unwrap_or(EventObservationKind::Witnessed);
             let source_json: serde_json::Value = row.get("source");
             let source: ObservationSource = serde_json::from_value(source_json)
                 .unwrap_or_else(|_| ObservationSource::new("bitcoin_core", "zmq", None));
@@ -634,17 +654,29 @@ impl EventRepository for PostgresStorage {
                 Some(h) => Some(i64_to_u64_checked(h)?),
                 None => None,
             };
+            let confirmation_status: Option<String> = row.get("confirmation_status");
+            let source_seq_i64: Option<i64> = row.get("source_sequence");
+            let source_sequence = source_seq_i64.map(|s| s as u32);
+            let mempool_seq_i64: Option<i64> = row.get("mempool_sequence");
+            let mempool_sequence = match mempool_seq_i64 {
+                Some(s) => Some(i64_to_u64_checked(s)?),
+                None => None,
+            };
 
             observations.push(EventObservation {
                 id: row.get("id"),
                 event_id: row.get("event_id"),
                 mode,
+                kind,
                 source,
                 observed_at: row.get("observed_at"),
                 bitcoin_time: row.get("bitcoin_time"),
                 replay_job_id: row.get("replay_job_id"),
                 block_height,
                 block_hash: row.get("block_hash"),
+                confirmation_status,
+                source_sequence,
+                mempool_sequence,
                 witness,
             });
         }

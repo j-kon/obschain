@@ -160,3 +160,20 @@ Live feeds can replay observations during network reconnects or catch-up bursts.
 - **Deterministic Key**: Combines `EventType` with unique on-chain identifiers (e.g. `DormantCoinsMoved:tx:<txid>`, `LongBlockInterval:block:<hash>`).
 - **Bounded In-Memory Cache**: Thread-safe FIFO/LRU eviction with TTL (default: 10,000 capacity, 30 min TTL).
 - Deduplication runs immediately before storage and live WebSocket broadcasting.
+
+---
+
+## Canonical Events vs Observation Lifecycle (Phase 6A.1 & 6A.2)
+
+ObsChain establishes a strict separation between logical Bitcoin events and observer telemetry:
+
+1. **`Event ≠ Observation`**:
+   - `ChainEvent` is an immutable, canonical record of what occurred on the Bitcoin network.
+   - `EventObservation` records an occurrence of how, when, and in what lifecycle state ObsChain learned about that event.
+2. **`Source ≠ Observation Lifecycle`**:
+   - A single provider/transport (e.g. Bitcoin Core ZMQ) can observe the same logical event across multiple meaningful lifecycle stages (`MEMPOOL_SEEN` -> `CONFIRMED` -> `REORGED_OUT` -> `MEMPOOL_SEEN`).
+   - Observations capture `kind: EventObservationKind`: `FirstSeen`, `MempoolSeen`, `Confirmed`, `ReorgedOut`, `Witnessed`, `HistoricalReplay`.
+3. **Statistical Baseline Invariant**:
+   - For anomaly rarity scoring and percentiles (Phase 6B), the statistical population is always `COUNT(chain_events)`.
+   - `COUNT(event_observations)` is NEVER used for population sizing, as multiple witnesses or lifecycle transitions do not represent additional Bitcoin events.
+

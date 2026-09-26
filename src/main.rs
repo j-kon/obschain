@@ -873,9 +873,15 @@ async fn save_event_with_retry(storage: &Storage, event: &ChainEvent, metrics: &
                     let source = event.source.clone().unwrap_or_else(|| {
                         obschain_core::ObservationSource::new("bitcoin_core", "zmq", None)
                     });
+                    let kind = if event.block_hash.is_some() {
+                        obschain_core::EventObservationKind::Confirmed
+                    } else {
+                        obschain_core::EventObservationKind::MempoolSeen
+                    };
                     let obs = obschain_core::EventObservation::live(
                         event.id,
                         source,
+                        kind,
                         chrono::Utc::now(),
                         Some(event.event_time),
                         event.block_height,
@@ -884,21 +890,34 @@ async fn save_event_with_retry(storage: &Storage, event: &ChainEvent, metrics: &
                     let _ = storage.save_event_observation(&obs).await;
                 } else {
                     for witness in &event.witnesses {
+                        let kind = obschain_core::EventObservationKind::Witnessed;
+                        let disc = obschain_core::EventObservation::build_discriminator(
+                            event.block_hash.as_deref(),
+                            None,
+                            None,
+                            None,
+                        );
                         let obs = obschain_core::EventObservation {
                             id: obschain_core::EventObservation::deterministic_id(
                                 event.id,
                                 obschain_core::ObservationMode::Live,
                                 &witness.source,
+                                kind,
                                 None,
+                                Some(&disc),
                             ),
                             event_id: event.id,
                             mode: obschain_core::ObservationMode::Live,
+                            kind,
                             source: witness.source.clone(),
                             observed_at: witness.observed_at,
                             bitcoin_time: Some(event.event_time),
                             replay_job_id: None,
                             block_height: event.block_height,
                             block_hash: event.block_hash.clone(),
+                            confirmation_status: None,
+                            source_sequence: None,
+                            mempool_sequence: None,
                             witness: Some(witness.clone()),
                         };
                         let _ = storage.save_event_observation(&obs).await;

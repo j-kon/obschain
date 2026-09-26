@@ -5,8 +5,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chrono::{DateTime, Utc};
 use obschain_core::{
-    ChainEvent, ConfidenceLevel, EventObservation, EventSeverity, EventType, ObservationMode,
-    ObservationSource, ObservationWitness, ReplayJob,
+    ChainEvent, ConfidenceLevel, EventObservation, EventObservationKind, EventSeverity, EventType,
+    ObservationMode, ObservationSource, ObservationWitness, ReplayJob,
 };
 use obschain_storage::{
     EventFilter, EventRepository, InMemoryStorage, PostgresStorage, ReplayRepository,
@@ -75,6 +75,7 @@ async fn test_live_then_replay_provenance_preservation() {
     let live_obs = EventObservation::live(
         event_id,
         live_source.clone(),
+        EventObservationKind::Confirmed,
         live_observed_at,
         Some(event_time),
         canonical.block_height,
@@ -230,6 +231,7 @@ async fn test_dual_source_multi_witness_observations() {
     let obs_core = EventObservation::live(
         event_id,
         btc_core_source.clone(),
+        EventObservationKind::MempoolSeen,
         Utc::now() - chrono::Duration::seconds(2),
         Some(event_time),
         canonical.block_height,
@@ -246,6 +248,7 @@ async fn test_dual_source_multi_witness_observations() {
     let obs_mempool = EventObservation::live(
         event_id,
         mempool_source.clone(),
+        EventObservationKind::Witnessed,
         Utc::now() - chrono::Duration::seconds(1),
         Some(event_time),
         canonical.block_height,
@@ -286,6 +289,7 @@ async fn test_query_mode_matches_both_live_and_replay() {
     let live_obs = EventObservation::live(
         event_id,
         ObservationSource::bitcoin_core_zmq("tcp://127.0.0.1:28332"),
+        EventObservationKind::Confirmed,
         Utc::now() - chrono::Duration::hours(3),
         Some(event_time),
         canonical.block_height,
@@ -505,6 +509,7 @@ async fn test_postgres_provenance_database_constraints() {
     let orphaned_obs = EventObservation::live(
         non_existent_event_id,
         ObservationSource::new("bitcoin_core", "zmq", None),
+        EventObservationKind::Witnessed,
         Utc::now(),
         Some(event_time),
         None,
@@ -611,6 +616,7 @@ async fn test_observation_api_endpoint() {
     let live_obs = EventObservation::live(
         event_id,
         ObservationSource::bitcoin_core_zmq("tcp://127.0.0.1:28332"),
+        EventObservationKind::Confirmed,
         Utc::now() - chrono::Duration::hours(4),
         Some(event_time),
         canonical.block_height,
@@ -641,6 +647,7 @@ async fn test_observation_api_endpoint() {
     let observations = json["observations"].as_array().unwrap();
     assert_eq!(observations.len(), 1);
     assert_eq!(observations[0]["mode"], "LIVE");
+    assert_eq!(observations[0]["kind"], "CONFIRMED");
     assert_eq!(observations[0]["source"]["provider"], "bitcoin_core");
 
     // Nonexistent event returns 404
@@ -652,4 +659,465 @@ async fn test_observation_api_endpoint() {
 
     let resp_404 = app.oneshot(req_404).await.unwrap();
     assert_eq!(resp_404.status(), StatusCode::NOT_FOUND);
+}
+
+// ===========================================================================
+// Phase 6A.2: Lifecycle Integrity Tests
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 9. Same Source: Mempool then Confirm (Canonical: 1, Observations: 2)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_lifecycle_same_source_mempool_then_confirm() {
+    let storage = InMemoryStorage::new_empty(1000);
+    let event_time = Utc::now() - chrono::Duration::minutes(10);
+    let mut canonical =
+        create_test_chain_event("tx_lifecycle_mempool_confirm", 500_000_000, event_time);
+    let event_id = canonical.id;
+    // Initially unconfirmed mempool event
+    canonical.block_height = None;
+    canonical.block_hash = None;
+
+    storage.save_event(&canonical).await.unwrap();
+
+    let zmq_source = ObservationSource::bitcoin_core_zmq("tcp://127.0.0.1:28332");
+
+    // 1. Mempool observation from Bitcoin Core ZMQ
+    let mempool_obs = EventObservation::live(
+        event_id,
+        zmq_source.clone(),
+        EventObservationKind::MempoolSeen,
+        Utc::now() - chrono::Duration::minutes(10),
+        Some(event_time),
+        None,
+        None,
+    )
+    .with_source_sequence(101)
+    .with_mempool_sequence(1);
+    storage.save_event_observation(&mempool_obs).await.unwrap();
+
+    // Verify 1 canonical event, 1 observation
+    assert_eq!(storage.list_events(10, 0).await.unwrap().len(), 1);
+    let obs1 = storage.list_event_observations(event_id).await.unwrap();
+    assert_eq!(obs1.len(), 1);
+    assert_eq!(obs1[0].kind, EventObservationKind::MempoolSeen);
+
+    // 2. Transaction confirms in block 840001
+    let mut confirmed_canonical = canonical.clone();
+    confirmed_canonical.block_height = Some(840001);
+    confirmed_canonical.block_hash = Some("0000000000000000000block840001".to_string());
+    storage.save_event(&confirmed_canonical).await.unwrap();
+
+    let confirmed_obs = EventObservation::live(
+        event_id,
+        zmq_source.clone(),
+        EventObservationKind::Confirmed,
+        Utc::now() - chrono::Duration::minutes(2),
+        Some(event_time),
+        Some(840001),
+        Some("0000000000000000000block840001".to_string()),
+    )
+    .with_source_sequence(150);
+    storage
+        .save_event_observation(&confirmed_obs)
+        .await
+        .unwrap();
+
+    // Invariant: Canonical events = 1, Observations = 2
+    assert_eq!(
+        storage.list_events(10, 0).await.unwrap().len(),
+        1,
+        "Canonical event count must remain 1"
+    );
+    let all_obs = storage.list_event_observations(event_id).await.unwrap();
+    assert_eq!(
+        all_obs.len(),
+        2,
+        "Must preserve both MEMPOOL_SEEN and CONFIRMED observations"
+    );
+    assert_eq!(all_obs[0].kind, EventObservationKind::MempoolSeen);
+    assert_eq!(all_obs[1].kind, EventObservationKind::Confirmed);
+    assert_eq!(all_obs[0].source.provider, "bitcoin_core");
+    assert_eq!(all_obs[1].source.provider, "bitcoin_core");
+}
+
+// ---------------------------------------------------------------------------
+// 10. Confirm then Reorg (Canonical: 1, Observations: CONFIRMED, REORGED_OUT)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_lifecycle_confirm_then_reorg() {
+    let storage = InMemoryStorage::new_empty(1000);
+    let event_time = Utc::now() - chrono::Duration::minutes(30);
+    let canonical = create_test_chain_event("tx_lifecycle_reorg", 750_000_000, event_time);
+    let event_id = canonical.id;
+    storage.save_event(&canonical).await.unwrap();
+
+    let zmq_source = ObservationSource::bitcoin_core_zmq("tcp://127.0.0.1:28332");
+    let block_a_hash = "0000000000000000000block_a".to_string();
+
+    // 1. Transaction confirmed in block A
+    let conf_obs = EventObservation::live(
+        event_id,
+        zmq_source.clone(),
+        EventObservationKind::Confirmed,
+        Utc::now() - chrono::Duration::minutes(25),
+        Some(event_time),
+        Some(840010),
+        Some(block_a_hash.clone()),
+    )
+    .with_confirmation_status("confirmed");
+    storage.save_event_observation(&conf_obs).await.unwrap();
+
+    // 2. Reorg occurs: block A is disconnected!
+    // Rather than replacing the prior record, append REORGED_OUT
+    let reorg_obs = EventObservation::live(
+        event_id,
+        zmq_source.clone(),
+        EventObservationKind::ReorgedOut,
+        Utc::now() - chrono::Duration::minutes(15),
+        Some(event_time),
+        Some(840010),
+        Some(block_a_hash.clone()),
+    )
+    .with_confirmation_status("reorged_out");
+    storage.save_event_observation(&reorg_obs).await.unwrap();
+
+    // Invariant: Canonical events = 1, Observations = 2 (CONFIRMED and REORGED_OUT)
+    assert_eq!(storage.list_events(10, 0).await.unwrap().len(), 1);
+    let obs = storage.list_event_observations(event_id).await.unwrap();
+    assert_eq!(
+        obs.len(),
+        2,
+        "Must preserve both CONFIRMED and REORGED_OUT history"
+    );
+    assert_eq!(obs[0].kind, EventObservationKind::Confirmed);
+    assert_eq!(obs[1].kind, EventObservationKind::ReorgedOut);
+}
+
+// ---------------------------------------------------------------------------
+// 11. Reorg then Mempool Re-entry (Historical records intact)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_lifecycle_reorg_then_mempool_reentry() {
+    let storage = InMemoryStorage::new_empty(1000);
+    let event_time = Utc::now() - chrono::Duration::hours(1);
+    let canonical = create_test_chain_event("tx_lifecycle_reentry", 900_000_000, event_time);
+    let event_id = canonical.id;
+    storage.save_event(&canonical).await.unwrap();
+
+    let zmq_source = ObservationSource::bitcoin_core_zmq("tcp://127.0.0.1:28332");
+    let block_hash = "0000000000000000000block_stale".to_string();
+
+    // 1. Initial MempoolSeen
+    let obs1 = EventObservation::live(
+        event_id,
+        zmq_source.clone(),
+        EventObservationKind::MempoolSeen,
+        Utc::now() - chrono::Duration::minutes(50),
+        Some(event_time),
+        None,
+        None,
+    )
+    .with_mempool_sequence(10);
+    storage.save_event_observation(&obs1).await.unwrap();
+
+    // 2. Confirmed in block
+    let obs2 = EventObservation::live(
+        event_id,
+        zmq_source.clone(),
+        EventObservationKind::Confirmed,
+        Utc::now() - chrono::Duration::minutes(40),
+        Some(event_time),
+        Some(840020),
+        Some(block_hash.clone()),
+    )
+    .with_confirmation_status("confirmed");
+    storage.save_event_observation(&obs2).await.unwrap();
+
+    // 3. ReorgedOut
+    let obs3 = EventObservation::live(
+        event_id,
+        zmq_source.clone(),
+        EventObservationKind::ReorgedOut,
+        Utc::now() - chrono::Duration::minutes(30),
+        Some(event_time),
+        Some(840020),
+        Some(block_hash.clone()),
+    )
+    .with_confirmation_status("reorged_out");
+    storage.save_event_observation(&obs3).await.unwrap();
+
+    // 4. Mempool re-entry
+    let obs4 = EventObservation::live(
+        event_id,
+        zmq_source.clone(),
+        EventObservationKind::MempoolSeen,
+        Utc::now() - chrono::Duration::minutes(20),
+        Some(event_time),
+        None,
+        None,
+    )
+    .with_mempool_sequence(80)
+    .with_confirmation_status("reentered");
+    storage.save_event_observation(&obs4).await.unwrap();
+
+    // Invariant: Canonical events = 1, Observations = 4
+    assert_eq!(storage.list_events(10, 0).await.unwrap().len(), 1);
+    let all_obs = storage.list_event_observations(event_id).await.unwrap();
+    assert_eq!(
+        all_obs.len(),
+        4,
+        "All 4 lifecycle stages must be preserved in historical sequence"
+    );
+    assert_eq!(all_obs[0].kind, EventObservationKind::MempoolSeen);
+    assert_eq!(all_obs[1].kind, EventObservationKind::Confirmed);
+    assert_eq!(all_obs[2].kind, EventObservationKind::ReorgedOut);
+    assert_eq!(all_obs[3].kind, EventObservationKind::MempoolSeen);
+    assert_eq!(all_obs[3].confirmation_status.as_deref(), Some("reentered"));
+}
+
+// ---------------------------------------------------------------------------
+// 12. Dual Source Multi-Stage (Bitcoin Core + mempool.space WS)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_lifecycle_dual_source_multi_stage() {
+    let storage = InMemoryStorage::new_empty(1000);
+    let event_time = Utc::now() - chrono::Duration::minutes(20);
+    let canonical = create_test_chain_event("tx_lifecycle_dual", 1_200_000_000, event_time);
+    let event_id = canonical.id;
+    storage.save_event(&canonical).await.unwrap();
+
+    let btc_source = ObservationSource::bitcoin_core_zmq("tcp://127.0.0.1:28332");
+    let mempool_source = ObservationSource::mempool_ws("wss://mempool.space/api/v1/ws");
+
+    // 1. Bitcoin Core ZMQ: MEMPOOL_SEEN
+    let obs1 = EventObservation::live(
+        event_id,
+        btc_source.clone(),
+        EventObservationKind::MempoolSeen,
+        Utc::now() - chrono::Duration::minutes(15),
+        Some(event_time),
+        None,
+        None,
+    );
+    storage.save_event_observation(&obs1).await.unwrap();
+
+    // 2. Mempool.space WebSocket: WITNESSED
+    let obs2 = EventObservation::live(
+        event_id,
+        mempool_source.clone(),
+        EventObservationKind::Witnessed,
+        Utc::now() - chrono::Duration::minutes(14),
+        Some(event_time),
+        None,
+        None,
+    );
+    storage.save_event_observation(&obs2).await.unwrap();
+
+    // 3. Bitcoin Core ZMQ: CONFIRMED
+    let obs3 = EventObservation::live(
+        event_id,
+        btc_source.clone(),
+        EventObservationKind::Confirmed,
+        Utc::now() - chrono::Duration::minutes(5),
+        Some(event_time),
+        Some(840030),
+        Some("0000000000000000000block840030".to_string()),
+    );
+    storage.save_event_observation(&obs3).await.unwrap();
+
+    // Invariant: 1 canonical event, 3 meaningful observations
+    assert_eq!(storage.list_events(10, 0).await.unwrap().len(), 1);
+    let obs = storage.list_event_observations(event_id).await.unwrap();
+    assert_eq!(
+        obs.len(),
+        3,
+        "Expected 1 canonical event and 3 distinct observations"
+    );
+    assert_eq!(obs[0].source.provider, "bitcoin_core");
+    assert_eq!(obs[0].kind, EventObservationKind::MempoolSeen);
+    assert_eq!(obs[1].source.provider, "mempool.space");
+    assert_eq!(obs[1].kind, EventObservationKind::Witnessed);
+    assert_eq!(obs[2].source.provider, "bitcoin_core");
+    assert_eq!(obs[2].kind, EventObservationKind::Confirmed);
+}
+
+// ---------------------------------------------------------------------------
+// 13. Repeated Duplicate Notification (Idempotency)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_lifecycle_repeated_duplicate_notification_idempotency() {
+    let storage = InMemoryStorage::new_empty(1000);
+    let event_time = Utc::now() - chrono::Duration::minutes(5);
+    let canonical = create_test_chain_event("tx_lifecycle_dedup", 300_000_000, event_time);
+    let event_id = canonical.id;
+    storage.save_event(&canonical).await.unwrap();
+
+    let zmq_source = ObservationSource::bitcoin_core_zmq("tcp://127.0.0.1:28332");
+
+    let obs = EventObservation::live(
+        event_id,
+        zmq_source.clone(),
+        EventObservationKind::Confirmed,
+        Utc::now() - chrono::Duration::minutes(5),
+        Some(event_time),
+        Some(840040),
+        Some("0000000000000000000block840040".to_string()),
+    );
+
+    // First save
+    storage.save_event_observation(&obs).await.unwrap();
+    // Second save (identical notification)
+    storage.save_event_observation(&obs).await.unwrap();
+
+    assert_eq!(storage.list_events(10, 0).await.unwrap().len(), 1);
+    let obs_list = storage.list_event_observations(event_id).await.unwrap();
+    assert_eq!(
+        obs_list.len(),
+        1,
+        "Duplicate notification must not create multiple observation rows"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 14. PostgreSQL Lifecycle Uniqueness, Backfill, and Isolation
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_postgres_lifecycle_uniqueness_and_backfill() {
+    let Some(storage) = get_test_postgres_storage().await else {
+        println!(
+            "Postgres not available, skipping test_postgres_lifecycle_uniqueness_and_backfill"
+        );
+        return;
+    };
+
+    let event_time = Utc::now() - chrono::Duration::hours(2);
+    let canonical = create_test_chain_event("tx_pg_lifecycle_1", 600_000_000, event_time);
+    let event_id = canonical.id;
+    storage
+        .save_event(&canonical)
+        .await
+        .expect("Save canonical event");
+
+    let source = ObservationSource::bitcoin_core_zmq("tcp://127.0.0.1:28332");
+
+    // 1. Same-source MempoolSeen insertion
+    let obs_mempool = EventObservation::live(
+        event_id,
+        source.clone(),
+        EventObservationKind::MempoolSeen,
+        Utc::now() - chrono::Duration::hours(2),
+        Some(event_time),
+        None,
+        None,
+    )
+    .with_source_sequence(10)
+    .with_mempool_sequence(1);
+    storage
+        .save_event_observation(&obs_mempool)
+        .await
+        .expect("Insert MempoolSeen");
+
+    // 2. Same-source Confirmed insertion (MUST SUCCEED without violating uniqueness!)
+    let obs_confirmed = EventObservation::live(
+        event_id,
+        source.clone(),
+        EventObservationKind::Confirmed,
+        Utc::now() - chrono::Duration::hours(1),
+        Some(event_time),
+        Some(840050),
+        Some("0000000000000000000block840050".to_string()),
+    )
+    .with_confirmation_status("confirmed")
+    .with_source_sequence(20);
+    storage
+        .save_event_observation(&obs_confirmed)
+        .await
+        .expect("Insert Confirmed from same source");
+
+    // Verify both observations are present for the single canonical event
+    let observations = storage
+        .list_event_observations(event_id)
+        .await
+        .expect("List observations");
+    assert_eq!(
+        observations.len(),
+        2,
+        "PostgreSQL must store both MempoolSeen and Confirmed from same source"
+    );
+    assert_eq!(observations[0].kind, EventObservationKind::MempoolSeen);
+    assert_eq!(observations[1].kind, EventObservationKind::Confirmed);
+
+    // 3. Same-source same-kind duplicate rejection / idempotency
+    storage
+        .save_event_observation(&obs_confirmed)
+        .await
+        .expect("Re-inserting Confirmed must be idempotent");
+    let after_dup = storage
+        .list_event_observations(event_id)
+        .await
+        .expect("List after dup");
+    assert_eq!(
+        after_dup.len(),
+        2,
+        "Idempotent insert must not duplicate observation rows"
+    );
+
+    // 4. Replay-job isolation
+    let replay_job_id = Uuid::new_v4();
+    let replay_job = ReplayJob::new("regtest", 840050, 840050, "bitcoin_core_rpc");
+    let mut replay_job_with_id = replay_job;
+    replay_job_with_id.id = replay_job_id;
+    storage
+        .create_job(&replay_job_with_id)
+        .await
+        .expect("Create replay job");
+
+    let obs_replay = EventObservation::historical_replay(
+        event_id,
+        replay_job_id,
+        ObservationSource::new("bitcoin_core", "rpc_historical_replay", None),
+        Utc::now(),
+        Some(event_time),
+        Some(840050),
+        Some("0000000000000000000block840050".to_string()),
+    );
+    storage
+        .save_event_observation(&obs_replay)
+        .await
+        .expect("Insert replay observation");
+
+    let all_obs = storage
+        .list_event_observations(event_id)
+        .await
+        .expect("List all observations");
+    assert_eq!(
+        all_obs.len(),
+        3,
+        "Live and Replay observations must be isolated and both preserved"
+    );
+
+    // 5. Foreign-key cascade behavior
+    sqlx::query("DELETE FROM chain_events WHERE id = $1")
+        .bind(event_id)
+        .execute(storage.pool())
+        .await
+        .expect("Delete canonical event");
+
+    let remaining_obs = storage
+        .list_event_observations(event_id)
+        .await
+        .expect("List after cascade");
+    assert_eq!(
+        remaining_obs.len(),
+        0,
+        "Deleting canonical event must cascade delete all observations"
+    );
 }

@@ -5,9 +5,9 @@ use std::{
 
 use chrono::Utc;
 use obschain_core::{
-    ActivityStatus, ChainEvent, ConfidenceLevel, EventObservation, EventSeverity, EventType,
-    Incident, IncidentActivity, IncidentAlert, ObservationMode, ReplayCheckpoint, ReplayJob,
-    WatchTarget,
+    ActivityStatus, ChainEvent, ConfidenceLevel, EventObservation, EventObservationKind,
+    EventSeverity, EventType, Incident, IncidentActivity, IncidentAlert, ObservationMode,
+    ReplayCheckpoint, ReplayJob, WatchTarget,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -362,6 +362,7 @@ impl InMemoryStorage {
             lock.push(EventObservation::live(
                 ev1.id,
                 obschain_core::ObservationSource::bitcoin_core_rpc("http://127.0.0.1:18443"),
+                EventObservationKind::Confirmed,
                 ev1.detected_at,
                 Some(ev1.detected_at),
                 ev1.block_height,
@@ -370,6 +371,7 @@ impl InMemoryStorage {
             lock.push(EventObservation::live(
                 ev2.id,
                 obschain_core::ObservationSource::bitcoin_core_rpc("http://127.0.0.1:18443"),
+                EventObservationKind::Confirmed,
                 ev2.detected_at,
                 Some(ev2.detected_at),
                 ev2.block_height,
@@ -378,6 +380,7 @@ impl InMemoryStorage {
             lock.push(EventObservation::live(
                 ev3.id,
                 obschain_core::ObservationSource::bitcoin_core_rpc("http://127.0.0.1:18443"),
+                EventObservationKind::Confirmed,
                 ev3.detected_at,
                 Some(ev3.detected_at),
                 ev3.block_height,
@@ -558,7 +561,7 @@ impl EventRepository for InMemoryStorage {
 
         // Uniqueness check:
         // Replay: (event_id, replay_job_id)
-        // Live: (event_id, provider, transport)
+        // Live: (event_id, mode, provider, transport, kind, block_hash, source_sequence, mempool_sequence, confirmation_status)
         if let Some(pos) = lock.iter().position(|o| {
             o.id == observation.id
                 || (observation.mode == ObservationMode::HistoricalReplay
@@ -569,7 +572,12 @@ impl EventRepository for InMemoryStorage {
                     && o.event_id == observation.event_id
                     && o.mode == ObservationMode::Live
                     && o.source.provider == observation.source.provider
-                    && o.source.transport == observation.source.transport)
+                    && o.source.transport == observation.source.transport
+                    && o.kind == observation.kind
+                    && o.block_hash == observation.block_hash
+                    && o.source_sequence == observation.source_sequence
+                    && o.mempool_sequence == observation.mempool_sequence
+                    && o.confirmation_status == observation.confirmation_status)
         }) {
             lock[pos] = observation.clone();
             return Ok(());

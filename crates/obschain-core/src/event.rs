@@ -43,6 +43,55 @@ pub enum EventType {
     UnusualFeeRatio,
 }
 
+/// Categorizes the lifecycle stage or role of an observation.
+/// Distinguishes between mempool discovery, block confirmation, reorg invalidation,
+/// secondary witnesses, and historical replay without manufacturing unsupported states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum EventObservationKind {
+    FirstSeen,
+    MempoolSeen,
+    Confirmed,
+    ReorgedOut,
+    Witnessed,
+    HistoricalReplay,
+}
+
+impl EventObservationKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::FirstSeen => "FIRST_SEEN",
+            Self::MempoolSeen => "MEMPOOL_SEEN",
+            Self::Confirmed => "CONFIRMED",
+            Self::ReorgedOut => "REORGED_OUT",
+            Self::Witnessed => "WITNESSED",
+            Self::HistoricalReplay => "HISTORICAL_REPLAY",
+        }
+    }
+}
+
+impl std::fmt::Display for EventObservationKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl std::str::FromStr for EventObservationKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_uppercase().as_str() {
+            "FIRST_SEEN" => Ok(Self::FirstSeen),
+            "MEMPOOL_SEEN" => Ok(Self::MempoolSeen),
+            "CONFIRMED" => Ok(Self::Confirmed),
+            "REORGED_OUT" => Ok(Self::ReorgedOut),
+            "WITNESSED" => Ok(Self::Witnessed),
+            "HISTORICAL_REPLAY" => Ok(Self::HistoricalReplay),
+            other => Err(format!("Unknown observation kind: {other}")),
+        }
+    }
+}
+
 /// An occurrence or witness of a chain event, recording how and when ObsChain learned about it.
 /// Separates observation provenance from intrinsic canonical event identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -50,6 +99,7 @@ pub struct EventObservation {
     pub id: Uuid,
     pub event_id: Uuid,
     pub mode: crate::replay::ObservationMode,
+    pub kind: EventObservationKind,
     pub source: crate::source::ObservationSource,
     pub observed_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -61,29 +111,60 @@ pub struct EventObservation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_sequence: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mempool_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub witness: Option<crate::source::ObservationWitness>,
 }
 
 impl EventObservation {
+    /// Builds a discriminator string from available block hash, sequence numbers, or confirmation status.
+    pub fn build_discriminator(
+        block_hash: Option<&str>,
+        source_sequence: Option<u32>,
+        mempool_sequence: Option<u64>,
+        confirmation_status: Option<&str>,
+    ) -> String {
+        if let Some(bh) = block_hash {
+            bh.to_string()
+        } else if let Some(mseq) = mempool_sequence {
+            format!("mempool_seq:{mseq}")
+        } else if let Some(sseq) = source_sequence {
+            format!("source_seq:{sseq}")
+        } else if let Some(status) = confirmation_status {
+            status.to_string()
+        } else {
+            String::new()
+        }
+    }
+
     /// Computes a stable, deterministic UUID for this observation occurrence.
     /// Replay observations are unique on (event_id, replay_job_id).
-    /// Live observations are unique on (event_id, mode, provider, transport).
+    /// Live observations are unique on (event_id, mode, provider, transport, kind, discriminator).
     pub fn deterministic_id(
         event_id: Uuid,
         mode: crate::replay::ObservationMode,
         source: &crate::source::ObservationSource,
+        kind: EventObservationKind,
         replay_job_id: Option<Uuid>,
+        discriminator: Option<&str>,
     ) -> Uuid {
         let key = match (mode, replay_job_id) {
             (crate::replay::ObservationMode::HistoricalReplay, Some(job_id)) => {
                 format!("obs:{event_id}:replay:{job_id}")
             }
             _ => {
+                let disc = discriminator.unwrap_or("");
                 format!(
-                    "obs:{event_id}:{}:{}:{}",
+                    "obs:{event_id}:{}:{}:{}:{}:{}",
                     mode.as_str(),
                     source.provider,
-                    source.transport
+                    source.transport,
+                    kind.as_str(),
+                    disc
                 )
             }
         };
@@ -94,16 +175,20 @@ impl EventObservation {
     pub fn live(
         event_id: Uuid,
         source: crate::source::ObservationSource,
+        kind: EventObservationKind,
         observed_at: DateTime<Utc>,
         bitcoin_time: Option<DateTime<Utc>>,
         block_height: Option<u64>,
         block_hash: Option<String>,
     ) -> Self {
+        let disc = Self::build_discriminator(block_hash.as_deref(), None, None, None);
         let id = Self::deterministic_id(
             event_id,
             crate::replay::ObservationMode::Live,
             &source,
+            kind,
             None,
+            Some(&disc),
         );
         let witness = Some(crate::source::ObservationWitness {
             source: source.clone(),
@@ -114,14 +199,53 @@ impl EventObservation {
             id,
             event_id,
             mode: crate::replay::ObservationMode::Live,
+            kind,
             source,
             observed_at,
             bitcoin_time,
             replay_job_id: None,
             block_height,
             block_hash,
+            confirmation_status: None,
+            source_sequence: None,
+            mempool_sequence: None,
             witness,
         }
+    }
+
+    pub fn with_confirmation_status(mut self, status: impl Into<String>) -> Self {
+        self.confirmation_status = Some(status.into());
+        self.recompute_id();
+        self
+    }
+
+    pub fn with_source_sequence(mut self, seq: u32) -> Self {
+        self.source_sequence = Some(seq);
+        self.recompute_id();
+        self
+    }
+
+    pub fn with_mempool_sequence(mut self, seq: u64) -> Self {
+        self.mempool_sequence = Some(seq);
+        self.recompute_id();
+        self
+    }
+
+    pub fn recompute_id(&mut self) {
+        let disc = Self::build_discriminator(
+            self.block_hash.as_deref(),
+            self.source_sequence,
+            self.mempool_sequence,
+            self.confirmation_status.as_deref(),
+        );
+        self.id = Self::deterministic_id(
+            self.event_id,
+            self.mode,
+            &self.source,
+            self.kind,
+            self.replay_job_id,
+            Some(&disc),
+        );
     }
 
     /// Creates a new HISTORICAL REPLAY observation record.
@@ -138,18 +262,24 @@ impl EventObservation {
             event_id,
             crate::replay::ObservationMode::HistoricalReplay,
             &source,
+            EventObservationKind::HistoricalReplay,
             Some(replay_job_id),
+            None,
         );
         Self {
             id,
             event_id,
             mode: crate::replay::ObservationMode::HistoricalReplay,
+            kind: EventObservationKind::HistoricalReplay,
             source,
             observed_at,
             bitcoin_time,
             replay_job_id: Some(replay_job_id),
             block_height,
             block_hash,
+            confirmation_status: Some("confirmed".to_string()),
+            source_sequence: None,
+            mempool_sequence: None,
             witness: None,
         }
     }

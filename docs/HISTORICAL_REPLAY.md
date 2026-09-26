@@ -246,10 +246,18 @@ Canonical ChainEvent (What Happened)
 3. **Deterministic Observation ID**:
    Each observation record receives a deterministic UUID v5:
    - Historical replay: `UUIDv5("obs:{event_id}:replay:{job_id}")`
-   - Live witnesses: `UUIDv5("obs:{event_id}:{mode}:{provider}:{transport}")`
+   - Live observations: `UUIDv5("obs:{event_id}:{mode}:{provider}:{transport}:{kind}:{discriminator}")`
+   where `discriminator` encapsulates `block_hash`, `source_sequence`, `mempool_sequence`, or `confirmation_status`.
 
-4. **Dedup Invariant for Baselines**:
-   Replaying the same block range across 10 jobs yields 10 discrete `event_observations` rows, but exactly 1 canonical `chain_events` row. Statistical baselines query canonical events, guaranteeing statistical distributions are never inflated.
+4. **Observation Lifecycle Integrity (Single Source Multi-Stage)**:
+   A single ingestion source (e.g. Bitcoin Core ZMQ) can observe the same logical event in multiple meaningful lifecycle stages (`MEMPOOL_SEEN` -> `CONFIRMED` -> `REORGED_OUT` -> `MEMPOOL_SEEN`).
+   - `Event ≠ Observation`: What happened vs how/when learned.
+   - `Source ≠ Observation Lifecycle`: A source observing multiple lifecycle transitions creates multiple distinct observation rows.
+   - All lifecycle transitions link back to the exact same canonical `ChainEvent`.
+
+5. **Dedup Invariant for Baselines**:
+   Replaying the same block range across 10 jobs yields 10 discrete `event_observations` rows, but exactly 1 canonical `chain_events` row.
+   Statistical baselines in Phase 6B evaluate `COUNT(chain_events)` — **never** `COUNT(event_observations)`. Observation records describe provenance and lifecycle transitions, not additional Bitcoin events. Statistical distributions are never inflated by multi-source witnessing or lifecycle transitions.
 
 
 ---
