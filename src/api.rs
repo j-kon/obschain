@@ -754,6 +754,7 @@ async fn get_event_handler(
                 if let Ok(dists) = state.storage.get_baseline_distributions(baseline.id).await {
                     if !dists.is_empty() {
                         let mut exact_ranks = std::collections::HashMap::new();
+                        let mut exact_query_failed = false;
                         let defs = MetricRegistry::metrics_for_event_type(event.event_type);
                         for def in &defs {
                             if let Some(val) =
@@ -764,7 +765,7 @@ async fn get_event_handler(
                                     def.metric.as_str(),
                                     EventMetricExtractor::DEFAULT_METRIC_VERSION
                                 );
-                                if let Ok(Some((p, tail, pop))) = state
+                                match state
                                     .storage
                                     .get_exact_empirical_rank(
                                         &baseline.network,
@@ -778,54 +779,69 @@ async fn get_event_handler(
                                     )
                                     .await
                                 {
-                                    exact_ranks.insert(def.metric, (p, tail, pop));
+                                    Ok(Some((p, tail, pop))) => {
+                                        exact_ranks.insert(def.metric, (p, tail, pop));
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            metric = %def.metric.as_str(),
+                                            "Database error querying exact empirical rank for event enrichment; skipping rarity to avoid false fallback"
+                                        );
+                                        exact_query_failed = true;
+                                        break;
+                                    }
                                 }
                             }
                         }
 
-                        let rarity_ctx = BaselineEngine::evaluate_event_rarity_with_exact_ranks(
-                            &event,
-                            &baseline,
-                            &dists,
-                            &exact_ranks,
-                            state.baseline_min_sample_size,
-                        );
-                        let quality = dists
-                            .iter()
-                            .find(|d| {
-                                d.event_type == event.event_type
-                                    && d.metric == rarity_ctx.primary.metric
-                            })
-                            .map(|d| d.quality.as_str())
-                            .unwrap_or("INSUFFICIENT");
+                        if !exact_query_failed {
+                            let rarity_ctx = BaselineEngine::evaluate_event_rarity_with_exact_ranks(
+                                &event,
+                                &baseline,
+                                &dists,
+                                &exact_ranks,
+                                state.baseline_min_sample_size,
+                            );
+                            let quality = dists
+                                .iter()
+                                .find(|d| {
+                                    d.event_type == event.event_type
+                                        && d.metric == rarity_ctx.primary.metric
+                                })
+                                .map(|d| d.quality.as_str())
+                                .unwrap_or("INSUFFICIENT");
 
-                        val["rarity"] = serde_json::json!({
-                            "baseline_id": baseline.id,
-                            "primary": {
-                                "metric": rarity_ctx.primary.metric.as_str(),
-                                "value": rarity_ctx.primary.value.to_numeric_string(),
-                                "percentile": rarity_ctx.primary.percentile,
-                                "percentile_method": rarity_ctx.primary.percentile_method.map(|m| m.as_str()),
-                                "estimated": rarity_ctx.primary.estimated,
-                                "rarity_band": rarity_ctx.primary.rarity_band.as_str(),
-                                "band": rarity_ctx.primary.rarity_band.as_str(),
-                                "population_size": rarity_ctx.primary.population_size,
-                                "tail_count": rarity_ctx.primary.tail_count,
-                                "baseline_quality": rarity_ctx.primary.baseline_quality.map(|q| q.as_str()).unwrap_or(quality),
-                            },
-                            "secondary": rarity_ctx.secondary.iter().map(|s| serde_json::json!({
-                                "metric": s.metric.as_str(),
-                                "value": s.value.to_numeric_string(),
-                                "percentile": s.percentile,
-                                "percentile_method": s.percentile_method.map(|m| m.as_str()),
-                                "estimated": s.estimated,
-                                "rarity_band": s.rarity_band.as_str(),
-                                "band": s.rarity_band.as_str(),
-                                "population_size": s.population_size,
-                                "tail_count": s.tail_count,
-                                "baseline_quality": s.baseline_quality.map(|q| q.as_str()).unwrap_or(quality),
-                            })).collect::<Vec<_>>(),
-                        });
+                            val["rarity"] = serde_json::json!({
+                                "baseline_id": baseline.id,
+                                "primary": {
+                                    "metric": rarity_ctx.primary.metric.as_str(),
+                                    "value": rarity_ctx.primary.value.to_numeric_string(),
+                                    "percentile": rarity_ctx.primary.percentile,
+                                    "percentile_method": rarity_ctx.primary.percentile_method.map(|m| m.as_str()),
+                                    "estimated": rarity_ctx.primary.estimated,
+                                    "rarity_band": rarity_ctx.primary.rarity_band.as_str(),
+                                    "band": rarity_ctx.primary.rarity_band.as_str(),
+                                    "population_size": rarity_ctx.primary.population_size,
+                                    "tail_count": rarity_ctx.primary.tail_count,
+                                    "baseline_quality": rarity_ctx.primary.baseline_quality.map(|q| q.as_str()).unwrap_or(quality),
+                                },
+                                "secondary": rarity_ctx.secondary.iter().map(|s| serde_json::json!({
+                                    "metric": s.metric.as_str(),
+                                    "value": s.value.to_numeric_string(),
+                                    "percentile": s.percentile,
+                                    "percentile_method": s.percentile_method.map(|m| m.as_str()),
+                                    "estimated": s.estimated,
+                                    "rarity_band": s.rarity_band.as_str(),
+                                    "band": s.rarity_band.as_str(),
+                                    "population_size": s.population_size,
+                                    "tail_count": s.tail_count,
+                                    "baseline_quality": s.baseline_quality.map(|q| q.as_str()).unwrap_or(quality),
+                                })).collect::<Vec<_>>(),
+                                "impact": rarity_ctx.impact,
+                            });
+                        }
                     }
                 }
             }
