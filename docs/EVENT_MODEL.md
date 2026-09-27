@@ -177,3 +177,50 @@ ObsChain establishes a strict separation between logical Bitcoin events and obse
    - For anomaly rarity scoring and percentiles (Phase 6B), the statistical population is always `COUNT(chain_events)`.
    - `COUNT(event_observations)` is NEVER used for population sizing, as multiple witnesses or lifecycle transitions do not represent additional Bitcoin events.
 
+---
+
+## Event Rarity Context & Impact Intelligence (Phase 6B)
+
+Each canonical `ChainEvent` can be evaluated against precomputed empirical baselines to answer: *How unusual is this event compared with Bitcoin history?*
+
+### Event Rarity Structure
+```json
+{
+  "rarity": {
+    "baseline_id": "9c2b1a4f-...",
+    "primary": {
+      "metric": "dormant_value_sats",
+      "value": "428104000000",
+      "percentile": 99.94,
+      "tail_count": 11,
+      "population_size": 18421,
+      "rarity_band": "EXTREME"
+    },
+    "secondary": [
+      {
+        "metric": "oldest_input_age_days",
+        "value": "4526",
+        "percentile": 99.72,
+        "tail_count": 52,
+        "population_size": 18421,
+        "rarity_band": "EXTREME"
+      }
+    ],
+    "impact": {
+      "model_version": "obschain-impact-v1",
+      "status": "EXPERIMENTAL",
+      "total_score": 72.4,
+      "components": [
+        { "component_name": "Value anomaly", "weight": 25.0, "points_awarded": 24.9, "percentile": 99.94 },
+        { "component_name": "Coin-age anomaly", "weight": 25.0, "points_awarded": 24.9, "percentile": 99.72 }
+      ]
+    }
+  }
+}
+```
+
+- **Rarity Bands**: `COMMON` (<90%), `NOTABLE` (90–95%), `UNUSUAL` (95–99%), `RARE` (99–99.9%), `EXTREME` (>=99.9%), or `INSUFFICIENT_DATA` (sample size < 100).
+- **Evaluation Mode**: `RETROSPECTIVE` if the baseline includes blocks after the event; `POINT_IN_TIME` if the baseline only includes blocks confirmed before the event.
+
+See [docs/HISTORICAL_BASELINES.md](HISTORICAL_BASELINES.md) for full statistical models and metric registries.
+

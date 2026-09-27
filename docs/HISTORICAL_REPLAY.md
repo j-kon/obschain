@@ -345,3 +345,16 @@ Response:
 
 ### 5. Research Event Queries
 `GET /api/v1/events?from_height=900000&to_height=901000&observation_mode=historical_replay&event_type=large_transaction&limit=50`
+
+---
+
+## 7. Relationship with Historical Baselines (Phase 6B)
+
+Historical Replay serves as the foundation for **Historical Baselines & Rarity Intelligence**:
+
+1. **Replay Ingestion**: As blocks are processed through `HistoricalReplayEngine`, detected anomalies are persisted as canonical `chain_events` (with deterministic UUID v5 identity) and provenance occurrences in `event_observations`.
+2. **Baseline Population**: Baseline generation (`BaselineEngine`) aggregates statistical distributions strictly over unique canonical events (`chain_events`), never double-counting duplicate replays of the same block.
+3. **Contiguous Coverage**: Baseline computations verify that requested block height windows have contiguous replay coverage before computing distributions.
+4. **Quantile Derivation**: Historical events are evaluated against computed discrete quantiles (`percentile_disc`) to deliver empirical rarity percentiles without arbitrary hype scores.
+
+See [docs/HISTORICAL_BASELINES.md](HISTORICAL_BASELINES.md) for complete details on baseline runs, metric extraction, and rarity intelligence.

@@ -1,4 +1,5 @@
 pub mod amount;
+pub mod baseline;
 pub mod error;
 pub mod event;
 pub mod fee;
@@ -12,6 +13,13 @@ pub use amount::{
     btc_str_to_sats, calculate_satoshi_days, safe_btc_f64_to_sats, satoshi_days_to_btc_days,
     AmountError, MAX_MONEY_SATS, SATS_PER_BTC,
 };
+pub use baseline::{
+    BaselineDistribution, BaselineMetric, BaselineMetricDefinition, BaselineQuality, BaselineRun,
+    BaselineRunStatus, BaselineWindow, EvaluationMode, EventMetricExtractor, EventRarityContext,
+    EventRarityResult, HalvingEpoch, ImpactBreakdown, ImpactComponent, MetricRegistry, MetricUnit,
+    MetricValue, QuantileDistribution, RarityBand, RarityDirection,
+};
+
 pub use error::CoreError;
 pub use event::{
     ChainEvent, ConfidenceLevel, ConsolidationMetadata, DormantClassification,

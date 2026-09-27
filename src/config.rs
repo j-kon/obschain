@@ -151,6 +151,11 @@ pub struct AppConfig {
     pub replay_tx_cache_limit: usize,
     pub replay_db_concurrency: usize,
     pub replay_api_enabled: bool,
+    // Phase 6B Historical Baselines Configuration
+    pub baseline_api_enabled: bool,
+    pub baseline_default_algorithm_version: String,
+    pub impact_default_model_version: String,
+    pub baseline_min_sample_size: u64,
 }
 
 impl AppConfig {
@@ -379,6 +384,23 @@ impl AppConfig {
             .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
             .unwrap_or(false);
 
+        // Phase 6B Historical Baselines Configuration
+        let baseline_api_enabled = std::env::var("OBSCHAIN_BASELINE_API_ENABLED")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false);
+
+        let baseline_default_algorithm_version =
+            std::env::var("OBSCHAIN_BASELINE_ALGORITHM_VERSION")
+                .unwrap_or_else(|_| "obschain-baseline-v1".to_string());
+
+        let impact_default_model_version = std::env::var("OBSCHAIN_IMPACT_MODEL_VERSION")
+            .unwrap_or_else(|_| "obschain-impact-v1".to_string());
+
+        let baseline_min_sample_size = std::env::var("OBSCHAIN_BASELINE_MIN_SAMPLE_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+
         Self {
             host,
             port,
@@ -429,6 +451,10 @@ impl AppConfig {
             replay_tx_cache_limit,
             replay_db_concurrency,
             replay_api_enabled,
+            baseline_api_enabled,
+            baseline_default_algorithm_version,
+            impact_default_model_version,
+            baseline_min_sample_size,
         }
     }
 

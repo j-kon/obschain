@@ -5,9 +5,10 @@ use std::{
 
 use chrono::Utc;
 use obschain_core::{
-    ActivityStatus, ChainEvent, ConfidenceLevel, EventObservation, EventObservationKind,
-    EventSeverity, EventType, Incident, IncidentActivity, IncidentAlert, ObservationMode,
-    ReplayCheckpoint, ReplayJob, WatchTarget,
+    ActivityStatus, BaselineDistribution, BaselineMetric, BaselineRun, BaselineRunStatus,
+    ChainEvent, ConfidenceLevel, EventObservation, EventObservationKind, EventRarityResult,
+    EventSeverity, EventType, ImpactBreakdown, Incident, IncidentActivity, IncidentAlert,
+    ObservationMode, ReplayCheckpoint, ReplayJob, WatchTarget,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -146,6 +147,74 @@ pub trait IncidentAlertRepository: Send + Sync {
     async fn get_alert_by_id(&self, id: Uuid) -> Result<Option<IncidentAlert>, StorageError>;
 }
 
+#[async_trait::async_trait]
+pub trait BaselineRepository: Send + Sync {
+    async fn create_baseline_run(&self, run: &BaselineRun) -> Result<(), StorageError>;
+
+    async fn update_baseline_run_status(
+        &self,
+        id: Uuid,
+        status: BaselineRunStatus,
+        completed_at: Option<chrono::DateTime<Utc>>,
+        canonical_event_count: u64,
+        error_message: Option<String>,
+    ) -> Result<(), StorageError>;
+
+    async fn get_baseline_run(&self, id: Uuid) -> Result<Option<BaselineRun>, StorageError>;
+
+    async fn list_baseline_runs(
+        &self,
+        network: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<BaselineRun>, StorageError>;
+
+    async fn get_latest_compatible_baseline_run(
+        &self,
+        network: &str,
+        height: Option<u64>,
+        version: Option<&str>,
+    ) -> Result<Option<BaselineRun>, StorageError>;
+
+    async fn save_baseline_distributions(
+        &self,
+        distributions: &[BaselineDistribution],
+    ) -> Result<(), StorageError>;
+
+    async fn get_baseline_distributions(
+        &self,
+        baseline_run_id: Uuid,
+    ) -> Result<Vec<BaselineDistribution>, StorageError>;
+
+    async fn query_distributions(
+        &self,
+        event_type: Option<EventType>,
+        metric: Option<BaselineMetric>,
+        limit: usize,
+    ) -> Result<Vec<BaselineDistribution>, StorageError>;
+
+    async fn save_event_rarity(
+        &self,
+        rarity: &EventRarityResult,
+        impact_breakdown: Option<&ImpactBreakdown>,
+    ) -> Result<(), StorageError>;
+
+    async fn get_event_rarity(
+        &self,
+        event_id: Uuid,
+        baseline_run_id: Option<Uuid>,
+    ) -> Result<Vec<EventRarityResult>, StorageError>;
+
+    async fn query_events_for_baseline(
+        &self,
+        event_type: Option<EventType>,
+        start_height: u64,
+        end_height: u64,
+    ) -> Result<Vec<ChainEvent>, StorageError>;
+}
+
+type EventRarityEntry = (EventRarityResult, Option<ImpactBreakdown>);
+
 /// Thread-safe in-memory event, incident, watch target, and activity store with bounded retention.
 /// Uses circular VecDeques to bound maximum memory consumption.
 #[derive(Clone)]
@@ -158,6 +227,9 @@ pub struct InMemoryStorage {
     alerts: Arc<RwLock<VecDeque<IncidentAlert>>>,
     replay_jobs: Arc<RwLock<Vec<ReplayJob>>>,
     replay_checkpoints: Arc<RwLock<Vec<ReplayCheckpoint>>>,
+    baseline_runs: Arc<RwLock<Vec<BaselineRun>>>,
+    baseline_distributions: Arc<RwLock<Vec<BaselineDistribution>>>,
+    event_rarity: Arc<RwLock<Vec<EventRarityEntry>>>,
     max_events: usize,
     max_activities: usize,
 }
@@ -194,6 +266,9 @@ impl InMemoryStorage {
             ))),
             replay_jobs: Arc::new(RwLock::new(Vec::new())),
             replay_checkpoints: Arc::new(RwLock::new(Vec::new())),
+            baseline_runs: Arc::new(RwLock::new(Vec::new())),
+            baseline_distributions: Arc::new(RwLock::new(Vec::new())),
+            event_rarity: Arc::new(RwLock::new(Vec::new())),
             max_events,
             max_activities,
         };
@@ -216,6 +291,9 @@ impl InMemoryStorage {
             ))),
             replay_jobs: Arc::new(RwLock::new(Vec::new())),
             replay_checkpoints: Arc::new(RwLock::new(Vec::new())),
+            baseline_runs: Arc::new(RwLock::new(Vec::new())),
+            baseline_distributions: Arc::new(RwLock::new(Vec::new())),
+            event_rarity: Arc::new(RwLock::new(Vec::new())),
             max_events,
             max_activities: Self::DEFAULT_MAX_ACTIVITIES,
         };
@@ -937,6 +1015,233 @@ impl ReplayRepository for InMemoryStorage {
             .max_by_key(|c| c.completed_height)
             .cloned();
         Ok(latest)
+    }
+}
+
+#[async_trait::async_trait]
+impl BaselineRepository for InMemoryStorage {
+    async fn create_baseline_run(&self, run: &BaselineRun) -> Result<(), StorageError> {
+        let mut lock = self
+            .baseline_runs
+            .write()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        if let Some(pos) = lock.iter().position(|r| r.id == run.id) {
+            lock[pos] = run.clone();
+        } else {
+            lock.push(run.clone());
+        }
+        Ok(())
+    }
+
+    async fn update_baseline_run_status(
+        &self,
+        id: Uuid,
+        status: BaselineRunStatus,
+        completed_at: Option<chrono::DateTime<Utc>>,
+        canonical_event_count: u64,
+        error_message: Option<String>,
+    ) -> Result<(), StorageError> {
+        let mut lock = self
+            .baseline_runs
+            .write()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        if let Some(pos) = lock.iter().position(|r| r.id == id) {
+            lock[pos].status = status;
+            lock[pos].completed_at = completed_at;
+            lock[pos].canonical_event_count = canonical_event_count;
+            lock[pos].error_message = error_message;
+            Ok(())
+        } else {
+            Err(StorageError::NotFound(format!(
+                "BaselineRun {id} not found"
+            )))
+        }
+    }
+
+    async fn get_baseline_run(&self, id: Uuid) -> Result<Option<BaselineRun>, StorageError> {
+        let lock = self
+            .baseline_runs
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(lock.iter().find(|r| r.id == id).cloned())
+    }
+
+    async fn list_baseline_runs(
+        &self,
+        network: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<BaselineRun>, StorageError> {
+        let lock = self
+            .baseline_runs
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut runs: Vec<BaselineRun> = lock
+            .iter()
+            .filter(|r| network.map(|n| r.network == n).unwrap_or(true))
+            .cloned()
+            .collect();
+        runs.sort_by_key(|b| std::cmp::Reverse(b.created_at));
+        let res = runs.into_iter().skip(offset).take(limit).collect();
+        Ok(res)
+    }
+
+    async fn get_latest_compatible_baseline_run(
+        &self,
+        network: &str,
+        height: Option<u64>,
+        version: Option<&str>,
+    ) -> Result<Option<BaselineRun>, StorageError> {
+        let lock = self
+            .baseline_runs
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut matching: Vec<BaselineRun> = lock
+            .iter()
+            .filter(|r| {
+                r.network == network
+                    && r.status == BaselineRunStatus::Completed
+                    && height.map(|h| r.start_height <= h).unwrap_or(true)
+                    && version.map(|v| r.algorithm_version == v).unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+
+        matching.sort_by(|a, b| {
+            b.end_height
+                .cmp(&a.end_height)
+                .then_with(|| b.completed_at.cmp(&a.completed_at))
+        });
+
+        Ok(matching.into_iter().next())
+    }
+
+    async fn save_baseline_distributions(
+        &self,
+        distributions: &[BaselineDistribution],
+    ) -> Result<(), StorageError> {
+        let mut lock = self
+            .baseline_distributions
+            .write()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        for dist in distributions {
+            if let Some(pos) = lock.iter().position(|d| {
+                d.baseline_run_id == dist.baseline_run_id
+                    && d.event_type == dist.event_type
+                    && d.metric == dist.metric
+            }) {
+                lock[pos] = dist.clone();
+            } else {
+                lock.push(dist.clone());
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_baseline_distributions(
+        &self,
+        baseline_run_id: Uuid,
+    ) -> Result<Vec<BaselineDistribution>, StorageError> {
+        let lock = self
+            .baseline_distributions
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(lock
+            .iter()
+            .filter(|d| d.baseline_run_id == baseline_run_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn query_distributions(
+        &self,
+        event_type: Option<EventType>,
+        metric: Option<BaselineMetric>,
+        limit: usize,
+    ) -> Result<Vec<BaselineDistribution>, StorageError> {
+        let lock = self
+            .baseline_distributions
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let res = lock
+            .iter()
+            .filter(|d| {
+                event_type.map(|et| d.event_type == et).unwrap_or(true)
+                    && metric.map(|m| d.metric == m).unwrap_or(true)
+            })
+            .take(limit)
+            .cloned()
+            .collect();
+        Ok(res)
+    }
+
+    async fn save_event_rarity(
+        &self,
+        rarity: &EventRarityResult,
+        impact_breakdown: Option<&ImpactBreakdown>,
+    ) -> Result<(), StorageError> {
+        let mut lock = self
+            .event_rarity
+            .write()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        if let Some(pos) = lock.iter().position(|(r, _)| {
+            r.event_id == rarity.event_id
+                && r.baseline_run_id == rarity.baseline_run_id
+                && r.metric == rarity.metric
+        }) {
+            lock[pos] = (rarity.clone(), impact_breakdown.cloned());
+        } else {
+            lock.push((rarity.clone(), impact_breakdown.cloned()));
+        }
+        Ok(())
+    }
+
+    async fn get_event_rarity(
+        &self,
+        event_id: Uuid,
+        baseline_run_id: Option<Uuid>,
+    ) -> Result<Vec<EventRarityResult>, StorageError> {
+        let lock = self
+            .event_rarity
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let res = lock
+            .iter()
+            .filter(|(r, _)| {
+                r.event_id == event_id
+                    && baseline_run_id
+                        .map(|bid| r.baseline_run_id == bid)
+                        .unwrap_or(true)
+            })
+            .map(|(r, _)| r.clone())
+            .collect();
+        Ok(res)
+    }
+
+    async fn query_events_for_baseline(
+        &self,
+        event_type: Option<EventType>,
+        start_height: u64,
+        end_height: u64,
+    ) -> Result<Vec<ChainEvent>, StorageError> {
+        let lock = self
+            .events
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let res: Vec<ChainEvent> = lock
+            .iter()
+            .filter(|e| {
+                if let Some(h) = e.block_height {
+                    h >= start_height
+                        && h <= end_height
+                        && event_type.map(|et| e.event_type == et).unwrap_or(true)
+                } else {
+                    false
+                }
+            })
+            .cloned()
+            .collect();
+        Ok(res)
     }
 }
 

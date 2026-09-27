@@ -3,14 +3,19 @@ pub mod repository;
 
 pub use postgres::PostgresStorage;
 pub use repository::{
-    i64_to_u64_checked, u64_to_i64_checked, EventFilter, EventRepository, InMemoryStorage,
-    IncidentActivityRepository, IncidentAlertRepository, IncidentRepository, ReplayRepository,
-    StorageError, WatchTargetRepository,
+    i64_to_u64_checked, u64_to_i64_checked, BaselineRepository, EventFilter, EventRepository,
+    InMemoryStorage, IncidentActivityRepository, IncidentAlertRepository, IncidentRepository,
+    ReplayRepository, StorageError, WatchTargetRepository,
 };
 
+use chrono::{DateTime, Utc};
+use obschain_core::baseline::{
+    BaselineDistribution, BaselineMetric, BaselineRun, BaselineRunStatus, EventRarityResult,
+    ImpactBreakdown,
+};
 use obschain_core::{
-    ActivityStatus, ChainEvent, EventObservation, Incident, IncidentActivity, IncidentAlert,
-    ReplayCheckpoint, ReplayJob, WatchTarget,
+    ActivityStatus, ChainEvent, EventObservation, EventType, Incident, IncidentActivity,
+    IncidentAlert, ReplayCheckpoint, ReplayJob, WatchTarget,
 };
 use uuid::Uuid;
 
@@ -375,6 +380,157 @@ impl ReplayRepository for Storage {
         match self {
             Self::Memory(m) => m.get_latest_checkpoint(job_id).await,
             Self::Postgres(p) => p.get_latest_checkpoint(job_id).await,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl BaselineRepository for Storage {
+    async fn create_baseline_run(&self, run: &BaselineRun) -> Result<(), StorageError> {
+        match self {
+            Self::Memory(m) => m.create_baseline_run(run).await,
+            Self::Postgres(p) => p.create_baseline_run(run).await,
+        }
+    }
+
+    async fn update_baseline_run_status(
+        &self,
+        id: Uuid,
+        status: BaselineRunStatus,
+        completed_at: Option<DateTime<Utc>>,
+        canonical_event_count: u64,
+        error_message: Option<String>,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Memory(m) => {
+                m.update_baseline_run_status(
+                    id,
+                    status,
+                    completed_at,
+                    canonical_event_count,
+                    error_message,
+                )
+                .await
+            }
+            Self::Postgres(p) => {
+                p.update_baseline_run_status(
+                    id,
+                    status,
+                    completed_at,
+                    canonical_event_count,
+                    error_message,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn get_baseline_run(&self, id: Uuid) -> Result<Option<BaselineRun>, StorageError> {
+        match self {
+            Self::Memory(m) => m.get_baseline_run(id).await,
+            Self::Postgres(p) => p.get_baseline_run(id).await,
+        }
+    }
+
+    async fn list_baseline_runs(
+        &self,
+        network: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<BaselineRun>, StorageError> {
+        match self {
+            Self::Memory(m) => m.list_baseline_runs(network, limit, offset).await,
+            Self::Postgres(p) => p.list_baseline_runs(network, limit, offset).await,
+        }
+    }
+
+    async fn get_latest_compatible_baseline_run(
+        &self,
+        network: &str,
+        height: Option<u64>,
+        version: Option<&str>,
+    ) -> Result<Option<BaselineRun>, StorageError> {
+        match self {
+            Self::Memory(m) => {
+                m.get_latest_compatible_baseline_run(network, height, version)
+                    .await
+            }
+            Self::Postgres(p) => {
+                p.get_latest_compatible_baseline_run(network, height, version)
+                    .await
+            }
+        }
+    }
+
+    async fn save_baseline_distributions(
+        &self,
+        distributions: &[BaselineDistribution],
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Memory(m) => m.save_baseline_distributions(distributions).await,
+            Self::Postgres(p) => p.save_baseline_distributions(distributions).await,
+        }
+    }
+
+    async fn get_baseline_distributions(
+        &self,
+        baseline_run_id: Uuid,
+    ) -> Result<Vec<BaselineDistribution>, StorageError> {
+        match self {
+            Self::Memory(m) => m.get_baseline_distributions(baseline_run_id).await,
+            Self::Postgres(p) => p.get_baseline_distributions(baseline_run_id).await,
+        }
+    }
+
+    async fn query_distributions(
+        &self,
+        event_type: Option<EventType>,
+        metric: Option<BaselineMetric>,
+        limit: usize,
+    ) -> Result<Vec<BaselineDistribution>, StorageError> {
+        match self {
+            Self::Memory(m) => m.query_distributions(event_type, metric, limit).await,
+            Self::Postgres(p) => p.query_distributions(event_type, metric, limit).await,
+        }
+    }
+
+    async fn save_event_rarity(
+        &self,
+        rarity: &EventRarityResult,
+        impact_breakdown: Option<&ImpactBreakdown>,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Memory(m) => m.save_event_rarity(rarity, impact_breakdown).await,
+            Self::Postgres(p) => p.save_event_rarity(rarity, impact_breakdown).await,
+        }
+    }
+
+    async fn get_event_rarity(
+        &self,
+        event_id: Uuid,
+        baseline_run_id: Option<Uuid>,
+    ) -> Result<Vec<EventRarityResult>, StorageError> {
+        match self {
+            Self::Memory(m) => m.get_event_rarity(event_id, baseline_run_id).await,
+            Self::Postgres(p) => p.get_event_rarity(event_id, baseline_run_id).await,
+        }
+    }
+
+    async fn query_events_for_baseline(
+        &self,
+        event_type: Option<EventType>,
+        start_height: u64,
+        end_height: u64,
+    ) -> Result<Vec<ChainEvent>, StorageError> {
+        match self {
+            Self::Memory(m) => {
+                m.query_events_for_baseline(event_type, start_height, end_height)
+                    .await
+            }
+            Self::Postgres(p) => {
+                p.query_events_for_baseline(event_type, start_height, end_height)
+                    .await
+            }
         }
     }
 }

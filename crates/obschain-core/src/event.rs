@@ -25,7 +25,7 @@ pub enum ConfidenceLevel {
 }
 
 /// Categorized type of chain event detected.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum EventType {
     LargeTransfer,
@@ -401,6 +401,24 @@ impl ChainEvent {
     pub fn with_typed_metadata<T: Serialize>(mut self, meta: &T) -> Self {
         if let Ok(val) = serde_json::to_value(meta) {
             self.metadata = val;
+        }
+        self
+    }
+
+    /// Retrieves the network name associated with this event from metadata if present.
+    pub fn network(&self) -> Option<&str> {
+        self.metadata.get("network").and_then(|v| v.as_str())
+    }
+
+    /// Sets the network name in event metadata.
+    pub fn with_network(mut self, network: impl Into<String>) -> Self {
+        if let Some(obj) = self.metadata.as_object_mut() {
+            obj.insert(
+                "network".to_string(),
+                serde_json::Value::String(network.into()),
+            );
+        } else {
+            self.metadata = serde_json::json!({ "network": network.into() });
         }
         self
     }

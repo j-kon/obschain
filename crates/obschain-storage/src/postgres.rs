@@ -12,11 +12,16 @@ use obschain_core::{
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+use obschain_core::baseline::{
+    BaselineDistribution, BaselineMetric, BaselineQuality, BaselineRun, BaselineRunStatus,
+    EvaluationMode, EventRarityResult, ImpactBreakdown, MetricUnit, MetricValue, RarityBand,
+};
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::repository::{
-    i64_to_u64_checked, u64_to_i64_checked, EventFilter, EventRepository,
+    i64_to_u64_checked, u64_to_i64_checked, BaselineRepository, EventFilter, EventRepository,
     IncidentActivityRepository, IncidentAlertRepository, IncidentRepository, ReplayRepository,
     StorageError, WatchTargetRepository,
 };
@@ -2789,4 +2794,678 @@ impl ReplayRepository for PostgresStorage {
             checkpointed_at: row.get("checkpointed_at"),
         }))
     }
+}
+
+// ---------------------------------------------------------------------------
+// BaselineRepository Implementation
+// ---------------------------------------------------------------------------
+
+#[async_trait::async_trait]
+impl BaselineRepository for PostgresStorage {
+    async fn create_baseline_run(&self, run: &BaselineRun) -> Result<(), StorageError> {
+        let start_height_i64 = u64_to_i64_checked(run.start_height)?;
+        let end_height_i64 = u64_to_i64_checked(run.end_height)?;
+        let canonical_count_i64 = u64_to_i64_checked(run.canonical_event_count)?;
+        let status_str = run.status.as_str();
+
+        sqlx::query(
+            r#"
+            INSERT INTO baseline_runs (
+                id, network, start_height, end_height, started_at, completed_at,
+                status, algorithm_version, canonical_event_count, error_message,
+                metadata, created_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            ON CONFLICT (id) DO UPDATE SET
+                status = EXCLUDED.status,
+                completed_at = EXCLUDED.completed_at,
+                canonical_event_count = EXCLUDED.canonical_event_count,
+                error_message = EXCLUDED.error_message,
+                metadata = EXCLUDED.metadata
+            "#,
+        )
+        .bind(run.id)
+        .bind(&run.network)
+        .bind(start_height_i64)
+        .bind(end_height_i64)
+        .bind(run.started_at)
+        .bind(run.completed_at)
+        .bind(status_str)
+        .bind(&run.algorithm_version)
+        .bind(canonical_count_i64)
+        .bind(&run.error_message)
+        .bind(&run.metadata)
+        .bind(run.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn update_baseline_run_status(
+        &self,
+        id: Uuid,
+        status: BaselineRunStatus,
+        completed_at: Option<DateTime<Utc>>,
+        canonical_event_count: u64,
+        error_message: Option<String>,
+    ) -> Result<(), StorageError> {
+        let canonical_count_i64 = u64_to_i64_checked(canonical_event_count)?;
+        let status_str = status.as_str();
+
+        let rows_affected = sqlx::query(
+            r#"
+            UPDATE baseline_runs
+            SET status = $2,
+                completed_at = $3,
+                canonical_event_count = $4,
+                error_message = $5
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .bind(status_str)
+        .bind(completed_at)
+        .bind(canonical_count_i64)
+        .bind(error_message)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?
+        .rows_affected();
+
+        if rows_affected == 0 {
+            return Err(StorageError::NotFound(format!(
+                "BaselineRun {id} not found"
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn get_baseline_run(&self, id: Uuid) -> Result<Option<BaselineRun>, StorageError> {
+        let row_opt = sqlx::query(
+            r#"
+            SELECT id, network, start_height, end_height, started_at, completed_at,
+                   status, algorithm_version, canonical_event_count, error_message,
+                   metadata, created_at
+            FROM baseline_runs
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let Some(row) = row_opt else {
+            return Ok(None);
+        };
+
+        row_to_baseline_run(&row).map(Some)
+    }
+
+    async fn list_baseline_runs(
+        &self,
+        network: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<BaselineRun>, StorageError> {
+        let limit_i64 = limit.clamp(1, 200) as i64;
+        let offset_i64 = offset as i64;
+
+        let rows = sqlx::query(
+            r#"
+            SELECT id, network, start_height, end_height, started_at, completed_at,
+                   status, algorithm_version, canonical_event_count, error_message,
+                   metadata, created_at
+            FROM baseline_runs
+            WHERE ($1::VARCHAR IS NULL OR network = $1)
+            ORDER BY created_at DESC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(network)
+        .bind(limit_i64)
+        .bind(offset_i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut runs = Vec::with_capacity(rows.len());
+        for row in rows {
+            runs.push(row_to_baseline_run(&row)?);
+        }
+
+        Ok(runs)
+    }
+
+    async fn get_latest_compatible_baseline_run(
+        &self,
+        network: &str,
+        height: Option<u64>,
+        version: Option<&str>,
+    ) -> Result<Option<BaselineRun>, StorageError> {
+        let height_i64 = match height {
+            Some(h) => Some(u64_to_i64_checked(h)?),
+            None => None,
+        };
+
+        let row_opt = sqlx::query(
+            r#"
+            SELECT id, network, start_height, end_height, started_at, completed_at,
+                   status, algorithm_version, canonical_event_count, error_message,
+                   metadata, created_at
+            FROM baseline_runs
+            WHERE network = $1
+              AND status = 'COMPLETED'
+              AND ($2::BIGINT IS NULL OR start_height <= $2)
+              AND ($3::VARCHAR IS NULL OR algorithm_version = $3)
+            ORDER BY end_height DESC, completed_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(network)
+        .bind(height_i64)
+        .bind(version)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let Some(row) = row_opt else {
+            return Ok(None);
+        };
+
+        row_to_baseline_run(&row).map(Some)
+    }
+
+    async fn save_baseline_distributions(
+        &self,
+        distributions: &[BaselineDistribution],
+    ) -> Result<(), StorageError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        for dist in distributions {
+            let event_type_str = serde_json::to_string(&dist.event_type)
+                .map_err(StorageError::Serialization)?
+                .trim_matches('"')
+                .to_string();
+            let metric_str = serde_json::to_string(&dist.metric)
+                .map_err(StorageError::Serialization)?
+                .trim_matches('"')
+                .to_string();
+            let unit_str = dist.unit.as_str();
+            let quality_str = dist.quality.as_str();
+            let mean_str = format!("{:.4}", dist.mean);
+
+            sqlx::query(
+                r#"
+                INSERT INTO baseline_distributions (
+                    id, baseline_run_id, event_type, metric, unit, sample_count,
+                    candidate_count, missing_count, coverage_ratio,
+                    minimum, maximum, mean, p50, p75, p90, p95, p99, p999,
+                    quality, samples_json, created_at
+                )
+                VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9,
+                    $10::NUMERIC, $11::NUMERIC, $12::NUMERIC, $13::NUMERIC, $14::NUMERIC,
+                    $15::NUMERIC, $16::NUMERIC, $17::NUMERIC, $18::NUMERIC,
+                    $19, $20, $21
+                )
+                ON CONFLICT (baseline_run_id, event_type, metric) DO UPDATE SET
+                    sample_count = EXCLUDED.sample_count,
+                    candidate_count = EXCLUDED.candidate_count,
+                    missing_count = EXCLUDED.missing_count,
+                    coverage_ratio = EXCLUDED.coverage_ratio,
+                    minimum = EXCLUDED.minimum,
+                    maximum = EXCLUDED.maximum,
+                    mean = EXCLUDED.mean,
+                    p50 = EXCLUDED.p50,
+                    p75 = EXCLUDED.p75,
+                    p90 = EXCLUDED.p90,
+                    p95 = EXCLUDED.p95,
+                    p99 = EXCLUDED.p99,
+                    p999 = EXCLUDED.p999,
+                    quality = EXCLUDED.quality,
+                    samples_json = EXCLUDED.samples_json
+                "#,
+            )
+            .bind(dist.id)
+            .bind(dist.baseline_run_id)
+            .bind(event_type_str)
+            .bind(metric_str)
+            .bind(unit_str)
+            .bind(u64_to_i64_checked(dist.sample_count)?)
+            .bind(u64_to_i64_checked(dist.candidate_count)?)
+            .bind(u64_to_i64_checked(dist.missing_count)?)
+            .bind(dist.coverage_ratio)
+            .bind(dist.minimum.to_numeric_string())
+            .bind(dist.maximum.to_numeric_string())
+            .bind(mean_str)
+            .bind(dist.p50.to_numeric_string())
+            .bind(dist.p75.to_numeric_string())
+            .bind(dist.p90.to_numeric_string())
+            .bind(dist.p95.to_numeric_string())
+            .bind(dist.p99.to_numeric_string())
+            .bind(dist.p999.to_numeric_string())
+            .bind(quality_str)
+            .bind(&dist.samples_json)
+            .bind(dist.created_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn get_baseline_distributions(
+        &self,
+        baseline_run_id: Uuid,
+    ) -> Result<Vec<BaselineDistribution>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, baseline_run_id, event_type, metric, unit, sample_count,
+                   candidate_count, missing_count, coverage_ratio,
+                   minimum::TEXT as minimum, maximum::TEXT as maximum, mean::FLOAT8 as mean,
+                   p50::TEXT as p50, p75::TEXT as p75, p90::TEXT as p90,
+                   p95::TEXT as p95, p99::TEXT as p99, p999::TEXT as p999,
+                   quality, samples_json, created_at
+            FROM baseline_distributions
+            WHERE baseline_run_id = $1
+            ORDER BY event_type ASC, metric ASC
+            "#,
+        )
+        .bind(baseline_run_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut dists = Vec::with_capacity(rows.len());
+        for row in rows {
+            dists.push(row_to_baseline_distribution(&row)?);
+        }
+
+        Ok(dists)
+    }
+
+    async fn query_distributions(
+        &self,
+        event_type: Option<EventType>,
+        metric: Option<BaselineMetric>,
+        limit: usize,
+    ) -> Result<Vec<BaselineDistribution>, StorageError> {
+        let limit_i64 = limit.clamp(1, 200) as i64;
+        let event_type_str = event_type.as_ref().map(|et| {
+            serde_json::to_string(et)
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string()
+        });
+        let metric_str = metric.as_ref().map(|m| {
+            serde_json::to_string(m)
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string()
+        });
+
+        let rows = sqlx::query(
+            r#"
+            SELECT id, baseline_run_id, event_type, metric, unit, sample_count,
+                   candidate_count, missing_count, coverage_ratio,
+                   minimum::TEXT as minimum, maximum::TEXT as maximum, mean::FLOAT8 as mean,
+                   p50::TEXT as p50, p75::TEXT as p75, p90::TEXT as p90,
+                   p95::TEXT as p95, p99::TEXT as p99, p999::TEXT as p999,
+                   quality, samples_json, created_at
+            FROM baseline_distributions
+            WHERE ($1::VARCHAR IS NULL OR event_type = $1)
+              AND ($2::VARCHAR IS NULL OR metric = $2)
+            ORDER BY created_at DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(event_type_str)
+        .bind(metric_str)
+        .bind(limit_i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut dists = Vec::with_capacity(rows.len());
+        for row in rows {
+            dists.push(row_to_baseline_distribution(&row)?);
+        }
+
+        Ok(dists)
+    }
+
+    async fn save_event_rarity(
+        &self,
+        rarity: &EventRarityResult,
+        impact_breakdown: Option<&ImpactBreakdown>,
+    ) -> Result<(), StorageError> {
+        let event_type_str = serde_json::to_string(&rarity.event_type)
+            .map_err(StorageError::Serialization)?
+            .trim_matches('"')
+            .to_string();
+        let metric_str = serde_json::to_string(&rarity.metric)
+            .map_err(StorageError::Serialization)?
+            .trim_matches('"')
+            .to_string();
+        let band_str = rarity.rarity_band.as_str();
+        let mode_str = rarity.evaluation_mode.as_str();
+        let impact_json = match impact_breakdown {
+            Some(ib) => Some(serde_json::to_value(ib)?),
+            None => None,
+        };
+        let impact_score = impact_breakdown.and_then(|ib| ib.total_score);
+
+        sqlx::query(
+            r#"
+            INSERT INTO event_rarity (
+                id, event_id, baseline_run_id, event_type, metric,
+                value_numeric, value_text, percentile, rarity_band,
+                population_size, tail_count, evaluation_mode,
+                impact_score, impact_json, created_at
+            )
+            VALUES (
+                $1, $2, $3, $4, $5,
+                $6::NUMERIC, $7, $8, $9,
+                $10, $11, $12,
+                $13, $14, NOW()
+            )
+            ON CONFLICT (event_id, baseline_run_id, metric) DO UPDATE SET
+                value_numeric = EXCLUDED.value_numeric,
+                value_text = EXCLUDED.value_text,
+                percentile = EXCLUDED.percentile,
+                rarity_band = EXCLUDED.rarity_band,
+                population_size = EXCLUDED.population_size,
+                tail_count = EXCLUDED.tail_count,
+                evaluation_mode = EXCLUDED.evaluation_mode,
+                impact_score = EXCLUDED.impact_score,
+                impact_json = EXCLUDED.impact_json
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(rarity.event_id)
+        .bind(rarity.baseline_run_id)
+        .bind(event_type_str)
+        .bind(metric_str)
+        .bind(rarity.value.to_numeric_string())
+        .bind(rarity.value.to_string())
+        .bind(rarity.percentile)
+        .bind(band_str)
+        .bind(u64_to_i64_checked(rarity.population_size)?)
+        .bind(u64_to_i64_checked(rarity.tail_count)?)
+        .bind(mode_str)
+        .bind(impact_score)
+        .bind(impact_json)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn get_event_rarity(
+        &self,
+        event_id: Uuid,
+        baseline_run_id: Option<Uuid>,
+    ) -> Result<Vec<EventRarityResult>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, event_id, baseline_run_id, event_type, metric,
+                   value_numeric::TEXT as value_numeric, value_text, percentile,
+                   rarity_band, population_size, tail_count, evaluation_mode
+            FROM event_rarity
+            WHERE event_id = $1
+              AND ($2::UUID IS NULL OR baseline_run_id = $2)
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(event_id)
+        .bind(baseline_run_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            let event_type_str: String = row.get("event_type");
+            let metric_str: String = row.get("metric");
+            let event_type: EventType = serde_json::from_str(&format!("\"{event_type_str}\""))
+                .unwrap_or(EventType::LargeTransfer);
+            let metric: BaselineMetric = metric_str.parse().unwrap_or(BaselineMetric::ValueSats);
+
+            let value_num_str: String = row.get("value_numeric");
+            let value = MetricValue::from_str_and_metric(&value_num_str, metric);
+
+            let band_str: String = row.get("rarity_band");
+            let rarity_band = band_str.parse::<RarityBand>().unwrap_or(RarityBand::Common);
+            let mode_str: String = row.get("evaluation_mode");
+            let evaluation_mode = mode_str
+                .parse::<EvaluationMode>()
+                .unwrap_or(EvaluationMode::Retrospective);
+
+            let pop_size_i64: i64 = row.get("population_size");
+            let tail_count_i64: i64 = row.get("tail_count");
+
+            results.push(EventRarityResult {
+                event_id: row.get("event_id"),
+                baseline_run_id: row.get("baseline_run_id"),
+                event_type,
+                metric,
+                value,
+                percentile: row.get("percentile"),
+                rarity_band,
+                population_size: i64_to_u64_checked(pop_size_i64)?,
+                tail_count: i64_to_u64_checked(tail_count_i64)?,
+                evaluation_mode,
+            });
+        }
+
+        Ok(results)
+    }
+
+    async fn query_events_for_baseline(
+        &self,
+        event_type: Option<EventType>,
+        start_height: u64,
+        end_height: u64,
+    ) -> Result<Vec<ChainEvent>, StorageError> {
+        let start_i64 = u64_to_i64_checked(start_height)?;
+        let end_i64 = u64_to_i64_checked(end_height)?;
+        let event_type_str = event_type.as_ref().map(|et| {
+            serde_json::to_string(et)
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string()
+        });
+
+        let rows = sqlx::query(
+            r#"
+            SELECT id, event_type, severity, confidence, title, description,
+                   COALESCE(event_time, detected_at) as event_time,
+                   COALESCE(first_observed_at, detected_at) as first_observed_at,
+                   detected_at, block_height, block_hash, txid, metadata, source,
+                   observation_mode, replay_job_id
+            FROM chain_events
+            WHERE block_height IS NOT NULL
+              AND block_height >= $1
+              AND block_height <= $2
+              AND ($3::VARCHAR IS NULL OR event_type = $3)
+            ORDER BY block_height ASC, detected_at ASC
+            "#,
+        )
+        .bind(start_i64)
+        .bind(end_i64)
+        .bind(event_type_str)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            let et_str: String = row.get("event_type");
+            let sev_str: String = row.get("severity");
+            let conf_str: String = row.get("confidence");
+
+            let event_type: EventType =
+                serde_json::from_str(&format!("\"{et_str}\"")).unwrap_or(EventType::LargeTransfer);
+            let severity: EventSeverity =
+                serde_json::from_str(&format!("\"{sev_str}\"")).unwrap_or(EventSeverity::Info);
+            let confidence: ConfidenceLevel = serde_json::from_str(&format!("\"{conf_str}\""))
+                .unwrap_or(ConfidenceLevel::Heuristic);
+
+            let bh_i64: Option<i64> = row.get("block_height");
+            let block_height = match bh_i64 {
+                Some(h) => Some(i64_to_u64_checked(h)?),
+                None => None,
+            };
+
+            let src_json: Option<serde_json::Value> = row.get("source");
+            let source = match src_json {
+                Some(v) => serde_json::from_value(v).ok(),
+                None => None,
+            };
+
+            let obs_mode_str: Option<String> = row.try_get("observation_mode").ok();
+            let observation_mode = obs_mode_str
+                .map(|s| match s.to_lowercase().as_str() {
+                    "historical_replay" => ObservationMode::HistoricalReplay,
+                    _ => ObservationMode::Live,
+                })
+                .unwrap_or(ObservationMode::Live);
+            let replay_job_id: Option<Uuid> = row.try_get("replay_job_id").ok().flatten();
+
+            let detected_at: DateTime<Utc> = row.get("detected_at");
+            let event_time: DateTime<Utc> = row.try_get("event_time").unwrap_or(detected_at);
+            let first_observed_at: DateTime<Utc> =
+                row.try_get("first_observed_at").unwrap_or(detected_at);
+
+            events.push(ChainEvent {
+                id: row.get("id"),
+                event_type,
+                severity,
+                confidence,
+                title: row.get("title"),
+                description: row.get("description"),
+                event_time,
+                first_observed_at,
+                detected_at,
+                block_height,
+                block_hash: row.get("block_hash"),
+                txid: row.get("txid"),
+                metadata: row.get("metadata"),
+                witnesses: source
+                    .clone()
+                    .map(|s| vec![obschain_core::ObservationWitness::new(s)])
+                    .unwrap_or_default(),
+                source,
+                observation_mode,
+                replay_job_id,
+                observations: Vec::new(),
+            });
+        }
+
+        Ok(events)
+    }
+}
+
+fn row_to_baseline_run(row: &sqlx::postgres::PgRow) -> Result<BaselineRun, StorageError> {
+    let start_height: i64 = row.get("start_height");
+    let end_height: i64 = row.get("end_height");
+    let status_str: String = row.get("status");
+    let status = status_str
+        .parse::<BaselineRunStatus>()
+        .unwrap_or(BaselineRunStatus::Pending);
+    let event_count: i64 = row.get("canonical_event_count");
+
+    Ok(BaselineRun {
+        id: row.get("id"),
+        network: row.get("network"),
+        start_height: i64_to_u64_checked(start_height)?,
+        end_height: i64_to_u64_checked(end_height)?,
+        started_at: row.get("started_at"),
+        completed_at: row.get("completed_at"),
+        status,
+        algorithm_version: row.get("algorithm_version"),
+        canonical_event_count: i64_to_u64_checked(event_count)?,
+        error_message: row.get("error_message"),
+        metadata: row.get("metadata"),
+        created_at: row.get("created_at"),
+    })
+}
+
+fn row_to_baseline_distribution(
+    row: &sqlx::postgres::PgRow,
+) -> Result<BaselineDistribution, StorageError> {
+    let event_type_str: String = row.get("event_type");
+    let metric_str: String = row.get("metric");
+    let unit_str: String = row.get("unit");
+    let quality_str: String = row.get("quality");
+
+    let event_type: EventType =
+        serde_json::from_str(&format!("\"{event_type_str}\"")).unwrap_or(EventType::LargeTransfer);
+    let metric: BaselineMetric = metric_str.parse().unwrap_or(BaselineMetric::ValueSats);
+    let unit = unit_str.parse().unwrap_or(MetricUnit::Satoshis);
+    let quality = quality_str.parse().unwrap_or(BaselineQuality::Insufficient);
+
+    let sample_count: i64 = row.get("sample_count");
+    let candidate_count: i64 = row.get("candidate_count");
+    let missing_count: i64 = row.get("missing_count");
+    let coverage_ratio: f64 = row.get("coverage_ratio");
+    let mean: f64 = row.get("mean");
+
+    let min_str: String = row.get("minimum");
+    let max_str: String = row.get("maximum");
+    let p50_str: String = row.get("p50");
+    let p75_str: String = row.get("p75");
+    let p90_str: String = row.get("p90");
+    let p95_str: String = row.get("p95");
+    let p99_str: String = row.get("p99");
+    let p999_str: String = row.get("p999");
+
+    let minimum = MetricValue::from_str_and_metric(&min_str, metric);
+    let maximum = MetricValue::from_str_and_metric(&max_str, metric);
+    let p50 = MetricValue::from_str_and_metric(&p50_str, metric);
+    let p75 = MetricValue::from_str_and_metric(&p75_str, metric);
+    let p90 = MetricValue::from_str_and_metric(&p90_str, metric);
+    let p95 = MetricValue::from_str_and_metric(&p95_str, metric);
+    let p99 = MetricValue::from_str_and_metric(&p99_str, metric);
+    let p999 = MetricValue::from_str_and_metric(&p999_str, metric);
+
+    let samples_json: Option<serde_json::Value> = row.get("samples_json");
+
+    Ok(BaselineDistribution {
+        id: row.get("id"),
+        baseline_run_id: row.get("baseline_run_id"),
+        event_type,
+        metric,
+        unit,
+        sample_count: i64_to_u64_checked(sample_count)?,
+        candidate_count: i64_to_u64_checked(candidate_count)?,
+        missing_count: i64_to_u64_checked(missing_count)?,
+        coverage_ratio,
+        minimum,
+        maximum,
+        mean,
+        p50,
+        p75,
+        p90,
+        p95,
+        p99,
+        p999,
+        quality,
+        samples_json,
+        created_at: row.get("created_at"),
+    })
 }

@@ -14,16 +14,19 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Utc};
+use obschain_core::baseline::{BaselineMetric, BaselineRunStatus};
 use obschain_core::{
     ActivityStatus, ChainEvent, EventSeverity, EventType, IncidentActivity, IncidentAlert,
     ObservationMode, PublicWatchTarget,
 };
 use obschain_detectors::Detector;
 use obschain_ingest::HistoricalReplayEngine;
+use obschain_intelligence::baseline::BaselineEngine;
 use obschain_intelligence::IncidentWatchEngine;
 use obschain_storage::{
-    EventFilter, EventRepository, IncidentActivityRepository, IncidentAlertRepository,
-    IncidentRepository, ReplayRepository, Storage, StorageError, WatchTargetRepository,
+    BaselineRepository, EventFilter, EventRepository, IncidentActivityRepository,
+    IncidentAlertRepository, IncidentRepository, ReplayRepository, Storage, StorageError,
+    WatchTargetRepository,
 };
 use serde::{Deserialize, Serialize};
 use tower_http::{
@@ -215,6 +218,10 @@ pub struct AppState {
     pub bitcoin_core_status: Arc<tokio::sync::RwLock<Option<BitcoinCoreStatusResponse>>>,
     pub replay_engine: Option<Arc<HistoricalReplayEngine>>,
     pub replay_api_enabled: bool,
+    pub baseline_api_enabled: bool,
+    pub baseline_default_algorithm_version: String,
+    pub impact_default_model_version: String,
+    pub baseline_min_sample_size: u64,
 }
 
 impl AppState {
@@ -292,6 +299,10 @@ impl AppState {
             bitcoin_core_status: Arc::new(tokio::sync::RwLock::new(None)),
             replay_engine: None,
             replay_api_enabled: false,
+            baseline_api_enabled: false,
+            baseline_default_algorithm_version: "obschain-baseline-v1".to_string(),
+            impact_default_model_version: "obschain-impact-v1".to_string(),
+            baseline_min_sample_size: 100,
         };
         (state, tx)
     }
@@ -303,6 +314,20 @@ impl AppState {
     ) -> Self {
         self.replay_engine = replay_engine;
         self.replay_api_enabled = replay_api_enabled;
+        self
+    }
+
+    pub fn with_baseline(
+        mut self,
+        baseline_api_enabled: bool,
+        algorithm_version: impl Into<String>,
+        impact_version: impl Into<String>,
+        min_sample_size: u64,
+    ) -> Self {
+        self.baseline_api_enabled = baseline_api_enabled;
+        self.baseline_default_algorithm_version = algorithm_version.into();
+        self.impact_default_model_version = impact_version.into();
+        self.baseline_min_sample_size = min_sample_size;
         self
     }
 }
@@ -492,6 +517,16 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/replay/jobs/{id}/resume",
             axum::routing::post(resume_replay_job_handler),
         )
+        .route(
+            "/api/v1/research/baselines",
+            get(list_baselines_handler).post(create_baseline_handler),
+        )
+        .route("/api/v1/research/baselines/{id}", get(get_baseline_handler))
+        .route(
+            "/api/v1/research/distributions",
+            get(query_distributions_handler),
+        )
+        .route("/api/v1/events/{id}/rarity", get(get_event_rarity_handler))
         .layer(TraceLayer::new_for_http())
         // Guard against oversized request DOS (limit to 1MB)
         .layer(RequestBodyLimitLayer::new(1024 * 1024))
@@ -691,7 +726,62 @@ async fn get_event_handler(
         .map_err(map_storage_error)?;
 
     match event_opt {
-        Some(event) => Ok(Json(event)),
+        Some(event) => {
+            let mut val = serde_json::to_value(&event).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiErrorResponse {
+                        error: e.to_string(),
+                        code: 500,
+                    }),
+                )
+            })?;
+
+            // Try fast lookup of latest compatible baseline without blocking live delivery
+            let network = event.network().unwrap_or("mainnet");
+
+            if let Ok(Some(baseline)) = state
+                .storage
+                .get_latest_compatible_baseline_run(
+                    network,
+                    event.block_height,
+                    Some(&state.baseline_default_algorithm_version),
+                )
+                .await
+            {
+                if let Ok(dists) = state.storage.get_baseline_distributions(baseline.id).await {
+                    if !dists.is_empty() {
+                        let rarity_ctx = BaselineEngine::evaluate_event_rarity(
+                            &event,
+                            &baseline,
+                            &dists,
+                            state.baseline_min_sample_size,
+                        );
+                        val["rarity"] = serde_json::json!({
+                            "baseline_id": baseline.id,
+                            "primary": {
+                                "metric": rarity_ctx.primary.metric.as_str(),
+                                "value": rarity_ctx.primary.value.to_numeric_string(),
+                                "percentile": rarity_ctx.primary.percentile,
+                                "band": rarity_ctx.primary.rarity_band.as_str(),
+                                "population_size": rarity_ctx.primary.population_size,
+                                "tail_count": rarity_ctx.primary.tail_count,
+                            },
+                            "secondary": rarity_ctx.secondary.iter().map(|s| serde_json::json!({
+                                "metric": s.metric.as_str(),
+                                "value": s.value.to_numeric_string(),
+                                "percentile": s.percentile,
+                                "band": s.rarity_band.as_str(),
+                                "population_size": s.population_size,
+                                "tail_count": s.tail_count,
+                            })).collect::<Vec<_>>(),
+                        });
+                    }
+                }
+            }
+
+            Ok(Json(val))
+        }
         None => Err((
             StatusCode::NOT_FOUND,
             Json(ApiErrorResponse {
@@ -1198,5 +1288,394 @@ async fn resume_replay_job_handler(
     Ok(Json(serde_json::json!({
         "status": "resumed",
         "job": job,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6B: Historical Baselines & Rarity API Handlers
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct BaselinesQuery {
+    pub network: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateBaselineRequest {
+    pub start_height: u64,
+    pub end_height: u64,
+    pub network: Option<String>,
+    pub event_types: Option<Vec<EventType>>,
+    pub algorithm_version: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DistributionsQuery {
+    pub event_type: Option<EventType>,
+    pub metric: Option<BaselineMetric>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EventRarityQuery {
+    pub baseline_id: Option<Uuid>,
+}
+
+async fn list_baselines_handler(
+    State(state): State<AppState>,
+    Query(query): Query<BaselinesQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let offset = query.offset.unwrap_or(0);
+
+    let runs = state
+        .storage
+        .list_baseline_runs(query.network.as_deref(), limit, offset)
+        .await
+        .map_err(map_storage_error)?;
+
+    Ok(Json(serde_json::json!({
+        "baselines": runs,
+        "count": runs.len(),
+        "limit": limit,
+        "offset": offset,
+    })))
+}
+
+async fn get_baseline_handler(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
+    let run = state
+        .storage
+        .get_baseline_run(id)
+        .await
+        .map_err(map_storage_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiErrorResponse {
+                    error: format!("BaselineRun {id} not found"),
+                    code: 404,
+                }),
+            )
+        })?;
+
+    let distributions = state
+        .storage
+        .get_baseline_distributions(id)
+        .await
+        .map_err(map_storage_error)?;
+
+    Ok(Json(serde_json::json!({
+        "baseline": run,
+        "distributions": distributions,
+        "distribution_count": distributions.len(),
+    })))
+}
+
+async fn create_baseline_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateBaselineRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
+    // Section 61: Baseline generation API disabled by default unless explicitly permitted
+    if !state.baseline_api_enabled {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiErrorResponse {
+                error: "Baseline generation API is disabled. Enable with OBSCHAIN_BASELINE_API_ENABLED=true".to_string(),
+                code: 403,
+            }),
+        ));
+    }
+
+    if payload.start_height > payload.end_height {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                error: format!(
+                    "start_height ({}) cannot exceed end_height ({})",
+                    payload.start_height, payload.end_height
+                ),
+                code: 400,
+            }),
+        ));
+    }
+
+    let network = payload.network.unwrap_or_else(|| "mainnet".to_string());
+    let algorithm_version = payload
+        .algorithm_version
+        .unwrap_or_else(|| state.baseline_default_algorithm_version.clone());
+
+    // 1. Create BaselineRun record in Running status
+    let mut run = BaselineEngine::create_run_record(
+        &network,
+        payload.start_height,
+        payload.end_height,
+        &algorithm_version,
+    );
+    state
+        .storage
+        .create_baseline_run(&run)
+        .await
+        .map_err(map_storage_error)?;
+
+    // 2. Query canonical events in the height range
+    // Section 8: Baseline population MUST operate on chain_events, never event_observations
+    let events = match state
+        .storage
+        .query_events_for_baseline(None, payload.start_height, payload.end_height)
+        .await
+    {
+        Ok(evs) => evs,
+        Err(e) => {
+            let _ = state
+                .storage
+                .update_baseline_run_status(
+                    run.id,
+                    BaselineRunStatus::Failed,
+                    Some(Utc::now()),
+                    0,
+                    Some(e.to_string()),
+                )
+                .await;
+            return Err(map_storage_error(e));
+        }
+    };
+
+    let canonical_count = events.len() as u64;
+
+    // 3. Generate distributions
+    let target_types = payload.event_types.as_deref();
+    let distributions = BaselineEngine::generate_distributions(run.id, &events, target_types);
+
+    // 4. Save distributions and update run status to Completed
+    if let Err(e) = state
+        .storage
+        .save_baseline_distributions(&distributions)
+        .await
+    {
+        let _ = state
+            .storage
+            .update_baseline_run_status(
+                run.id,
+                BaselineRunStatus::Failed,
+                Some(Utc::now()),
+                canonical_count,
+                Some(e.to_string()),
+            )
+            .await;
+        return Err(map_storage_error(e));
+    }
+
+    run.status = BaselineRunStatus::Completed;
+    run.completed_at = Some(Utc::now());
+    run.canonical_event_count = canonical_count;
+
+    state
+        .storage
+        .update_baseline_run_status(
+            run.id,
+            run.status,
+            run.completed_at,
+            run.canonical_event_count,
+            None,
+        )
+        .await
+        .map_err(map_storage_error)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "baseline_run": run,
+            "distribution_count": distributions.len(),
+            "canonical_event_count": canonical_count,
+        })),
+    ))
+}
+
+async fn query_distributions_handler(
+    State(state): State<AppState>,
+    Query(query): Query<DistributionsQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+
+    let distributions = state
+        .storage
+        .query_distributions(query.event_type, query.metric, limit)
+        .await
+        .map_err(map_storage_error)?;
+
+    Ok(Json(serde_json::json!({
+        "distributions": distributions,
+        "count": distributions.len(),
+    })))
+}
+
+async fn get_event_rarity_handler(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<EventRarityQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
+    let event = state
+        .storage
+        .get_event_by_id(id)
+        .await
+        .map_err(map_storage_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiErrorResponse {
+                    error: format!("Event {id} not found"),
+                    code: 404,
+                }),
+            )
+        })?;
+
+    // Determine baseline run to use
+    let baseline_run = if let Some(bid) = query.baseline_id {
+        state
+            .storage
+            .get_baseline_run(bid)
+            .await
+            .map_err(map_storage_error)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ApiErrorResponse {
+                        error: format!("Specified baseline {bid} not found"),
+                        code: 404,
+                    }),
+                )
+            })?
+    } else {
+        let network = event.network().unwrap_or("mainnet");
+
+        let run_opt = state
+            .storage
+            .get_latest_compatible_baseline_run(
+                network,
+                event.block_height,
+                Some(&state.baseline_default_algorithm_version),
+            )
+            .await
+            .map_err(map_storage_error)?;
+
+        match run_opt {
+            Some(r) => r,
+            None => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(ApiErrorResponse {
+                        error: "No compatible completed baseline found for event".to_string(),
+                        code: 404,
+                    }),
+                ));
+            }
+        }
+    };
+
+    // Check if network matches (Section 30, 55: network isolation)
+    if let Some(event_net) = event.network() {
+        if !event_net.is_empty() && event_net != baseline_run.network {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiErrorResponse {
+                    error: format!(
+                        "Network mismatch: event is on '{}' while baseline is on '{}'",
+                        event_net, baseline_run.network
+                    ),
+                    code: 400,
+                }),
+            ));
+        }
+    }
+
+    let distributions = state
+        .storage
+        .get_baseline_distributions(baseline_run.id)
+        .await
+        .map_err(map_storage_error)?;
+
+    let rarity_context = BaselineEngine::evaluate_event_rarity(
+        &event,
+        &baseline_run,
+        &distributions,
+        state.baseline_min_sample_size,
+    );
+
+    // Save evaluated rarity for durability/caching
+    let _ = state
+        .storage
+        .save_event_rarity(&rarity_context.primary, rarity_context.impact.as_ref())
+        .await;
+    for sec in &rarity_context.secondary {
+        let _ = state
+            .storage
+            .save_event_rarity(sec, rarity_context.impact.as_ref())
+            .await;
+    }
+
+    // Build rich, clean response matching Section 65 / Section 42
+    let mut all_metrics = vec![serde_json::json!({
+        "metric": rarity_context.primary.metric.as_str(),
+        "value": rarity_context.primary.value.to_numeric_string(),
+        "value_display": rarity_context.primary.value.to_string(),
+        "percentile": rarity_context.primary.percentile,
+        "tail_count": rarity_context.primary.tail_count,
+        "population_size": rarity_context.primary.population_size,
+        "rarity": rarity_context.primary.rarity_band.as_str(),
+        "frequency": rarity_context.primary.frequency_description(),
+        "is_primary": true,
+    })];
+
+    for sec in &rarity_context.secondary {
+        all_metrics.push(serde_json::json!({
+            "metric": sec.metric.as_str(),
+            "value": sec.value.to_numeric_string(),
+            "value_display": sec.value.to_string(),
+            "percentile": sec.percentile,
+            "tail_count": sec.tail_count,
+            "population_size": sec.population_size,
+            "rarity": sec.rarity_band.as_str(),
+            "frequency": sec.frequency_description(),
+            "is_primary": false,
+        }));
+    }
+
+    let quality = distributions
+        .iter()
+        .find(|d| d.event_type == event.event_type && d.metric == rarity_context.primary.metric)
+        .map(|d| d.quality.as_str())
+        .unwrap_or("INSUFFICIENT");
+
+    Ok(Json(serde_json::json!({
+        "event_id": event.id,
+        "event_type": event.event_type,
+        "baseline": {
+            "id": baseline_run.id,
+            "algorithm_version": baseline_run.algorithm_version,
+            "network": baseline_run.network,
+            "start_height": baseline_run.start_height,
+            "end_height": baseline_run.end_height,
+            "population_size": baseline_run.canonical_event_count,
+            "quality": quality,
+            "evaluation_mode": rarity_context.evaluation_mode.as_str(),
+        },
+        "primary": {
+            "metric": rarity_context.primary.metric.as_str(),
+            "value": rarity_context.primary.value.to_numeric_string(),
+            "percentile": rarity_context.primary.percentile,
+            "tail_count": rarity_context.primary.tail_count,
+            "population_size": rarity_context.primary.population_size,
+            "band": rarity_context.primary.rarity_band.as_str(),
+            "rarity": rarity_context.primary.rarity_band.as_str(),
+            "rarity_band": rarity_context.primary.rarity_band.as_str(),
+        },
+        "secondary": rarity_context.secondary,
+        "metrics": all_metrics,
+        "impact": rarity_context.impact,
     })))
 }

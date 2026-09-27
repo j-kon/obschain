@@ -432,6 +432,40 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/EVENT_MODEL.md](docs/
 
 ---
 
+## Historical Baselines, Rarity & Impact Intelligence (Phase 6B)
+
+ObsChain provides sovereign, verifiable empirical statistical context for Bitcoin chain events without relying on arbitrary hype scores or black-box machine learning models:
+
+- **Empirical Discrete Quantiles (`percentile_disc`)**: Computes exact observed historical percentiles ($p50, p75, p90, p95, p99, p99.9$) and empirical CDF ranks with inclusive tie handling.
+- **Strict Canonical Population Invariant**: Statistical populations count `chain_events` exclusively. Multiple observation occurrences across replays never distort frequency distributions.
+- **Data Quality & Coverage Accounting**: Transparently reports sample size, candidate count, missing UTXO count, and metric coverage percentage (`HIGH`, `MODERATE`, `DEGRADED`, `INSUFFICIENT`).
+- **Sample-Size Safeguards**: Automatically returns `INSUFFICIENT_DATA` and withholds percentiles if sample count is below threshold ($N < 100$), avoiding spurious tail claims.
+- **Explainable Impact Scoring**: Breaks down composite significance into visible, normalized component contributions (`obschain-impact-v1`, marked `EXPERIMENTAL`).
+- **Historical Leakage Distinction**: Explicitly flags evaluations as `RETROSPECTIVE` (baseline covers blocks after the event) vs `POINT_IN_TIME` (baseline only covers blocks before the event).
+
+### Baseline CLI Commands
+
+```bash
+# Generate a baseline for Mainnet blocks 840,000 to 850,000
+cargo run --bin obschain -- baseline --start 840000 --end 850000 --network mainnet
+
+# Evaluate the historical rarity and impact of a canonical event
+cargo run --bin obschain -- rarity --event-id <EVENT_UUID>
+```
+
+### Research REST API
+
+- `GET /api/v1/research/baselines`: List completed historical baseline runs.
+- `GET /api/v1/research/baselines/:id`: Inspect baseline run metadata and distribution parameters.
+- `GET /api/v1/research/distributions`: Query specific metric distributions across runs.
+- `POST /api/v1/research/baselines`: Administratively trigger baseline computation (disabled by default; requires `OBSCHAIN_BASELINE_API_ENABLED=true`).
+- `GET /api/v1/events/:id/rarity`: Query comprehensive rarity results, tail counts, frequency descriptions, and explainable impact components.
+- `GET /api/v1/events/:id`: Enriched with fast, non-blocking baseline rarity summary.
+
+See [docs/HISTORICAL_BASELINES.md](docs/HISTORICAL_BASELINES.md) for full statistical architecture and quantile specifications.
+
+---
+
 ## Testing & Quality
 
 Run full workspace checks:

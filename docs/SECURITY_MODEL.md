@@ -117,6 +117,23 @@ ObsChain processes data from untrusted network sources (peer-to-peer gossip, ext
 - **Baseline Statistical Integrity**:
   - Rarity scoring and baseline calculations in Phase 6B query canonical `chain_events` directly. Replaying the same range multiple times records observation provenance without inflating or distorting historical sample distributions.
 
+### 12. Historical Baselines & Statistical Security (Phase 6B)
+- **Administrative Baseline API Access Control**:
+  - Baseline computation (`POST /api/v1/research/baselines`) is an expensive analytical operation. The endpoint is disabled by default to prevent denial of service. It requires explicit operator activation via `OBSCHAIN_BASELINE_API_ENABLED=true`. Research queries are performed via CLI (`obschain baseline`) in self-hosted environments.
+- **Bounded Range Validation & SQL Aggregate DoS Defenses**:
+  - Baseline generation endpoints strictly validate that `start_height < end_height` and enforce a maximum block range (e.g. 500,000 blocks). Unbounded queries that would scan the entire `chain_events` table are rejected immediately with HTTP `400 Bad Request`.
+- **Cross-Network Isolation**:
+  - Events from `regtest`, `testnet`, or `signet` are strictly barred from evaluation against `mainnet` baselines. Baseline selection requires exact network matching, and event detail lookup returns HTTP `400 Bad Request` or CLI validation failure if an operator attempts a cross-network comparison.
+- **Integer Precision & Overflow Prevention**:
+  - Metric extraction maps to exact typed variants (`MetricValue::U64`, `MetricValue::U128`, `BasisPoints`, `DecimalScaled`). Coin Age Destroyed (satoshi-days) can exceed $u64::\text{MAX}$ and is strictly evaluated using `u128` arithmetic and stored in PostgreSQL `NUMERIC(38, 4)`. Floating-point conversion is forbidden during distribution calculation.
+- **Baseline Poisoning Prevention**:
+  - Repeated historical replays cannot distort statistical distributions. `BaselineEngine` queries canonical `chain_events` directly, guaranteeing that $100$ replays of an event contribute exactly $1$ sample.
+- **Sample-Size Safeguards**:
+  - If a baseline population has fewer than `baseline_min_sample_size` qualifying events (default: 100), percentiles are withheld (`None`) and rarity band returns `INSUFFICIENT_DATA` to prevent misleading high-tail claims on sparse data.
+- **Sovereign Privacy**:
+  - In `OBSCHAIN_SOVEREIGN_ONLY=true`, baseline calculation and rarity evaluation run entirely locally against the node's reconstructed events. No third-party analytics APIs or telemetry are invoked.
+
+
 
 
 

@@ -9,7 +9,8 @@ use obschain::{
     BitcoinCoreStatusResponse, BitcoinCoreZmqStatusResponse, PipelineMetrics, StorageBackendConfig,
     WebSocketBroadcast,
 };
-use obschain_core::{ChainEvent, IncidentActivity, IncidentAlert, Observation};
+use obschain_core::baseline::BaselineRunStatus;
+use obschain_core::{ChainEvent, EventType, IncidentActivity, IncidentAlert, Observation};
 use obschain_detectors::{
     ConsolidationDetector, DetectorEngine, DormantCoinDetector, EventDeduplicator,
     ExtremeFeeDetector, FanOutDetector, LargeTransactionDetector, LongBlockIntervalDetector,
@@ -20,14 +21,16 @@ use obschain_ingest::{
     BitcoinZmqConfig, BitcoinZmqSubscriber, EnricherConfig, HistoricalReplayEngine,
     MempoolRestClient, MempoolRestConfig, MempoolWebSocketClient, TransactionEnricher, UtxoCache,
 };
+use obschain_intelligence::baseline::BaselineEngine;
 use obschain_intelligence::IncidentWatchEngine;
 use obschain_storage::{
-    EventRepository, InMemoryStorage, IncidentActivityRepository, IncidentAlertRepository,
-    PostgresStorage, Storage,
+    BaselineRepository, EventRepository, InMemoryStorage, IncidentActivityRepository,
+    IncidentAlertRepository, PostgresStorage, Storage,
 };
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use uuid::Uuid;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -58,6 +61,33 @@ pub enum Commands {
         #[arg(long)]
         checkpoint_interval: Option<u64>,
     },
+    /// Generate historical baselines over canonical events
+    Baseline {
+        /// Start block height
+        #[arg(long, short)]
+        start: u64,
+        /// End block height
+        #[arg(long, short)]
+        end: u64,
+        /// Optional specific event type (e.g. dormant_coins_moved, large_transfer)
+        #[arg(long, short)]
+        event_type: Option<String>,
+        /// Target network (defaults to configured network)
+        #[arg(long)]
+        network: Option<String>,
+        /// Algorithm version
+        #[arg(long)]
+        algorithm_version: Option<String>,
+    },
+    /// Evaluate event statistical rarity and impact against historical baselines
+    Rarity {
+        /// Event UUID
+        #[arg(long)]
+        event_id: Uuid,
+        /// Optional baseline run UUID
+        #[arg(long)]
+        baseline: Option<Uuid>,
+    },
 }
 
 #[tokio::main]
@@ -74,14 +104,28 @@ async fn main() -> anyhow::Result<()> {
     let args = CliArgs::parse();
     let config = AppConfig::from_env();
 
-    if let Some(Commands::Replay {
-        start,
-        end,
-        batch_size,
-        checkpoint_interval,
-    }) = args.command
-    {
-        return run_replay(&config, start, end, batch_size, checkpoint_interval).await;
+    match args.command {
+        Some(Commands::Replay {
+            start,
+            end,
+            batch_size,
+            checkpoint_interval,
+        }) => {
+            return run_replay(&config, start, end, batch_size, checkpoint_interval).await;
+        }
+        Some(Commands::Baseline {
+            start,
+            end,
+            event_type,
+            network,
+            algorithm_version,
+        }) => {
+            return run_baseline(&config, start, end, event_type, network, algorithm_version).await;
+        }
+        Some(Commands::Rarity { event_id, baseline }) => {
+            return run_rarity(&config, event_id, baseline).await;
+        }
+        Some(Commands::Run) | None => {}
     }
 
     let addr = config.socket_addr()?;
@@ -315,7 +359,14 @@ async fn main() -> anyhow::Result<()> {
         metrics.clone(),
         watch_engine_arc.clone(),
     );
-    let state = state.with_replay(replay_engine, config.replay_api_enabled);
+    let state = state
+        .with_replay(replay_engine, config.replay_api_enabled)
+        .with_baseline(
+            config.baseline_api_enabled,
+            config.baseline_default_algorithm_version.clone(),
+            config.impact_default_model_version.clone(),
+            config.baseline_min_sample_size,
+        );
     let app = create_router(state.clone());
 
     // 7. Spawn Bitcoin Core Coordinator if configured
@@ -1145,6 +1196,322 @@ async fn run_replay(
         events_generated = completed_job.events_generated,
         "Historical replay completed successfully!"
     );
+
+    Ok(())
+}
+
+async fn run_baseline(
+    config: &AppConfig,
+    start: u64,
+    end: u64,
+    event_type_filter: Option<String>,
+    network_opt: Option<String>,
+    algo_version_opt: Option<String>,
+) -> anyhow::Result<()> {
+    if start > end {
+        anyhow::bail!("start_height ({start}) cannot exceed end_height ({end})");
+    }
+
+    let network = network_opt.unwrap_or_else(|| config.bitcoin_network.clone());
+    let algorithm_version =
+        algo_version_opt.unwrap_or_else(|| config.baseline_default_algorithm_version.clone());
+
+    let target_event_types: Option<Vec<EventType>> = match event_type_filter {
+        Some(ref s) => {
+            let et = serde_json::from_str::<EventType>(&format!("\"{s}\""))
+                .or_else(|_| match s.to_lowercase().replace('-', "_").as_str() {
+                    "large_transfer" | "large_transaction" => Ok(EventType::LargeTransfer),
+                    "long_block_interval" => Ok(EventType::LongBlockInterval),
+                    "dormant_coins_moved" | "dormant_coins" => Ok(EventType::DormantCoinsMoved),
+                    "consolidation" => Ok(EventType::Consolidation),
+                    "fan_out" | "fanout" => Ok(EventType::FanOut),
+                    "extreme_fee" => Ok(EventType::ExtremeFee),
+                    _ => Err(anyhow::anyhow!("Unknown event type: '{s}'. Supported: large_transfer, long_block_interval, dormant_coins_moved, consolidation, fan_out, extreme_fee")),
+                })?;
+            Some(vec![et])
+        }
+        None => None,
+    };
+
+    println!("============================================================");
+    println!("ObsChain Historical Baseline Generation Engine");
+    println!("============================================================");
+    println!("Target Network:    {network}");
+    println!(
+        "Height Range:      Blocks {start} -> {end} ({} blocks)",
+        end - start + 1
+    );
+    println!("Algorithm Version: {algorithm_version}");
+    if let Some(ref t) = target_event_types {
+        println!("Event Type Filter: {:?}", t);
+    } else {
+        println!("Event Type Filter: All supported replayable detectors");
+    }
+    println!("Storage Backend:   {}", config.storage_backend);
+    println!("------------------------------------------------------------");
+
+    let storage = setup_storage(config).await?;
+
+    // Create BaselineRun in Running status
+    let mut run = BaselineEngine::create_run_record(&network, start, end, &algorithm_version);
+    storage.create_baseline_run(&run).await?;
+
+    println!("Created Baseline Run: {}", run.id);
+    println!("Querying canonical historical events in range...");
+
+    // Section 8: Query strictly canonical chain_events (never duplicate observations)
+    let events = match storage.query_events_for_baseline(None, start, end).await {
+        Ok(evs) => evs,
+        Err(e) => {
+            let _ = storage
+                .update_baseline_run_status(
+                    run.id,
+                    BaselineRunStatus::Failed,
+                    Some(chrono::Utc::now()),
+                    0,
+                    Some(e.to_string()),
+                )
+                .await;
+            anyhow::bail!("Failed to query historical events: {e}");
+        }
+    };
+
+    let canonical_count = events.len() as u64;
+    println!("Retrieved {} canonical qualifying events.", canonical_count);
+
+    if canonical_count == 0 {
+        warn!(
+            start_height = start,
+            end_height = end,
+            "No canonical events found in block range. Baseline will have empty distributions."
+        );
+    }
+
+    let distributions =
+        BaselineEngine::generate_distributions(run.id, &events, target_event_types.as_deref());
+
+    println!(
+        "Saving {} computed metric distributions...",
+        distributions.len()
+    );
+    if let Err(e) = storage.save_baseline_distributions(&distributions).await {
+        let _ = storage
+            .update_baseline_run_status(
+                run.id,
+                BaselineRunStatus::Failed,
+                Some(chrono::Utc::now()),
+                canonical_count,
+                Some(e.to_string()),
+            )
+            .await;
+        anyhow::bail!("Failed to save distributions: {e}");
+    }
+
+    run.status = BaselineRunStatus::Completed;
+    run.completed_at = Some(chrono::Utc::now());
+    run.canonical_event_count = canonical_count;
+
+    storage
+        .update_baseline_run_status(
+            run.id,
+            run.status,
+            run.completed_at,
+            run.canonical_event_count,
+            None,
+        )
+        .await?;
+
+    println!("\nBaseline Generation Complete!");
+    println!("Status: COMPLETED");
+    println!("Run ID: {}", run.id);
+    println!("Canonical Event Population: {}", canonical_count);
+    println!("------------------------------------------------------------");
+    println!("Metric Distributions Summary:");
+    for dist in &distributions {
+        println!(
+            "  • {:?} | {:?} ({})",
+            dist.event_type,
+            dist.metric,
+            dist.unit.as_str()
+        );
+        println!(
+            "    Samples: {} / {} candidate events (Coverage: {:.2}%, Quality: {})",
+            dist.sample_count,
+            dist.candidate_count,
+            dist.coverage_ratio * 100.0,
+            dist.quality.as_str()
+        );
+        println!(
+            "    Min: {}  |  Mean: {:.2}  |  Max: {}",
+            dist.minimum, dist.mean, dist.maximum
+        );
+        println!(
+            "    P50: {}  |  P75: {}  |  P90: {}",
+            dist.p50, dist.p75, dist.p90
+        );
+        println!(
+            "    P95: {}  |  P99: {}  |  P99.9: {}",
+            dist.p95, dist.p99, dist.p999
+        );
+        println!();
+    }
+    println!("============================================================");
+
+    Ok(())
+}
+
+async fn run_rarity(
+    config: &AppConfig,
+    event_id: Uuid,
+    baseline_id_opt: Option<Uuid>,
+) -> anyhow::Result<()> {
+    let storage = setup_storage(config).await?;
+
+    let event = storage
+        .get_event_by_id(event_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Event {event_id} not found in storage"))?;
+
+    let baseline_run = if let Some(bid) = baseline_id_opt {
+        storage
+            .get_baseline_run(bid)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Specified baseline run {bid} not found"))?
+    } else {
+        let network = event.network().unwrap_or(&config.bitcoin_network);
+
+        storage
+            .get_latest_compatible_baseline_run(
+                network,
+                event.block_height,
+                Some(&config.baseline_default_algorithm_version),
+            )
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No completed baseline found compatible with network '{network}' and height {:?}",
+                    event.block_height
+                )
+            })?
+    };
+
+    // Check network isolation (Section 30, 55)
+    if let Some(event_net) = event.network() {
+        if !event_net.is_empty() && event_net != baseline_run.network {
+            anyhow::bail!(
+                "Network mismatch: event is on '{event_net}' while baseline is on '{}'",
+                baseline_run.network
+            );
+        }
+    }
+
+    let distributions = storage.get_baseline_distributions(baseline_run.id).await?;
+
+    let context = BaselineEngine::evaluate_event_rarity(
+        &event,
+        &baseline_run,
+        &distributions,
+        config.baseline_min_sample_size,
+    );
+
+    // Save evaluated rarity
+    let _ = storage
+        .save_event_rarity(&context.primary, context.impact.as_ref())
+        .await;
+    for sec in &context.secondary {
+        let _ = storage
+            .save_event_rarity(sec, context.impact.as_ref())
+            .await;
+    }
+
+    // Print unhyped CLI output matching Section 26
+    println!("============================================================");
+    println!("ObsChain Event Statistical Rarity & Impact Context");
+    println!("============================================================");
+    println!("Event ID:        {}", event.id);
+    println!("Event Type:      {:?}", event.event_type);
+    println!("Title:           {}", event.title);
+    if let Some(h) = event.block_height {
+        println!("Block Height:    {h}");
+    }
+    if let Some(ref txid) = event.txid {
+        println!("TxID:            {txid}");
+    }
+    println!("Evaluation Mode: {}", context.evaluation_mode.as_str());
+    println!("------------------------------------------------------------");
+    println!("Reference Baseline:");
+    println!("  Run ID:        {}", baseline_run.id);
+    println!("  Network:       {}", baseline_run.network);
+    println!(
+        "  Range:         Blocks {} -> {}",
+        baseline_run.start_height, baseline_run.end_height
+    );
+    println!("  Algorithm:     {}", baseline_run.algorithm_version);
+    println!("------------------------------------------------------------");
+    println!("Primary Metric:  {:?}", context.primary.metric);
+    println!("  Observed:      {}", context.primary.value);
+    if let Some(p) = context.primary.percentile {
+        println!("  Percentile:    {:.2}%", p);
+    } else {
+        println!("  Percentile:    N/A (Insufficient Data)");
+    }
+    println!("  Population:    {}", context.primary.population_size);
+    println!("  Tail Count:    {}", context.primary.tail_count);
+    println!(
+        "  Frequency:     {}",
+        context.primary.frequency_description()
+    );
+    println!("  Rarity Band:   {}", context.primary.rarity_band.as_str());
+
+    if !context.secondary.is_empty() {
+        println!("------------------------------------------------------------");
+        println!("Secondary Metrics:");
+        for sec in &context.secondary {
+            let p_str = sec
+                .percentile
+                .map(|p| format!("{p:.2}%"))
+                .unwrap_or_else(|| "N/A".to_string());
+            println!(
+                "  • {:<28} Value: {:<18} Percentile: {:<8} Band: {:<12} Tail: {} / {}",
+                format!("{:?}:", sec.metric),
+                sec.value.to_string(),
+                p_str,
+                sec.rarity_band.as_str(),
+                sec.tail_count,
+                sec.population_size,
+            );
+        }
+    }
+
+    if let Some(ref impact) = context.impact {
+        println!("------------------------------------------------------------");
+        println!(
+            "Explainable Impact Breakdown (Model: {}, Status: {}):",
+            impact.model_version, impact.status
+        );
+        if let Some(score) = impact.total_score {
+            println!(
+                "  Composite Impact Score: {:.1} / {:.1} (Coverage: {:.1}%)",
+                score,
+                impact.max_possible_points,
+                impact.coverage_ratio * 100.0
+            );
+        } else {
+            println!("  Composite Impact Score: UNAVAILABLE (Insufficient sample size or metrics)");
+        }
+        println!("  Component Contributions:");
+        for comp in &impact.components {
+            let p_str = comp
+                .percentile
+                .map(|p| format!("{p:.2}%"))
+                .unwrap_or_else(|| "N/A".to_string());
+            println!(
+                "    - {:<24} Weight: {:>4.1} | Points: {:>4.1} | Percentile: {:>6} | Raw: {}",
+                comp.component_name, comp.weight, comp.points_awarded, p_str, comp.raw_value
+            );
+        }
+    }
+    println!("============================================================");
 
     Ok(())
 }
