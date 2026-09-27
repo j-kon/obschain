@@ -2,13 +2,16 @@ use chrono::Utc;
 use obschain_core::{
     BaselineDistribution, BaselineMetric, BaselineQuality, BaselineRun, BaselineRunStatus,
     EvaluationMode, EventMetricExtractor, EventRarityContext, EventRarityResult, EventType,
-    HalvingEpoch, ImpactBreakdown, ImpactComponent, MetricRegistry, MetricValue,
-    QuantileDistribution, RarityBand, RarityDirection,
+    HalvingEpoch, ImpactBreakdown, ImpactComponent, ImpactComponentDefinition,
+    ImpactModelDefinition, MetricRegistry, MetricValue, PercentileMethod, QuantileDistribution,
+    RarityBand, RarityDirection,
 };
 use uuid::Uuid;
 
-pub const DEFAULT_ALGORITHM_VERSION: &str = "obschain-baseline-v1";
-pub const DEFAULT_IMPACT_MODEL_VERSION: &str = "obschain-impact-v1";
+pub const ALGORITHM_VERSION_V1: &str = "obschain-baseline-v1";
+pub const ALGORITHM_VERSION_V2: &str = "obschain-baseline-v2";
+pub const DEFAULT_ALGORITHM_VERSION: &str = ALGORITHM_VERSION_V2;
+pub const DEFAULT_IMPACT_MODEL_VERSION: &str = "v1";
 pub const DEFAULT_MIN_SAMPLE_SIZE: u64 = 100;
 
 /// Statistical calculator for distributions, quantiles, and empirical CDF ranks.
@@ -197,100 +200,230 @@ impl BaselineCalculator {
 
 /// Explainable impact scoring engine.
 /// Computes normalized, component-by-component points (0..100)
-/// without black-box machine learning.
+/// without black-box machine learning or arbitrary clamping.
 pub struct ImpactCalculator;
 
 impl ImpactCalculator {
+    /// Returns the official event-type-specific impact model definition.
+    pub fn model_for_event_type(event_type: EventType) -> Option<ImpactModelDefinition> {
+        match event_type {
+            EventType::LargeTransfer => Some(ImpactModelDefinition {
+                id: "obschain-impact-large-transfer-v1",
+                event_type,
+                version: "v1",
+                components: vec![
+                    ImpactComponentDefinition {
+                        name: "Value rarity",
+                        metric: BaselineMetric::ValueSats,
+                        weight: 60.0,
+                    },
+                    ImpactComponentDefinition {
+                        name: "Input count structure",
+                        metric: BaselineMetric::InputCount,
+                        weight: 15.0,
+                    },
+                    ImpactComponentDefinition {
+                        name: "Output count structure",
+                        metric: BaselineMetric::OutputCount,
+                        weight: 15.0,
+                    },
+                    ImpactComponentDefinition {
+                        name: "Transaction size anomaly",
+                        metric: BaselineMetric::Vsize,
+                        weight: 10.0,
+                    },
+                ],
+            }),
+            EventType::DormantCoinsMoved => Some(ImpactModelDefinition {
+                id: "obschain-impact-dormant-coins-v1",
+                event_type,
+                version: "v1",
+                components: vec![
+                    ImpactComponentDefinition {
+                        name: "Dormant value rarity",
+                        metric: BaselineMetric::DormantValueSats,
+                        weight: 35.0,
+                    },
+                    ImpactComponentDefinition {
+                        name: "Coin-age rarity",
+                        metric: BaselineMetric::OldestInputAgeDays,
+                        weight: 30.0,
+                    },
+                    ImpactComponentDefinition {
+                        name: "Coin-age-destroyed rarity",
+                        metric: BaselineMetric::CoinAgeDestroyedSatoshiDays,
+                        weight: 25.0,
+                    },
+                    ImpactComponentDefinition {
+                        name: "Input count structure",
+                        metric: BaselineMetric::InputCount,
+                        weight: 10.0,
+                    },
+                ],
+            }),
+            EventType::LongBlockInterval => Some(ImpactModelDefinition {
+                id: "obschain-impact-long-block-interval-v1",
+                event_type,
+                version: "v1",
+                components: vec![ImpactComponentDefinition {
+                    name: "Network interval rarity",
+                    metric: BaselineMetric::IntervalSeconds,
+                    weight: 100.0,
+                }],
+            }),
+            EventType::Consolidation => Some(ImpactModelDefinition {
+                id: "obschain-impact-consolidation-v1",
+                event_type,
+                version: "v1",
+                components: vec![
+                    ImpactComponentDefinition {
+                        name: "Input count structure",
+                        metric: BaselineMetric::InputCount,
+                        weight: 40.0,
+                    },
+                    ImpactComponentDefinition {
+                        name: "Consolidation ratio rarity",
+                        metric: BaselineMetric::ConsolidationRatio,
+                        weight: 30.0,
+                    },
+                    ImpactComponentDefinition {
+                        name: "Consolidation value rarity",
+                        metric: BaselineMetric::ValueSats,
+                        weight: 20.0,
+                    },
+                    ImpactComponentDefinition {
+                        name: "Output count structure",
+                        metric: BaselineMetric::OutputCount,
+                        weight: 10.0,
+                    },
+                ],
+            }),
+            EventType::FanOut => Some(ImpactModelDefinition {
+                id: "obschain-impact-fan-out-v1",
+                event_type,
+                version: "v1",
+                components: vec![
+                    ImpactComponentDefinition {
+                        name: "Output count structure",
+                        metric: BaselineMetric::OutputCount,
+                        weight: 40.0,
+                    },
+                    ImpactComponentDefinition {
+                        name: "Distributed volume rarity",
+                        metric: BaselineMetric::DistributedValueSats,
+                        weight: 35.0,
+                    },
+                    ImpactComponentDefinition {
+                        name: "Median output size anomaly",
+                        metric: BaselineMetric::MedianOutputSats,
+                        weight: 25.0,
+                    },
+                ],
+            }),
+            EventType::ExtremeFee => Some(ImpactModelDefinition {
+                id: "obschain-impact-extreme-fee-v1",
+                event_type,
+                version: "v1",
+                components: vec![
+                    ImpactComponentDefinition {
+                        name: "Fee rate rarity",
+                        metric: BaselineMetric::FeeRateSatVb,
+                        weight: 60.0,
+                    },
+                    ImpactComponentDefinition {
+                        name: "Absolute fee rarity",
+                        metric: BaselineMetric::FeeSats,
+                        weight: 40.0,
+                    },
+                ],
+            }),
+            _ => None,
+        }
+    }
+
     /// Computes explainable impact breakdown for an event given its evaluated rarity metrics.
     pub fn calculate_impact(
         event_type: EventType,
         rarity_results: &[EventRarityResult],
         model_version: Option<&str>,
     ) -> ImpactBreakdown {
-        let version = model_version.unwrap_or(DEFAULT_IMPACT_MODEL_VERSION);
-        let mut components = Vec::new();
+        let model =
+            Self::model_for_event_type(event_type).unwrap_or_else(|| ImpactModelDefinition {
+                id: "obschain-impact-generic-v1",
+                event_type,
+                version: "v1",
+                components: Vec::new(),
+            });
 
-        for res in rarity_results {
-            if let Some(comp) = Self::component_for_metric(event_type, res) {
-                components.push(comp);
+        let version = model_version.unwrap_or(model.version);
+        let mut components = Vec::new();
+        let expected_count = model.components.len();
+        let mut available_count = 0usize;
+        let mut has_insufficient_samples = false;
+
+        for comp_def in &model.components {
+            if let Some(res) = rarity_results.iter().find(|r| r.metric == comp_def.metric) {
+                available_count += 1;
+                if res.population_size < DEFAULT_MIN_SAMPLE_SIZE {
+                    has_insufficient_samples = true;
+                }
+
+                let points_awarded = if let Some(p) = res.percentile {
+                    if p >= 50.0 {
+                        let normalized = (p - 50.0) / 50.0;
+                        comp_def.weight * normalized
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+
+                components.push(ImpactComponent {
+                    component_name: comp_def.name.to_string(),
+                    metric: comp_def.metric,
+                    raw_value: res.value.to_numeric_string(),
+                    percentile: res.percentile,
+                    weight: comp_def.weight,
+                    points_awarded: (points_awarded * 100.0).round() / 100.0,
+                    population_size: res.population_size,
+                });
             }
         }
 
-        let total_weight: f64 = components.iter().map(|c| c.weight).sum();
-        let total_points: f64 = components.iter().map(|c| c.points_awarded).sum();
-
-        // Check if sample count is sufficient for primary metrics
-        let has_insufficient_samples = rarity_results
-            .iter()
-            .any(|r| r.population_size < DEFAULT_MIN_SAMPLE_SIZE);
-
-        let total_score =
-            if has_insufficient_samples || components.is_empty() || total_weight == 0.0 {
-                None
-            } else {
-                // Normalized composite score out of 100
-                Some(((total_points / total_weight) * 100.0).clamp(0.0, 100.0))
-            };
-
-        let coverage_ratio = if total_weight > 0.0 {
-            components.iter().filter(|c| c.percentile.is_some()).count() as f64
-                / (components.len() as f64)
+        let model_coverage = if expected_count > 0 {
+            (available_count as f64) / (expected_count as f64)
         } else {
             0.0
         };
 
+        // Score is available only if coverage >= 50% and sample size >= minimum and available_count > 0
+        let total_score =
+            if has_insufficient_samples || available_count == 0 || model_coverage < 0.50 {
+                None
+            } else {
+                let raw_points: f64 = components.iter().map(|c| c.points_awarded).sum();
+                // Mathematical proof: each points_awarded <= weight, and sum of weights == 100.0.
+                // Therefore, raw_points <= 100.0 by construction without structural clamping.
+                let clamped = if raw_points > 100.00000001 {
+                    100.0
+                } else {
+                    raw_points
+                };
+                Some((clamped * 100.0).round() / 100.0)
+            };
+
         ImpactBreakdown {
+            model_id: model.id.to_string(),
             model_version: version.to_string(),
+            event_type,
             status: "EXPERIMENTAL".to_string(),
             total_score,
             max_possible_points: 100.0,
-            coverage_ratio,
+            model_coverage,
+            coverage_ratio: model_coverage,
             components,
         }
-    }
-
-    /// Evaluates an individual component and its points awarded.
-    fn component_for_metric(
-        _event_type: EventType,
-        rarity: &EventRarityResult,
-    ) -> Option<ImpactComponent> {
-        let (comp_name, weight) = match rarity.metric {
-            BaselineMetric::ValueSats | BaselineMetric::DormantValueSats => ("Value anomaly", 25.0),
-            BaselineMetric::CoinAgeDestroyedSatoshiDays | BaselineMetric::OldestInputAgeDays => {
-                ("Coin-age anomaly", 25.0)
-            }
-            BaselineMetric::FeeRateSatVb | BaselineMetric::FeeSats => ("Fee anomaly", 15.0),
-            BaselineMetric::InputCount
-            | BaselineMetric::OutputCount
-            | BaselineMetric::ConsolidationRatio => ("Transaction structure anomaly", 20.0),
-            BaselineMetric::IntervalSeconds => ("Network block interval anomaly", 50.0),
-            BaselineMetric::DistributedValueSats => ("Distributed volume anomaly", 25.0),
-            BaselineMetric::MedianOutputSats => ("Output distribution anomaly", 15.0),
-            _ => return None,
-        };
-
-        let points_awarded = if let Some(p) = rarity.percentile {
-            // Normalized rarity: events below 50th percentile get 0 anomaly points.
-            // Events above 50th percentile scale linearly up to max component points.
-            if p >= 50.0 {
-                let normalized = (p - 50.0) / 50.0;
-                weight * normalized
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        };
-
-        Some(ImpactComponent {
-            component_name: comp_name.to_string(),
-            metric: rarity.metric,
-            raw_value: rarity.value.to_numeric_string(),
-            percentile: rarity.percentile,
-            weight,
-            points_awarded: (points_awarded * 100.0).round() / 100.0,
-            population_size: rarity.population_size,
-        })
     }
 }
 
@@ -383,11 +516,12 @@ impl BaselineEngine {
         distributions
     }
 
-    /// Evaluates an event against a collection of precomputed baseline distributions.
-    pub fn evaluate_event_rarity(
+    /// Evaluates an event against a collection of precomputed baseline distributions with optional exact ranks.
+    pub fn evaluate_event_rarity_with_exact_ranks(
         event: &obschain_core::ChainEvent,
         baseline_run: &BaselineRun,
         distributions: &[BaselineDistribution],
+        exact_ranks: &std::collections::HashMap<BaselineMetric, (f64, u64, u64)>,
         min_sample_size: u64,
     ) -> EventRarityContext {
         let is_retrospective = event
@@ -408,23 +542,55 @@ impl BaselineEngine {
                 continue;
             };
 
-            let dist_opt = distributions
-                .iter()
-                .find(|d| d.event_type == event.event_type && d.metric == def.metric);
-
-            let (percentile_opt, tail_count, pop_size, band) = if let Some(dist) = dist_opt {
-                let (p, tail) =
-                    BaselineCalculator::rank_from_distribution(dist, val, def.direction);
-                let b = RarityBand::from_percentile(p, dist.sample_count, min_sample_size);
-                let p_opt = if b == RarityBand::InsufficientData {
-                    None
+            let (percentile_opt, method, estimated, tail_count, pop_size, band) =
+                if let Some(&(p, tail, pop)) = exact_ranks
+                    .get(&def.metric)
+                    .filter(|(_, _, pop)| *pop >= min_sample_size)
+                {
+                    let b = RarityBand::from_percentile(p, pop, min_sample_size);
+                    let p_opt = if b == RarityBand::InsufficientData {
+                        None
+                    } else {
+                        Some(p)
+                    };
+                    (
+                        p_opt,
+                        PercentileMethod::ExactEmpiricalCdf,
+                        false,
+                        tail,
+                        pop,
+                        b,
+                    )
+                } else if let Some(dist) = distributions
+                    .iter()
+                    .find(|d| d.event_type == event.event_type && d.metric == def.metric)
+                {
+                    let (p, tail) =
+                        BaselineCalculator::rank_from_distribution(dist, val, def.direction);
+                    let b = RarityBand::from_percentile(p, dist.sample_count, min_sample_size);
+                    let p_opt = if b == RarityBand::InsufficientData {
+                        None
+                    } else {
+                        Some(p)
+                    };
+                    (
+                        p_opt,
+                        PercentileMethod::QuantileInterpolationEstimate,
+                        true,
+                        tail,
+                        dist.sample_count,
+                        b,
+                    )
                 } else {
-                    Some(p)
+                    (
+                        None,
+                        PercentileMethod::QuantileInterpolationEstimate,
+                        true,
+                        0,
+                        0,
+                        RarityBand::InsufficientData,
+                    )
                 };
-                (p_opt, tail, dist.sample_count, b)
-            } else {
-                (None, 0, 0, RarityBand::InsufficientData)
-            };
 
             results.push((
                 def.is_primary,
@@ -435,6 +601,8 @@ impl BaselineEngine {
                     metric: def.metric,
                     value: val,
                     percentile: percentile_opt,
+                    percentile_method: method,
+                    estimated,
                     rarity_band: band,
                     population_size: pop_size,
                     tail_count,
@@ -459,6 +627,8 @@ impl BaselineEngine {
                     metric: fallback_metric,
                     value: MetricValue::U64(0),
                     percentile: None,
+                    percentile_method: PercentileMethod::ExactEmpiricalCdf,
+                    estimated: false,
                     rarity_band: RarityBand::InsufficientData,
                     population_size: 0,
                     tail_count: 0,
@@ -489,6 +659,23 @@ impl BaselineEngine {
             secondary,
             impact,
         }
+    }
+
+    /// Evaluates an event against a collection of precomputed baseline distributions.
+    pub fn evaluate_event_rarity(
+        event: &obschain_core::ChainEvent,
+        baseline_run: &BaselineRun,
+        distributions: &[BaselineDistribution],
+        min_sample_size: u64,
+    ) -> EventRarityContext {
+        let empty_exact = std::collections::HashMap::new();
+        Self::evaluate_event_rarity_with_exact_ranks(
+            event,
+            baseline_run,
+            distributions,
+            &empty_exact,
+            min_sample_size,
+        )
     }
 }
 
@@ -605,6 +792,8 @@ mod tests {
             metric: BaselineMetric::ValueSats,
             value: MetricValue::U64(10_000_000_000),
             percentile: Some(99.94),
+            percentile_method: PercentileMethod::ExactEmpiricalCdf,
+            estimated: false,
             rarity_band: RarityBand::Extreme,
             population_size: 18421,
             tail_count: 11,
@@ -618,6 +807,8 @@ mod tests {
             metric: BaselineMetric::OutputCount,
             value: MetricValue::U64(50),
             percentile: Some(95.0),
+            percentile_method: PercentileMethod::ExactEmpiricalCdf,
+            estimated: false,
             rarity_band: RarityBand::Unusual,
             population_size: 18421,
             tail_count: 920,
@@ -631,24 +822,27 @@ mod tests {
         );
 
         assert_eq!(breakdown.status, "EXPERIMENTAL");
+        assert_eq!(breakdown.model_id, "obschain-impact-large-transfer-v1");
+        assert_eq!(breakdown.model_coverage, 0.50);
         assert_eq!(breakdown.components.len(), 2);
 
-        // Value anomaly (weight 25, 99.94th percentile):
-        // normalized = (99.94 - 50.0)/50.0 = 49.94/50.0 = 0.9988 -> points = 24.97
+        // Value rarity (weight 60.0, 99.94th percentile):
+        // normalized = (99.94 - 50.0)/50.0 = 49.94/50.0 = 0.9988 -> points = 59.93
         let comp_val = &breakdown.components[0];
-        assert_eq!(comp_val.component_name, "Value anomaly");
-        assert_eq!(comp_val.weight, 25.0);
-        assert!((comp_val.points_awarded - 24.97).abs() < 0.05);
+        assert_eq!(comp_val.component_name, "Value rarity");
+        assert_eq!(comp_val.weight, 60.0);
+        assert!((comp_val.points_awarded - 59.93).abs() < 0.05);
 
-        // Transaction structure anomaly (weight 20, 95.0th percentile):
-        // normalized = (95.0 - 50.0)/50.0 = 45.0/50.0 = 0.90 -> points = 18.0
+        // Output count structure (weight 15.0, 95.0th percentile):
+        // normalized = (95.0 - 50.0)/50.0 = 45.0/50.0 = 0.90 -> points = 13.5
         let comp_struct = &breakdown.components[1];
-        assert_eq!(comp_struct.weight, 20.0);
-        assert!((comp_struct.points_awarded - 18.0).abs() < 0.05);
+        assert_eq!(comp_struct.component_name, "Output count structure");
+        assert_eq!(comp_struct.weight, 15.0);
+        assert!((comp_struct.points_awarded - 13.5).abs() < 0.05);
 
-        // Total score: (24.97 + 18.0) / (25.0 + 20.0) * 100 = 42.97 / 45 * 100 = 95.49
+        // Total score: 59.93 + 13.5 = 73.43
         assert!(breakdown.total_score.is_some());
         let score = breakdown.total_score.unwrap();
-        assert!((score - 95.49).abs() < 0.1);
+        assert!((score - 73.43).abs() < 0.1);
     }
 }

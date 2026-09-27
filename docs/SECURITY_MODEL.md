@@ -117,19 +117,27 @@ ObsChain processes data from untrusted network sources (peer-to-peer gossip, ext
 - **Baseline Statistical Integrity**:
   - Rarity scoring and baseline calculations in Phase 6B query canonical `chain_events` directly. Replaying the same range multiple times records observation provenance without inflating or distorting historical sample distributions.
 
-### 12. Historical Baselines & Statistical Security (Phase 6B)
+### 12. Historical Baselines & Statistical Security (Phase 6B & 6B.1)
 - **Administrative Baseline API Access Control**:
   - Baseline computation (`POST /api/v1/research/baselines`) is an expensive analytical operation. The endpoint is disabled by default to prevent denial of service. It requires explicit operator activation via `OBSCHAIN_BASELINE_API_ENABLED=true`. Research queries are performed via CLI (`obschain baseline`) in self-hosted environments.
 - **Bounded Range Validation & SQL Aggregate DoS Defenses**:
   - Baseline generation endpoints strictly validate that `start_height < end_height` and enforce a maximum block range (e.g. 500,000 blocks). Unbounded queries that would scan the entire `chain_events` table are rejected immediately with HTTP `400 Bad Request`.
+- **Exact Empirical CDF Query Optimization & DoS Protection**:
+  - Calculating exact empirical percentiles involves population counting. To prevent this from becoming an API DoS vector:
+    - Queries use a single-pass `COUNT(*) FILTER (...)` structure that calculates rank, tail count, and population size in one database round-trip without subqueries.
+    - All lookups are strictly bounded to the baseline window (`block_height BETWEEN $start AND $end`).
+    - Covered by composite index `idx_event_metric_lookup` on `(network, event_type, metric, metric_definition_version, block_height, value_numeric)`.
+    - If the exact population is below `min_sample_size` (100) or exact ranks are unavailable, the engine falls back gracefully to discrete quantile interpolation (`QuantileInterpolationEstimate`, `estimated: true`) without failing the request.
 - **Cross-Network Isolation**:
   - Events from `regtest`, `testnet`, or `signet` are strictly barred from evaluation against `mainnet` baselines. Baseline selection requires exact network matching, and event detail lookup returns HTTP `400 Bad Request` or CLI validation failure if an operator attempts a cross-network comparison.
-- **Integer Precision & Overflow Prevention**:
-  - Metric extraction maps to exact typed variants (`MetricValue::U64`, `MetricValue::U128`, `BasisPoints`, `DecimalScaled`). Coin Age Destroyed (satoshi-days) can exceed $u64::\text{MAX}$ and is strictly evaluated using `u128` arithmetic and stored in PostgreSQL `NUMERIC(38, 4)`. Floating-point conversion is forbidden during distribution calculation.
-- **Baseline Poisoning Prevention**:
-  - Repeated historical replays cannot distort statistical distributions. `BaselineEngine` queries canonical `chain_events` directly, guaranteeing that $100$ replays of an event contribute exactly $1$ sample.
+- **Integer Precision & Overflow Prevention (`NUMERIC(50, 4)`)**:
+  - Metric extraction maps to exact typed variants (`MetricValue::U64`, `MetricValue::U128`, `BasisPoints`, `DecimalScaled`). Coin Age Destroyed (satoshi-days) can exceed $u64::\text{MAX}$ and is strictly evaluated using `u128` arithmetic and stored in PostgreSQL `NUMERIC(50, 4)` (upgraded from `NUMERIC(38, 4)` in `0007_statistical_correctness.sql`). This reserves 46 integer digits, providing 100% lossless storage for `u128::MAX` (39 digits) without float truncation or scientific-notation errors. Mean is stored as `NUMERIC(50, 4)` for decimal precision; std_dev is an approximate descriptive float aggregate.
+- **Metric Table Idempotency & Poisoning Prevention**:
+  - Repeated historical replays cannot distort statistical distributions. `event_metric_values` enforces unique constraint `(event_id, metric, metric_definition_version)`. Replaying $100$ times produces **exactly 1 metric row** per version.
 - **Sample-Size Safeguards**:
   - If a baseline population has fewer than `baseline_min_sample_size` qualifying events (default: 100), percentiles are withheld (`None`) and rarity band returns `INSUFFICIENT_DATA` to prevent misleading high-tail claims on sparse data.
+- **Impact Model Weight Bounding (No Saturation Exploit)**:
+  - Event-type-specific models have component weights summing to exactly 100.0 by construction. Anomaly scores cannot exceed 100.0 mathematically, eliminating vulnerability to score inflation or artificial saturation.
 - **Sovereign Privacy**:
   - In `OBSCHAIN_SOVEREIGN_ONLY=true`, baseline calculation and rarity evaluation run entirely locally against the node's reconstructed events. No third-party analytics APIs or telemetry are invoked.
 

@@ -14,7 +14,8 @@ use uuid::Uuid;
 
 use obschain_core::baseline::{
     BaselineDistribution, BaselineMetric, BaselineQuality, BaselineRun, BaselineRunStatus,
-    EvaluationMode, EventRarityResult, ImpactBreakdown, MetricUnit, MetricValue, RarityBand,
+    EvaluationMode, EventMetricExtractor, EventMetricValue, EventRarityResult, ImpactBreakdown,
+    MetricUnit, MetricValue, PercentileMethod, RarityBand, RarityDirection,
 };
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -240,6 +241,13 @@ impl EventRepository for PostgresStorage {
         .map_err(|e| StorageError::Database(e.to_string()))?;
 
         self.cached_events.fetch_add(1, Ordering::Relaxed);
+
+        // Deduplicated canonical metric extraction
+        let extracted = EventMetricExtractor::extract_event_metrics(event, None);
+        if !extracted.is_empty() {
+            let _ = self.save_event_metrics(&extracted).await;
+        }
+
         Ok(())
     }
 
@@ -3174,13 +3182,13 @@ impl BaselineRepository for PostgresStorage {
                 id, event_id, baseline_run_id, event_type, metric,
                 value_numeric, value_text, percentile, rarity_band,
                 population_size, tail_count, evaluation_mode,
-                impact_score, impact_json, created_at
+                impact_score, impact_json, percentile_method, estimated, created_at
             )
             VALUES (
                 $1, $2, $3, $4, $5,
                 $6::NUMERIC, $7, $8, $9,
                 $10, $11, $12,
-                $13, $14, NOW()
+                $13, $14, $15, $16, NOW()
             )
             ON CONFLICT (event_id, baseline_run_id, metric) DO UPDATE SET
                 value_numeric = EXCLUDED.value_numeric,
@@ -3191,7 +3199,9 @@ impl BaselineRepository for PostgresStorage {
                 tail_count = EXCLUDED.tail_count,
                 evaluation_mode = EXCLUDED.evaluation_mode,
                 impact_score = EXCLUDED.impact_score,
-                impact_json = EXCLUDED.impact_json
+                impact_json = EXCLUDED.impact_json,
+                percentile_method = EXCLUDED.percentile_method,
+                estimated = EXCLUDED.estimated
             "#,
         )
         .bind(Uuid::new_v4())
@@ -3208,6 +3218,8 @@ impl BaselineRepository for PostgresStorage {
         .bind(mode_str)
         .bind(impact_score)
         .bind(impact_json)
+        .bind(rarity.percentile_method.as_str())
+        .bind(rarity.estimated)
         .execute(&self.pool)
         .await
         .map_err(|e| StorageError::Database(e.to_string()))?;
@@ -3257,6 +3269,13 @@ impl BaselineRepository for PostgresStorage {
 
             let pop_size_i64: i64 = row.get("population_size");
             let tail_count_i64: i64 = row.get("tail_count");
+            let method_str: String = row
+                .try_get("percentile_method")
+                .unwrap_or_else(|_| "EXACT_EMPIRICAL_CDF".to_string());
+            let percentile_method: PercentileMethod = method_str
+                .parse()
+                .unwrap_or(PercentileMethod::ExactEmpiricalCdf);
+            let estimated: bool = row.try_get("estimated").unwrap_or(false);
 
             results.push(EventRarityResult {
                 event_id: row.get("event_id"),
@@ -3269,6 +3288,8 @@ impl BaselineRepository for PostgresStorage {
                 population_size: i64_to_u64_checked(pop_size_i64)?,
                 tail_count: i64_to_u64_checked(tail_count_i64)?,
                 evaluation_mode,
+                percentile_method,
+                estimated,
             });
         }
 
@@ -3377,6 +3398,170 @@ impl BaselineRepository for PostgresStorage {
         }
 
         Ok(events)
+    }
+
+    async fn save_event_metrics(&self, metrics: &[EventMetricValue]) -> Result<(), StorageError> {
+        for m in metrics {
+            let event_type_str = serde_json::to_string(&m.event_type)
+                .map_err(StorageError::Serialization)?
+                .trim_matches('"')
+                .to_string();
+            let metric_str = m.metric.as_str();
+            let block_height_i64 = u64_to_i64_checked(m.block_height)?;
+
+            sqlx::query(
+                r#"
+                INSERT INTO event_metric_values (
+                    id, event_id, network, event_type, metric,
+                    metric_definition_version, value_numeric, metric_scale,
+                    block_height, event_time, created_at
+                )
+                VALUES (
+                    $1, $2, $3, $4, $5,
+                    $6, $7::NUMERIC, $8,
+                    $9, $10, NOW()
+                )
+                ON CONFLICT (event_id, metric, metric_definition_version) DO UPDATE SET
+                    value_numeric = EXCLUDED.value_numeric,
+                    metric_scale = EXCLUDED.metric_scale,
+                    block_height = EXCLUDED.block_height,
+                    event_time = EXCLUDED.event_time,
+                    network = EXCLUDED.network
+                "#,
+            )
+            .bind(m.id)
+            .bind(m.event_id)
+            .bind(&m.network)
+            .bind(event_type_str)
+            .bind(metric_str)
+            .bind(&m.metric_definition_version)
+            .bind(m.value.to_numeric_string())
+            .bind(m.metric_scale as i32)
+            .bind(block_height_i64)
+            .bind(m.event_time)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn get_event_metrics(
+        &self,
+        event_id: Uuid,
+    ) -> Result<Vec<EventMetricValue>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, event_id, network, event_type, metric,
+                   metric_definition_version, value_numeric::TEXT as value_numeric,
+                   metric_scale, block_height, event_time, created_at
+            FROM event_metric_values
+            WHERE event_id = $1
+            ORDER BY metric ASC
+            "#,
+        )
+        .bind(event_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            let event_type_str: String = row.get("event_type");
+            let metric_str: String = row.get("metric");
+            let event_type: EventType = serde_json::from_str(&format!("\"{event_type_str}\""))
+                .unwrap_or(EventType::LargeTransfer);
+            let metric: BaselineMetric = metric_str.parse().unwrap_or(BaselineMetric::ValueSats);
+            let scale: i32 = row.get("metric_scale");
+            let val_num_str: String = row.get("value_numeric");
+            let value = MetricValue::from_str_scale_and_metric(&val_num_str, scale as u32, metric);
+            let bh_i64: i64 = row.get("block_height");
+
+            results.push(EventMetricValue {
+                id: row.get("id"),
+                event_id: row.get("event_id"),
+                network: row.get("network"),
+                event_type,
+                metric,
+                metric_definition_version: row.get("metric_definition_version"),
+                value,
+                metric_scale: scale as u32,
+                block_height: i64_to_u64_checked(bh_i64)?,
+                event_time: row.get("event_time"),
+                created_at: row.get("created_at"),
+            });
+        }
+
+        Ok(results)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn get_exact_empirical_rank(
+        &self,
+        network: &str,
+        event_type: EventType,
+        metric: BaselineMetric,
+        metric_definition_version: &str,
+        start_height: u64,
+        end_height: u64,
+        query_value: &MetricValue,
+        direction: RarityDirection,
+    ) -> Result<Option<(f64, u64, u64)>, StorageError> {
+        let start_i64 = u64_to_i64_checked(start_height)?;
+        let end_i64 = u64_to_i64_checked(end_height)?;
+        let event_type_str = serde_json::to_string(&event_type)
+            .map_err(StorageError::Serialization)?
+            .trim_matches('"')
+            .to_string();
+        let metric_str = metric.as_str();
+
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*) FILTER (WHERE value_numeric <= $7::NUMERIC) as count_le,
+                COUNT(*) FILTER (WHERE value_numeric >= $7::NUMERIC) as count_ge,
+                COUNT(*) as total_count
+            FROM event_metric_values
+            WHERE network = $1
+              AND event_type = $2
+              AND metric = $3
+              AND metric_definition_version = $4
+              AND block_height >= $5
+              AND block_height <= $6
+            "#,
+        )
+        .bind(network)
+        .bind(event_type_str)
+        .bind(metric_str)
+        .bind(metric_definition_version)
+        .bind(start_i64)
+        .bind(end_i64)
+        .bind(query_value.to_numeric_string())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let total_count: i64 = row.get("total_count");
+        if total_count == 0 {
+            return Ok(None);
+        }
+
+        let count_le: i64 = row.get("count_le");
+        let count_ge: i64 = row.get("count_ge");
+        let n = total_count as u64;
+
+        match direction {
+            RarityDirection::HigherIsRarer | RarityDirection::TwoSided => {
+                let tail_count = count_ge as u64;
+                let percentile = (count_le as f64 / total_count as f64) * 100.0;
+                Ok(Some((percentile, tail_count, n)))
+            }
+            RarityDirection::LowerIsRarer => {
+                let tail_count = count_le as u64;
+                let percentile = (count_ge as f64 / total_count as f64) * 100.0;
+                Ok(Some((percentile, tail_count, n)))
+            }
+        }
     }
 }
 

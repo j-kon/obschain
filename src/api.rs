@@ -14,7 +14,9 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Utc};
-use obschain_core::baseline::{BaselineMetric, BaselineRunStatus};
+use obschain_core::baseline::{
+    BaselineMetric, BaselineRunStatus, EventMetricExtractor, MetricRegistry,
+};
 use obschain_core::{
     ActivityStatus, ChainEvent, EventSeverity, EventType, IncidentActivity, IncidentAlert,
     ObservationMode, PublicWatchTarget,
@@ -751,10 +753,41 @@ async fn get_event_handler(
             {
                 if let Ok(dists) = state.storage.get_baseline_distributions(baseline.id).await {
                     if !dists.is_empty() {
-                        let rarity_ctx = BaselineEngine::evaluate_event_rarity(
+                        let mut exact_ranks = std::collections::HashMap::new();
+                        let defs = MetricRegistry::metrics_for_event_type(event.event_type);
+                        for def in &defs {
+                            if let Some(val) =
+                                EventMetricExtractor::extract_metric(&event, def.metric)
+                            {
+                                let version = format!(
+                                    "{}-{}",
+                                    def.metric.as_str(),
+                                    EventMetricExtractor::DEFAULT_METRIC_VERSION
+                                );
+                                if let Ok(Some((p, tail, pop))) = state
+                                    .storage
+                                    .get_exact_empirical_rank(
+                                        &baseline.network,
+                                        event.event_type,
+                                        def.metric,
+                                        &version,
+                                        baseline.start_height,
+                                        baseline.end_height,
+                                        &val,
+                                        def.direction,
+                                    )
+                                    .await
+                                {
+                                    exact_ranks.insert(def.metric, (p, tail, pop));
+                                }
+                            }
+                        }
+
+                        let rarity_ctx = BaselineEngine::evaluate_event_rarity_with_exact_ranks(
                             &event,
                             &baseline,
                             &dists,
+                            &exact_ranks,
                             state.baseline_min_sample_size,
                         );
                         val["rarity"] = serde_json::json!({
@@ -763,6 +796,8 @@ async fn get_event_handler(
                                 "metric": rarity_ctx.primary.metric.as_str(),
                                 "value": rarity_ctx.primary.value.to_numeric_string(),
                                 "percentile": rarity_ctx.primary.percentile,
+                                "percentile_method": rarity_ctx.primary.percentile_method.as_str(),
+                                "estimated": rarity_ctx.primary.estimated,
                                 "band": rarity_ctx.primary.rarity_band.as_str(),
                                 "population_size": rarity_ctx.primary.population_size,
                                 "tail_count": rarity_ctx.primary.tail_count,
@@ -771,6 +806,8 @@ async fn get_event_handler(
                                 "metric": s.metric.as_str(),
                                 "value": s.value.to_numeric_string(),
                                 "percentile": s.percentile,
+                                "percentile_method": s.percentile_method.as_str(),
+                                "estimated": s.estimated,
                                 "band": s.rarity_band.as_str(),
                                 "population_size": s.population_size,
                                 "tail_count": s.tail_count,
@@ -1599,10 +1636,40 @@ async fn get_event_rarity_handler(
         .await
         .map_err(map_storage_error)?;
 
-    let rarity_context = BaselineEngine::evaluate_event_rarity(
+    // Query exact empirical ranks from normalized canonical metric population
+    let mut exact_ranks = std::collections::HashMap::new();
+    let defs = MetricRegistry::metrics_for_event_type(event.event_type);
+    for def in &defs {
+        if let Some(val) = EventMetricExtractor::extract_metric(&event, def.metric) {
+            let version = format!(
+                "{}-{}",
+                def.metric.as_str(),
+                EventMetricExtractor::DEFAULT_METRIC_VERSION
+            );
+            if let Ok(Some((p, tail, pop))) = state
+                .storage
+                .get_exact_empirical_rank(
+                    &baseline_run.network,
+                    event.event_type,
+                    def.metric,
+                    &version,
+                    baseline_run.start_height,
+                    baseline_run.end_height,
+                    &val,
+                    def.direction,
+                )
+                .await
+            {
+                exact_ranks.insert(def.metric, (p, tail, pop));
+            }
+        }
+    }
+
+    let rarity_context = BaselineEngine::evaluate_event_rarity_with_exact_ranks(
         &event,
         &baseline_run,
         &distributions,
+        &exact_ranks,
         state.baseline_min_sample_size,
     );
 
@@ -1618,12 +1685,14 @@ async fn get_event_rarity_handler(
             .await;
     }
 
-    // Build rich, clean response matching Section 65 / Section 42
+    // Build rich, clean response matching Section 65 / Section 42 / Section 40
     let mut all_metrics = vec![serde_json::json!({
         "metric": rarity_context.primary.metric.as_str(),
         "value": rarity_context.primary.value.to_numeric_string(),
         "value_display": rarity_context.primary.value.to_string(),
         "percentile": rarity_context.primary.percentile,
+        "percentile_method": rarity_context.primary.percentile_method.as_str(),
+        "estimated": rarity_context.primary.estimated,
         "tail_count": rarity_context.primary.tail_count,
         "population_size": rarity_context.primary.population_size,
         "rarity": rarity_context.primary.rarity_band.as_str(),
@@ -1637,6 +1706,8 @@ async fn get_event_rarity_handler(
             "value": sec.value.to_numeric_string(),
             "value_display": sec.value.to_string(),
             "percentile": sec.percentile,
+            "percentile_method": sec.percentile_method.as_str(),
+            "estimated": sec.estimated,
             "tail_count": sec.tail_count,
             "population_size": sec.population_size,
             "rarity": sec.rarity_band.as_str(),
@@ -1668,6 +1739,8 @@ async fn get_event_rarity_handler(
             "metric": rarity_context.primary.metric.as_str(),
             "value": rarity_context.primary.value.to_numeric_string(),
             "percentile": rarity_context.primary.percentile,
+            "percentile_method": rarity_context.primary.percentile_method.as_str(),
+            "estimated": rarity_context.primary.estimated,
             "tail_count": rarity_context.primary.tail_count,
             "population_size": rarity_context.primary.population_size,
             "band": rarity_context.primary.rarity_band.as_str(),

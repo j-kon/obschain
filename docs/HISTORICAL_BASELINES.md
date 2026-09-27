@@ -29,19 +29,30 @@ Canonical Historical Events (chain_events)
    Typed Metric Extraction (EventMetricExtractor)
                │
                ▼
+   Normalized Metric Storage (event_metric_values)
+   [Unique: (event_id, metric, metric_definition_version)]
+               │
+               ▼
        Baseline Population (Sample Filtering & Deduplication)
                │
                ▼
    Distribution Aggregation (BaselineCalculator: min, max, mean, discrete quantiles)
                │
                ▼
-       Quantiles & Ranks (p50, p75, p90, p95, p99, p99.9 & empirical CDF)
+   Quantile Distributions & Summaries (p50, p75, p90, p95, p99, p99.9)
                │
-               ▼
-    Rarity Classification (Common, Notable, Unusual, Rare, Extreme, InsufficientData)
-               │
-               ▼
- Explainable Impact Breakdown (Normalized Component Weights & Experimental Total)
+               ├─────────────────────────────────────────┐
+               ▼                                         ▼
+   Exact Empirical CDF Rank                  Quantile Interpolation Estimate
+   (ExactEmpiricalCdf, estimated: false)     (QuantileInterpolationEstimate, estimated: true)
+   [Evaluated against actual metric values]  [Fast approximation from sparse quantiles]
+               │                                         │
+               └────────────────────┬────────────────────┘
+                                    ▼
+       Rarity Classification (Common, Notable, Unusual, Rare, Extreme, InsufficientData)
+                                    │
+                                    ▼
+       Event-Type-Specific Impact Model (Normalized Component Weights Sum to 100.0)
 ```
 
 Detectors remain focused on detecting objective network conditions. The baseline engine operates on top of canonical event data.
@@ -84,7 +95,7 @@ Replayable detectors with objective on-chain historical metrics are supported in
 
 ---
 
-## 5. Metric Extraction & Numerical Precision
+## 5. Metric Extraction, Versioning & Numerical Precision
 
 All numeric extraction is centralized in `EventMetricExtractor` avoiding ad-hoc parsing:
 
@@ -92,17 +103,44 @@ All numeric extraction is centralized in `EventMetricExtractor` avoiding ad-hoc 
 extract_metric(event, BaselineMetric::DormantValueSats) -> Option<MetricValue>
 ```
 
-### Supported Metric Value Types
+### Metric Definition Versioning
+Metrics themselves evolve over time. To preserve historical reproducibility and prevent extraction logic changes from silently altering historical interpretations, every metric definition includes an explicit version string:
+- `value-v1`: Large transfer transaction output value (sats).
+- `input-count-v1`, `output-count-v1`: Transaction input/output counts.
+- `vsize-v1`: Transaction virtual size.
+- `interval-v1`: Long block interval duration (seconds).
+- `dormant-value-v1`: Total value of dormant inputs spent (sats).
+- `oldest-input-age-v1`, `average-input-age-v1`: Input age metrics (days).
+- `coin-age-destroyed-v1`: Coin Age Destroyed ($\text{sats} \times \text{days}$).
+- `consolidation-ratio-v1`: Input-to-output consolidation ratio (basis points).
+- `distributed-value-v1`, `median-output-v1`: Fan-out distribution metrics (sats).
+- `fee-rate-v1`: Fee rate (sat/vB, scaled decimal).
+- `fee-sats-v1`: Absolute transaction fee (sats).
+
+### Normalized Canonical Metric Storage (`event_metric_values`)
+Canonical event metrics are normalized into `event_metric_values`:
+- Enforces uniqueness on `(event_id, metric, metric_definition_version)`.
+- Replaying 100 observations of an event creates **exactly 1 canonical metric row** per metric version.
+- Avoids repeated JSON parsing during baseline generation and exact empirical rank lookups.
+- Backed by clean B-Tree indexes on `(network, event_type, metric, metric_definition_version, block_height, value_numeric)`.
+
+### Supported Metric Value Types & PostgreSQL Numeric Precision
 - `MetricValue::U64(u64)`: Satoshis (up to 21M BTC = $2.1 \times 10^{15}$ sats), counts, seconds, days.
 - `MetricValue::U128(u128)`: Coin Age Destroyed satoshi-days ($\text{sats} \times \text{days}$). Safely exceeds $u64::\text{MAX}$ ($1.84 \times 10^{19}$) without overflow or floating-point truncation.
 - `MetricValue::BasisPoints(u32)`: Ratios (e.g. consolidation ratio: $100 = 1.00\times$).
 - `MetricValue::DecimalScaled { value, scale }`: Fee rates (e.g. 15.50 sat/vB as value: 1550, scale: 2).
 
-> **Satoshi Safety**: Satoshi and coin-age arithmetic are NEVER converted to floating-point BTC before computing distributions. BTC formatting is presentation-only. In PostgreSQL, all distribution metrics are stored in `NUMERIC(38, 4)`.
+> **Numeric Domain Safety (`NUMERIC(50, 4)`)**:
+> In Phase 6B.1, PostgreSQL storage was upgraded from `NUMERIC(38, 4)` to `NUMERIC(50, 4)`. Rust's `u128::MAX` is $340,282,366,920,938,463,463,374,607,431,768,211,455$, requiring 39 decimal integer digits. `NUMERIC(38, 4)` reserved 4 decimal places, leaving only 34 digits before the decimal point, causing numeric overflow for large `u128` values. `NUMERIC(50, 4)` allows 46 digits before the decimal, guaranteeing 100% lossless round-trip persistence for all Rust `u128` and Coin Age Destroyed metrics.
+>
+> **Mean and StdDev Precision Semantics**:
+> - `mean` is stored as `NUMERIC(50, 4)` in baseline distributions to prevent floating-point precision loss across large sample totals.
+> - `std_dev` is stored as `FLOAT8` (`DOUBLE PRECISION`) and is explicitly documented as an approximate descriptive aggregate, not a lossless integer representation.
+> - Integer quantile thresholds (`p50` through `p999`) remain exact numeric values with zero float conversion.
 
 ---
 
-## 6. Distribution Methodology & Quantile Semantics
+## 6. Distribution Methodology & Percentile Semantics
 
 For each metric in a baseline run, ObsChain computes:
 - Sample count ($N$)
@@ -121,17 +159,51 @@ $$\text{index} = \lceil p \times N \rceil$$
 
 This guarantees that integer monetary thresholds (e.g., p99 large transfer) correspond to actual transactions mined on the Bitcoin network rather than interpolated fractional satoshis.
 
-### Empirical CDF Percentile-Rank Formula
-When ranking an event value $x$ against a reference population:
+### Exact Empirical Percentile vs Quantile Interpolation
+
+ObsChain makes an explicit mathematical distinction between two ranking methods:
+
+```rust
+pub enum PercentileMethod {
+    /// Exact empirical rank computed against the actual historical canonical metric population.
+    ExactEmpiricalCdf,
+    /// Linear interpolation between precomputed discrete quantiles (p50, p75, p90, p95, p99, p99.9).
+    QuantileInterpolationEstimate,
+}
+```
+
+Every rarity result records which method produced it and sets `estimated: bool` accordingly (`false` for exact CDF, `true` for interpolation).
+
+#### 1. Exact Empirical CDF (`ExactEmpiricalCdf`)
+When exact empirical ranking is performed, the query calculates the rank directly against the actual canonical metric values in `event_metric_values` within the baseline window:
 
 $$\text{percentile}(x) = \left( \frac{\text{count}(s \le x)}{N} \right) \times 100.0$$
 
-### Inclusive Tie Handling
-Ties are treated **inclusively** in both cumulative distribution and tail counts:
-- An event with value equal to 3 other historical events is counted as $\le x$ for all matching events.
-- Tail count represents the number of events with value $\ge x$:
+Tail count is the exact number of events matching or exceeding $x$:
 
 $$\text{tail\_count}(x) = \text{count}(s \ge x)$$
+
+Ties are treated **inclusively** in both cumulative distribution and tail counts.
+
+Parameterized single-pass SQL implementation:
+```sql
+SELECT
+    COUNT(*) FILTER (WHERE value_numeric <= $1),
+    COUNT(*) FILTER (WHERE value_numeric >= $1),
+    COUNT(*)
+FROM event_metric_values
+WHERE network = $2
+  AND event_type = $3
+  AND metric = $4
+  AND metric_definition_version = $5
+  AND block_height BETWEEN $6 AND $7;
+```
+
+#### 2. Quantile Interpolation Estimate (`QuantileInterpolationEstimate`)
+When evaluating against stored distribution summaries without scanning the raw metric population:
+- The percentile is estimated by piece-wise linear interpolation between discrete quantiles ($p50, p75, p90, p95, p99, p99.9$).
+- Marked explicitly as `estimated: true` and `percentile_method: QUANTILE_INTERPOLATION_ESTIMATE`.
+- Never labeled as `EXACT_EMPIRICAL_CDF`. Useful for visualization, rapid inspection, and lightweight summary previews.
 
 **Example Dataset**: $[10, 10, 10, 20, 20, 30]$ ($N = 6$):
 - Value $10$: $3 / 6 = 50.00\%$, Tail count = $6$
@@ -191,49 +263,114 @@ When evaluating an event against a baseline, ObsChain distinguishes:
 
 ## 10. Explainable Impact Intelligence (`ImpactBreakdown`)
 
-Composite anomaly significance is broken down into visible components:
+In Phase 6B.1, the impact scoring model was completely overhauled to eliminate weight saturation flaws.
 
+### Previous Model Flaw
+Previously, a universal model assigned component weights totaling 135:
 ```text
 Value anomaly                 0–25 points
 Coin-age anomaly              0–25 points
 Fee anomaly                   0–15 points
 Transaction structure anomaly 0–20 points
 Network anomaly               0–50 points
+Total:                        135 points (clamped to 100.0)
 ```
+Clamping a >100 weighted model caused premature saturation (events reached 100 before their metrics reached the tail) and obscured composition evidence. Furthermore, non-applicable components (e.g. asking for transaction structure in a `LongBlockInterval`) distorted scoring.
 
-### Deterministic Percentile-to-Points Formula
+### Event-Type-Specific Impact Models
+ObsChain implements dedicated, isolated impact models for each supported event type where component weights sum to **exactly 100.0**:
+
+1. **`LargeTransfer` (`obschain-impact-large-transfer-v1`)**:
+   - `value_sats`: 60.0%
+   - `input_count`: 15.0%
+   - `output_count`: 15.0%
+   - `vsize`: 10.0%
+   - **Total**: 100.0%
+
+2. **`DormantCoinsMoved` (`obschain-impact-dormant-coins-v1`)**:
+   - `dormant_value_sats`: 35.0%
+   - `oldest_input_age_days`: 30.0%
+   - `coin_age_destroyed_satoshi_days`: 25.0%
+   - `input_count`: 10.0%
+   - **Total**: 100.0%
+
+3. **`LongBlockInterval` (`obschain-impact-long-block-interval-v1`)**:
+   - `interval_seconds`: 100.0%
+   - **Total**: 100.0% *(Contains NO fee, coin-age, or transaction structure components)*
+
+4. **`Consolidation` (`obschain-impact-consolidation-v1`)**:
+   - `input_count`: 40.0%
+   - `consolidation_ratio`: 30.0%
+   - `value_sats`: 20.0%
+   - `output_count`: 10.0%
+   - **Total**: 100.0%
+
+5. **`FanOut` (`obschain-impact-fan-out-v1`)**:
+   - `output_count`: 40.0%
+   - `distributed_value_sats`: 35.0%
+   - `median_output_sats`: 25.0%
+   - **Total**: 100.0%
+
+6. **`ExtremeFee` (`obschain-impact-extreme-fee-v1`)**:
+   - `fee_rate_sat_vb`: 60.0%
+   - `fee_sats`: 40.0%
+   - **Total**: 100.0%
+
+### Mathematical Range Proof (No Structural Clamping)
 Anomaly points scale linearly for upper-half anomalies ($p \ge 50.0\%$):
 
-$$\text{normalized} = \frac{p - 50.0}{50.0}$$
-$$\text{points\_awarded} = \text{max\_points} \times \text{normalized}$$
+$$\text{normalized}_i = \frac{\max(0, p_i - 50.0)}{50.0}$$
+$$\text{points\_awarded}_i = \text{weight}_i \times \text{normalized}_i$$
 
-Events at or below median ($p < 50.0\%$) receive 0 anomaly points.
+Since $p_i \le 100.0$, $\text{normalized}_i \le 1.0$, which implies:
 
-### Impact Metadata & Status
-- `model_version`: `obschain-impact-v1`
-- `status`: `EXPERIMENTAL` (disclosed on all API responses)
-- If required data is insufficient, `total_score` is `None` rather than manufactured precision.
+$$\text{points\_awarded}_i \le \text{weight}_i$$
+$$\sum_{i} \text{points\_awarded}_i \le \sum_{i} \text{weight}_i = 100.0$$
+
+The score is mathematically bounded within $[0.0, 100.0]$ **by construction**. Structural clamping (`score.min(100.0)`) is removed, leaving only a defensive floating-point epsilon check at `100.00000001`.
+
+### Component Coverage & Score Availability
+If certain metrics are missing (e.g. UTXO input age unavailable), ObsChain calculates coverage:
+
+$$\text{model\_coverage} = \frac{\sum \text{applicable\_weights}}{100.0}$$
+
+- If `model_coverage` is below 50% ($0.50$), or if the population sample count is below `min_sample_size` (100), the composite score is **suppressed** (`total_score: None`).
+- If `model_coverage >= 0.50`, the score is normalized over available components: $\text{score} = \frac{\sum \text{points}}{\text{model\_coverage}}$.
+
+### Cross-Event Comparability Boundary
+An impact score for `DormantCoinsMoved` and `LongBlockInterval` cannot be naively compared as identical universal danger rankings. They represent relative anomaly indexes within their respective event-type models. Every score explicitly exposes:
+- `model_id`: e.g. `obschain-impact-dormant-coins-v1`
+- `event_type`: e.g. `DORMANT_COINS_MOVED`
+- `model_coverage`: e.g. `1.0` (100%)
+- `status`: `EXPERIMENTAL`
 
 ---
 
-## 11. PostgreSQL Schema (`0006_historical_baselines.sql`)
+## 11. PostgreSQL Schema (`0006_historical_baselines.sql` & `0007_statistical_correctness.sql`)
 
 ```sql
-CREATE TABLE baseline_runs (
-    id UUID PRIMARY KEY,
+-- Normalized Canonical Event Metrics (0007_statistical_correctness.sql)
+CREATE TABLE event_metric_values (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_id UUID NOT NULL REFERENCES chain_events(id) ON DELETE CASCADE,
+    event_type VARCHAR(64) NOT NULL,
+    metric VARCHAR(64) NOT NULL,
+    value_numeric NUMERIC(50, 4) NOT NULL,
+    metric_scale INTEGER NOT NULL DEFAULT 0,
+    block_height BIGINT,
+    event_time TIMESTAMPTZ NOT NULL,
     network VARCHAR(32) NOT NULL,
-    start_height BIGINT NOT NULL,
-    end_height BIGINT NOT NULL,
-    started_at TIMESTAMPTZ NOT NULL,
-    completed_at TIMESTAMPTZ,
-    status VARCHAR(32) NOT NULL,
-    algorithm_version VARCHAR(64) NOT NULL,
-    canonical_event_count BIGINT NOT NULL DEFAULT 0,
-    error_message TEXT,
-    metadata JSONB NOT NULL DEFAULT '{}',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    metric_definition_version VARCHAR(64) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_event_metric_version UNIQUE (event_id, metric, metric_definition_version)
 );
 
+CREATE INDEX idx_event_metric_lookup ON event_metric_values(
+    network, event_type, metric, metric_definition_version, block_height, value_numeric
+);
+CREATE INDEX idx_event_metric_event_id ON event_metric_values(event_id);
+
+-- Baseline Distributions (0006 & 0007 migrations)
 CREATE TABLE baseline_distributions (
     id UUID PRIMARY KEY,
     baseline_run_id UUID NOT NULL REFERENCES baseline_runs(id) ON DELETE CASCADE,
@@ -245,27 +382,28 @@ CREATE TABLE baseline_distributions (
     missing_count BIGINT NOT NULL,
     coverage_ratio DOUBLE PRECISION NOT NULL,
     quality VARCHAR(32) NOT NULL,
-    minimum NUMERIC(38, 4) NOT NULL,
-    maximum NUMERIC(38, 4) NOT NULL,
-    mean DOUBLE PRECISION NOT NULL,
-    p50 NUMERIC(38, 4) NOT NULL,
-    p75 NUMERIC(38, 4) NOT NULL,
-    p90 NUMERIC(38, 4) NOT NULL,
-    p95 NUMERIC(38, 4) NOT NULL,
-    p99 NUMERIC(38, 4) NOT NULL,
-    p999 NUMERIC(38, 4) NOT NULL,
+    minimum NUMERIC(50, 4) NOT NULL,
+    maximum NUMERIC(50, 4) NOT NULL,
+    mean NUMERIC(50, 4) NOT NULL,
+    p50 NUMERIC(50, 4) NOT NULL,
+    p75 NUMERIC(50, 4) NOT NULL,
+    p90 NUMERIC(50, 4) NOT NULL,
+    p95 NUMERIC(50, 4) NOT NULL,
+    p99 NUMERIC(50, 4) NOT NULL,
+    p999 NUMERIC(50, 4) NOT NULL,
     samples_json JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_baseline_dist_metric UNIQUE (baseline_run_id, event_type, metric)
 );
 
+-- Event Rarity Evaluations (0006 & 0007 migrations)
 CREATE TABLE event_rarity (
     id UUID PRIMARY KEY,
     event_id UUID NOT NULL REFERENCES chain_events(id) ON DELETE CASCADE,
     baseline_run_id UUID NOT NULL REFERENCES baseline_runs(id) ON DELETE CASCADE,
     event_type VARCHAR(64) NOT NULL,
     metric VARCHAR(64) NOT NULL,
-    raw_value NUMERIC(38, 4) NOT NULL,
+    raw_value NUMERIC(50, 4) NOT NULL,
     percentile DOUBLE PRECISION,
     rarity_band VARCHAR(32) NOT NULL,
     population_size BIGINT NOT NULL,
@@ -273,6 +411,8 @@ CREATE TABLE event_rarity (
     evaluation_mode VARCHAR(32) NOT NULL,
     impact_breakdown JSONB,
     calculated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    percentile_method VARCHAR(64) NOT NULL DEFAULT 'EXACT_EMPIRICAL_CDF',
+    estimated BOOLEAN NOT NULL DEFAULT FALSE,
     CONSTRAINT uq_event_rarity_metric UNIQUE (event_id, baseline_run_id, metric)
 );
 ```
@@ -289,7 +429,7 @@ cargo run --bin obschain -- baseline \
   --start 840000 \
   --end 850000 \
   --network mainnet \
-  --algorithm-version obschain-baseline-v1
+  --algorithm-version obschain-baseline-v2
 ```
 
 Optional event-specific filter:
@@ -327,28 +467,32 @@ Baseline Context:
   Population:    18421 qualifying events
   Quality:       HIGH
   Mode:          RETROSPECTIVE
-  Algorithm:     obschain-baseline-v1
+  Algorithm:     obschain-baseline-v2
 
 Primary Metric:
   Metric:        dormant_value_sats
   Raw Value:     428104000000 (4281.04 BTC)
   Percentile:    99.94%
+  Method:        EXACT_EMPIRICAL_CDF (Exact)
   Tail Count:    11
   Rarity Band:   EXTREME
   Frequency:     11 comparable-or-rarer events across 18,421 qualifying events (approx. 1 in 1674)
 
 Secondary Metrics:
-  - oldest_input_age_days: 4526 days | Percentile: 99.72% | Rarity: EXTREME
-  - coin_age_destroyed_satoshi_days: 19375987040000000 | Percentile: 99.88% | Rarity: EXTREME
-  - input_count: 2 | Percentile: 65.40% | Rarity: COMMON
+  - oldest_input_age_days: 4526 days | Percentile: 99.72% (EXACT_EMPIRICAL_CDF) | Rarity: EXTREME
+  - coin_age_destroyed_satoshi_days: 19375987040000000 | Percentile: 99.88% (EXACT_EMPIRICAL_CDF) | Rarity: EXTREME
+  - input_count: 2 | Percentile: 65.40% (EXACT_EMPIRICAL_CDF) | Rarity: COMMON
 
 Composite Impact (EXPERIMENTAL):
-  Model Version: obschain-impact-v1
-  Total Score:   72.4 / 100.0
+  Model ID:      obschain-impact-dormant-coins-v1
+  Event Type:    DORMANT_COINS_MOVED
+  Coverage:      100.0%
+  Total Score:   92.7 / 100.0
   Components:
-    - Value anomaly:                 24.9 / 25.0
-    - Coin-age anomaly:              24.9 / 25.0
-    - Transaction structure anomaly: 6.2 / 20.0
+    - dormant_value_sats:              34.9 / 35.0
+    - oldest_input_age_days:           29.8 / 30.0
+    - coin_age_destroyed_satoshi_days: 24.9 / 25.0
+    - input_count:                      3.1 / 10.0
 ============================================================
 ```
 

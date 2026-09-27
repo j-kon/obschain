@@ -10,8 +10,8 @@ pub use repository::{
 
 use chrono::{DateTime, Utc};
 use obschain_core::baseline::{
-    BaselineDistribution, BaselineMetric, BaselineRun, BaselineRunStatus, EventRarityResult,
-    ImpactBreakdown,
+    BaselineDistribution, BaselineMetric, BaselineRun, BaselineRunStatus, EventMetricValue,
+    EventRarityResult, ImpactBreakdown, MetricValue, RarityDirection,
 };
 use obschain_core::{
     ActivityStatus, ChainEvent, EventObservation, EventType, Incident, IncidentActivity,
@@ -530,6 +530,65 @@ impl BaselineRepository for Storage {
             Self::Postgres(p) => {
                 p.query_events_for_baseline(event_type, start_height, end_height)
                     .await
+            }
+        }
+    }
+
+    async fn save_event_metrics(&self, metrics: &[EventMetricValue]) -> Result<(), StorageError> {
+        match self {
+            Self::Memory(m) => m.save_event_metrics(metrics).await,
+            Self::Postgres(p) => p.save_event_metrics(metrics).await,
+        }
+    }
+
+    async fn get_event_metrics(
+        &self,
+        event_id: Uuid,
+    ) -> Result<Vec<EventMetricValue>, StorageError> {
+        match self {
+            Self::Memory(m) => m.get_event_metrics(event_id).await,
+            Self::Postgres(p) => p.get_event_metrics(event_id).await,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn get_exact_empirical_rank(
+        &self,
+        network: &str,
+        event_type: EventType,
+        metric: BaselineMetric,
+        metric_definition_version: &str,
+        start_height: u64,
+        end_height: u64,
+        query_value: &MetricValue,
+        direction: RarityDirection,
+    ) -> Result<Option<(f64, u64, u64)>, StorageError> {
+        match self {
+            Self::Memory(m) => {
+                m.get_exact_empirical_rank(
+                    network,
+                    event_type,
+                    metric,
+                    metric_definition_version,
+                    start_height,
+                    end_height,
+                    query_value,
+                    direction,
+                )
+                .await
+            }
+            Self::Postgres(p) => {
+                p.get_exact_empirical_rank(
+                    network,
+                    event_type,
+                    metric,
+                    metric_definition_version,
+                    start_height,
+                    end_height,
+                    query_value,
+                    direction,
+                )
+                .await
             }
         }
     }

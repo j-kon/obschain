@@ -179,9 +179,14 @@ ObsChain establishes a strict separation between logical Bitcoin events and obse
 
 ---
 
-## Event Rarity Context & Impact Intelligence (Phase 6B)
+## Event Rarity Context & Impact Intelligence (Phase 6B & 6B.1)
 
 Each canonical `ChainEvent` can be evaluated against precomputed empirical baselines to answer: *How unusual is this event compared with Bitcoin history?*
+
+### Event Metric Extraction & Deduplication Invariant
+When a canonical event is created or updated, its canonical metrics are extracted via `EventMetricExtractor` and saved to `event_metric_values` with a unique constraint on `(event_id, metric, metric_definition_version)`.
+- **Deduplication Invariant**: Multiple observations (e.g. 100 replays or multi-node witnesses) of 1 canonical event produce **exactly 1 set of canonical metric rows**.
+- **Versioned Definitions**: Each metric is versioned (e.g. `dormant-value-v1`, `coin-age-destroyed-v1`) to prevent methodology drift over time.
 
 ### Event Rarity Structure
 ```json
@@ -192,6 +197,8 @@ Each canonical `ChainEvent` can be evaluated against precomputed empirical basel
       "metric": "dormant_value_sats",
       "value": "428104000000",
       "percentile": 99.94,
+      "percentile_method": "EXACT_EMPIRICAL_CDF",
+      "estimated": false,
       "tail_count": 11,
       "population_size": 18421,
       "rarity_band": "EXTREME"
@@ -201,26 +208,37 @@ Each canonical `ChainEvent` can be evaluated against precomputed empirical basel
         "metric": "oldest_input_age_days",
         "value": "4526",
         "percentile": 99.72,
+        "percentile_method": "EXACT_EMPIRICAL_CDF",
+        "estimated": false,
         "tail_count": 52,
         "population_size": 18421,
         "rarity_band": "EXTREME"
       }
     ],
     "impact": {
-      "model_version": "obschain-impact-v1",
+      "model_id": "obschain-impact-dormant-coins-v1",
+      "model_version": "obschain-impact-dormant-coins-v1",
+      "event_type": "DORMANT_COINS_MOVED",
+      "model_coverage": 1.0,
       "status": "EXPERIMENTAL",
-      "total_score": 72.4,
+      "score": 92.7,
       "components": [
-        { "component_name": "Value anomaly", "weight": 25.0, "points_awarded": 24.9, "percentile": 99.94 },
-        { "component_name": "Coin-age anomaly", "weight": 25.0, "points_awarded": 24.9, "percentile": 99.72 }
+        { "component_name": "dormant_value_sats", "weight": 35.0, "points_awarded": 34.9, "percentile": 99.94 },
+        { "component_name": "oldest_input_age_days", "weight": 30.0, "points_awarded": 29.8, "percentile": 99.72 },
+        { "component_name": "coin_age_destroyed_satoshi_days", "weight": 25.0, "points_awarded": 24.9, "percentile": 99.88 },
+        { "component_name": "input_count", "weight": 10.0, "points_awarded": 3.1, "percentile": 65.40 }
       ]
     }
   }
 }
 ```
 
+- **Percentile Methods**:
+  - `EXACT_EMPIRICAL_CDF` (`estimated: false`): Exact empirical CDF rank calculated directly against raw metric values in `event_metric_values` within the baseline window using inclusive tie handling.
+  - `QUANTILE_INTERPOLATION_ESTIMATE` (`estimated: true`): Fast linear interpolation between discrete quantiles ($p50, p75, p90, p95, p99, p99.9$).
 - **Rarity Bands**: `COMMON` (<90%), `NOTABLE` (90–95%), `UNUSUAL` (95–99%), `RARE` (99–99.9%), `EXTREME` (>=99.9%), or `INSUFFICIENT_DATA` (sample size < 100).
 - **Evaluation Mode**: `RETROSPECTIVE` if the baseline includes blocks after the event; `POINT_IN_TIME` if the baseline only includes blocks confirmed before the event.
+- **Event-Type-Specific Impact Models**: Component weights sum to 100.0 by construction without structural clamping. Scores require `model_coverage >= 50%` and sample size $\ge 100$, otherwise score is suppressed (`None`).
 
 See [docs/HISTORICAL_BASELINES.md](HISTORICAL_BASELINES.md) for full statistical models and metric registries.
 

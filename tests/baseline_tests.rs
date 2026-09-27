@@ -8,7 +8,8 @@ use obschain::api::AppState;
 use obschain::create_router;
 use obschain_core::baseline::{
     BaselineDistribution, BaselineMetric, BaselineQuality, BaselineRunStatus, EvaluationMode,
-    EventRarityResult, HalvingEpoch, MetricUnit, MetricValue, RarityBand, RarityDirection,
+    EventRarityResult, HalvingEpoch, MetricUnit, MetricValue, PercentileMethod, RarityBand,
+    RarityDirection,
 };
 use obschain_core::{
     ChainEvent, ConfidenceLevel, EventObservation, EventObservationKind, EventSeverity, EventType,
@@ -420,28 +421,41 @@ fn test_explainable_impact_breakdown_formula() {
         metric: BaselineMetric::ValueSats,
         value: MetricValue::U64(1_000_000_000_000),
         percentile: Some(99.0),
+        percentile_method: PercentileMethod::ExactEmpiricalCdf,
+        estimated: false,
         rarity_band: RarityBand::Rare,
         population_size: 10_000,
         tail_count: 100,
         evaluation_mode: EvaluationMode::Retrospective,
     };
+    let secondary = EventRarityResult {
+        event_id: primary.event_id,
+        baseline_run_id: primary.baseline_run_id,
+        event_type: EventType::LargeTransfer,
+        metric: BaselineMetric::OutputCount,
+        value: MetricValue::U64(50),
+        percentile: Some(95.0),
+        percentile_method: PercentileMethod::ExactEmpiricalCdf,
+        estimated: false,
+        rarity_band: RarityBand::Unusual,
+        population_size: 10_000,
+        tail_count: 500,
+        evaluation_mode: EvaluationMode::Retrospective,
+    };
 
-    let impact = ImpactCalculator::calculate_impact(
-        EventType::LargeTransfer,
-        &[primary],
-        Some("obschain-impact-v1"),
-    );
+    let impact =
+        ImpactCalculator::calculate_impact(EventType::LargeTransfer, &[primary, secondary], None);
 
-    assert_eq!(impact.model_version, "obschain-impact-v1");
+    assert_eq!(impact.model_id, "obschain-impact-large-transfer-v1");
     assert_eq!(impact.status, "EXPERIMENTAL");
     assert!(impact.total_score.is_some());
 
-    // Value rarity max points = 25
-    // Percentile 99.0% -> normalized points = 25.0 * (99.0 / 100.0) = 24.75 -> rounded 24.75
+    // Value rarity max points = 60.0
+    // (99.0 - 50.0)/50.0 = 0.98 -> 60.0 * 0.98 = 58.8 points
     let comp = &impact.components[0];
-    assert_eq!(comp.component_name, "Value anomaly");
-    assert_eq!(comp.weight, 25.0);
-    assert_eq!(comp.points_awarded, 24.5);
+    assert_eq!(comp.component_name, "Value rarity");
+    assert_eq!(comp.weight, 60.0);
+    assert!((comp.points_awarded - 58.8).abs() < 0.1);
     assert_eq!(comp.percentile, Some(99.0));
     assert_eq!(comp.population_size, 10_000);
 }
@@ -658,4 +672,475 @@ async fn test_postgres_baseline_persistence() {
     assert_eq!(dists.len(), 1);
     assert_eq!(dists[0].metric, BaselineMetric::ValueSats);
     assert_eq!(dists[0].maximum.as_u64(), Some(2_100_000_000_000_000));
+}
+
+// ---------------------------------------------------------------------------
+// 13. Section 34: Exact Empirical CDF vs Quantile Interpolation on Skewed Dataset
+// ---------------------------------------------------------------------------
+#[test]
+fn test_exact_empirical_cdf_vs_quantile_interpolation_skewed() {
+    // Deliberately skewed dataset of 10,000 samples:
+    // 9,900 samples with value 100
+    // 90 samples with value 500
+    // 10 samples with value 10,000
+    let mut samples = Vec::with_capacity(10_000);
+    for _ in 0..9_900 {
+        samples.push(MetricValue::U64(100));
+    }
+    for _ in 0..90 {
+        samples.push(MetricValue::U64(500));
+    }
+    for _ in 0..10 {
+        samples.push(MetricValue::U64(10_000));
+    }
+    samples.sort();
+
+    // Query value: 499 (just below 500)
+    let query_val = MetricValue::U64(499);
+
+    // Exact empirical rank:
+    // Elements <= 499 is exactly 9,900 out of 10,000 -> 99.00%
+    let (exact_p, tail_count) =
+        BaselineCalculator::rank_value(&samples, query_val, RarityDirection::HigherIsRarer);
+    assert_eq!(exact_p, 99.0);
+    assert_eq!(tail_count, 100); // 90 with 500 + 10 with 10,000
+
+    // Construct distribution quantiles representing this dataset:
+    // p99 (sample 9900) = 100
+    // p99.9 (sample 9990) = 500
+    let dist = BaselineDistribution {
+        id: Uuid::new_v4(),
+        baseline_run_id: Uuid::new_v4(),
+        event_type: EventType::LargeTransfer,
+        metric: BaselineMetric::ValueSats,
+        unit: MetricUnit::Satoshis,
+        sample_count: 10_000,
+        candidate_count: 10_000,
+        missing_count: 0,
+        coverage_ratio: 1.0,
+        quality: BaselineQuality::High,
+        minimum: MetricValue::U64(100),
+        maximum: MetricValue::U64(10_000),
+        mean: 113.6,
+        p50: MetricValue::U64(100),
+        p75: MetricValue::U64(100),
+        p90: MetricValue::U64(100),
+        p95: MetricValue::U64(100),
+        p99: MetricValue::U64(100),
+        p999: MetricValue::U64(500),
+        samples_json: None,
+        created_at: Utc::now(),
+    };
+
+    // Quantile interpolation estimate between p99 (100) and p99.9 (500):
+    // frac = (499 - 100) / (500 - 100) = 399 / 400 = 0.9975
+    // estimated percentile = 99.0 + 0.9975 * 0.9 = 99.89775%
+    let (est_p, _est_tail) = BaselineCalculator::rank_from_distribution(
+        &dist,
+        query_val,
+        RarityDirection::HigherIsRarer,
+    );
+    assert!((est_p - 99.897).abs() < 0.05);
+
+    // Material difference demonstration: exact is 99.00%, estimate is 99.90%
+    let diff = (est_p - exact_p).abs();
+    assert!(
+        diff > 0.85,
+        "Expected material difference between exact eCDF and linear interpolation, got {diff}"
+    );
+
+    // Verify evaluation engine tags methods accurately:
+    let ev = create_large_transfer_event("tx_skewed", 499, 850_000, "mainnet");
+    let baseline =
+        BaselineEngine::create_run_record("mainnet", 800_000, 900_000, "obschain-baseline-v2");
+
+    // Evaluation with exact rank:
+    let mut exact_map = std::collections::HashMap::new();
+    exact_map.insert(BaselineMetric::ValueSats, (exact_p, tail_count, 10_000));
+    let ctx_exact = BaselineEngine::evaluate_event_rarity_with_exact_ranks(
+        &ev,
+        &baseline,
+        std::slice::from_ref(&dist),
+        &exact_map,
+        100,
+    );
+    assert_eq!(
+        ctx_exact.primary.percentile_method,
+        PercentileMethod::ExactEmpiricalCdf
+    );
+    assert!(!ctx_exact.primary.estimated);
+    assert_eq!(ctx_exact.primary.percentile, Some(99.0));
+
+    // Evaluation without exact rank (falls back to quantile interpolation estimate):
+    let empty_map = std::collections::HashMap::new();
+    let ctx_est = BaselineEngine::evaluate_event_rarity_with_exact_ranks(
+        &ev,
+        &baseline,
+        &[dist],
+        &empty_map,
+        100,
+    );
+    assert_eq!(
+        ctx_est.primary.percentile_method,
+        PercentileMethod::QuantileInterpolationEstimate
+    );
+    assert!(ctx_est.primary.estimated);
+    assert!((ctx_est.primary.percentile.unwrap() - 99.897).abs() < 0.05);
+}
+
+// ---------------------------------------------------------------------------
+// 14. Section 35: Impact Weight Saturation Bound (Never Exceeds 100 by Construction)
+// ---------------------------------------------------------------------------
+#[test]
+fn test_impact_weight_saturation_never_exceeds_100_by_construction() {
+    let supported = obschain_core::MetricRegistry::supported_event_types();
+    assert_eq!(supported.len(), 6);
+
+    for event_type in supported {
+        let defs = obschain_core::MetricRegistry::metrics_for_event_type(event_type);
+        // Create 100th percentile for EVERY registered metric of this event type
+        let rarities: Vec<EventRarityResult> = defs
+            .iter()
+            .map(|def| EventRarityResult {
+                event_id: Uuid::new_v4(),
+                baseline_run_id: Uuid::new_v4(),
+                event_type,
+                metric: def.metric,
+                value: MetricValue::U64(1_000_000),
+                percentile: Some(100.0),
+                percentile_method: PercentileMethod::ExactEmpiricalCdf,
+                estimated: false,
+                rarity_band: RarityBand::Extreme,
+                population_size: 50_000,
+                tail_count: 1,
+                evaluation_mode: EvaluationMode::Retrospective,
+            })
+            .collect();
+
+        let breakdown = ImpactCalculator::calculate_impact(event_type, &rarities, None);
+        assert_eq!(breakdown.status, "EXPERIMENTAL");
+        assert_eq!(breakdown.model_coverage, 1.0);
+        assert!(breakdown.total_score.is_some());
+
+        let total = breakdown.total_score.unwrap();
+        // Mathematical proof: total score must be exactly 100.0 by construction, never > 100.0
+        assert!(
+            (total - 100.0).abs() < 0.0001,
+            "Event {:?} max impact score should be 100.0, got {}",
+            event_type,
+            total
+        );
+
+        let raw_points_sum: f64 = breakdown.components.iter().map(|c| c.points_awarded).sum();
+        assert!(
+            (raw_points_sum - 100.0).abs() < 0.0001,
+            "Event {:?} sum of component points must equal 100.0 without structural clamp",
+            event_type
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 15. Section 36: Event-Specific Impact Models (No Irrelevant Components)
+// ---------------------------------------------------------------------------
+#[test]
+fn test_event_specific_impact_models_no_irrelevant_components() {
+    // Test LongBlockInterval: must ONLY contain IntervalSeconds (weight 100.0)
+    // Irrelevant metrics (e.g. ValueSats, FeeSats, CoinAgeDestroyed) must NOT appear.
+    let lbi_rarities = vec![
+        EventRarityResult {
+            event_id: Uuid::new_v4(),
+            baseline_run_id: Uuid::new_v4(),
+            event_type: EventType::LongBlockInterval,
+            metric: BaselineMetric::IntervalSeconds,
+            value: MetricValue::U64(7200),
+            percentile: Some(99.5),
+            percentile_method: PercentileMethod::ExactEmpiricalCdf,
+            estimated: false,
+            rarity_band: RarityBand::Rare,
+            population_size: 20_000,
+            tail_count: 100,
+            evaluation_mode: EvaluationMode::Retrospective,
+        },
+        // Injected irrelevant metrics from other event types:
+        EventRarityResult {
+            event_id: Uuid::new_v4(),
+            baseline_run_id: Uuid::new_v4(),
+            event_type: EventType::LongBlockInterval,
+            metric: BaselineMetric::ValueSats,
+            value: MetricValue::U64(10_000_000_000),
+            percentile: Some(99.9),
+            percentile_method: PercentileMethod::ExactEmpiricalCdf,
+            estimated: false,
+            rarity_band: RarityBand::Extreme,
+            population_size: 20_000,
+            tail_count: 2,
+            evaluation_mode: EvaluationMode::Retrospective,
+        },
+    ];
+
+    let lbi_impact =
+        ImpactCalculator::calculate_impact(EventType::LongBlockInterval, &lbi_rarities, None);
+
+    assert_eq!(
+        lbi_impact.model_id,
+        "obschain-impact-long-block-interval-v1"
+    );
+    assert_eq!(lbi_impact.components.len(), 1);
+    assert_eq!(
+        lbi_impact.components[0].component_name,
+        "Network interval rarity"
+    );
+    assert_eq!(lbi_impact.components[0].weight, 100.0);
+    assert_eq!(
+        lbi_impact.components[0].metric,
+        BaselineMetric::IntervalSeconds
+    );
+
+    // Verify ExtremeFee: only FeeRateSatVb (60) and FeeSats (40) = 100
+    let fee_defs = obschain_core::MetricRegistry::metrics_for_event_type(EventType::ExtremeFee);
+    assert_eq!(fee_defs.len(), 2);
+    let fee_rarities = vec![
+        EventRarityResult {
+            event_id: Uuid::new_v4(),
+            baseline_run_id: Uuid::new_v4(),
+            event_type: EventType::ExtremeFee,
+            metric: BaselineMetric::FeeRateSatVb,
+            value: MetricValue::DecimalScaled {
+                value: 15000,
+                scale: 2,
+            },
+            percentile: Some(98.0),
+            percentile_method: PercentileMethod::ExactEmpiricalCdf,
+            estimated: false,
+            rarity_band: RarityBand::Rare,
+            population_size: 5_000,
+            tail_count: 100,
+            evaluation_mode: EvaluationMode::Retrospective,
+        },
+        EventRarityResult {
+            event_id: Uuid::new_v4(),
+            baseline_run_id: Uuid::new_v4(),
+            event_type: EventType::ExtremeFee,
+            metric: BaselineMetric::FeeSats,
+            value: MetricValue::U64(50_000_000),
+            percentile: Some(95.0),
+            percentile_method: PercentileMethod::ExactEmpiricalCdf,
+            estimated: false,
+            rarity_band: RarityBand::Unusual,
+            population_size: 5_000,
+            tail_count: 250,
+            evaluation_mode: EvaluationMode::Retrospective,
+        },
+    ];
+    let fee_impact = ImpactCalculator::calculate_impact(EventType::ExtremeFee, &fee_rarities, None);
+    assert_eq!(fee_impact.model_id, "obschain-impact-extreme-fee-v1");
+    assert_eq!(fee_impact.components.len(), 2);
+    assert_eq!(
+        fee_impact.components[0].weight + fee_impact.components[1].weight,
+        100.0
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 16. Section 37: Impact Model Coverage Availability Thresholds
+// ---------------------------------------------------------------------------
+#[test]
+fn test_impact_model_coverage_thresholds() {
+    let event_type = EventType::LargeTransfer; // Has 4 components: Value (60), Inputs (15), Outputs (15), Vsize (10)
+    let make_rarity = |metric: BaselineMetric| EventRarityResult {
+        event_id: Uuid::new_v4(),
+        baseline_run_id: Uuid::new_v4(),
+        event_type,
+        metric,
+        value: MetricValue::U64(1_000),
+        percentile: Some(90.0),
+        percentile_method: PercentileMethod::ExactEmpiricalCdf,
+        estimated: false,
+        rarity_band: RarityBand::Unusual,
+        population_size: 10_000,
+        tail_count: 1_000,
+        evaluation_mode: EvaluationMode::Retrospective,
+    };
+
+    // 100% coverage (4 of 4)
+    let r4 = vec![
+        make_rarity(BaselineMetric::ValueSats),
+        make_rarity(BaselineMetric::InputCount),
+        make_rarity(BaselineMetric::OutputCount),
+        make_rarity(BaselineMetric::Vsize),
+    ];
+    let imp4 = ImpactCalculator::calculate_impact(event_type, &r4, None);
+    assert_eq!(imp4.model_coverage, 1.0);
+    assert!(imp4.total_score.is_some());
+
+    // 75% coverage (3 of 4)
+    let r3 = vec![
+        make_rarity(BaselineMetric::ValueSats),
+        make_rarity(BaselineMetric::InputCount),
+        make_rarity(BaselineMetric::OutputCount),
+    ];
+    let imp3 = ImpactCalculator::calculate_impact(event_type, &r3, None);
+    assert_eq!(imp3.model_coverage, 0.75);
+    assert!(imp3.total_score.is_some());
+
+    // 50% coverage (2 of 4)
+    let r2 = vec![
+        make_rarity(BaselineMetric::ValueSats),
+        make_rarity(BaselineMetric::OutputCount),
+    ];
+    let imp2 = ImpactCalculator::calculate_impact(event_type, &r2, None);
+    assert_eq!(imp2.model_coverage, 0.50);
+    assert!(imp2.total_score.is_some());
+
+    // 25% coverage (1 of 4) -> Below 50% minimum threshold, score must be suppressed!
+    let r1 = vec![make_rarity(BaselineMetric::ValueSats)];
+    let imp1 = ImpactCalculator::calculate_impact(event_type, &r1, None);
+    assert_eq!(imp1.model_coverage, 0.25);
+    assert_eq!(
+        imp1.total_score, None,
+        "Score must be suppressed when coverage < 50%"
+    );
+
+    // 0% coverage -> score must be None
+    let imp0 = ImpactCalculator::calculate_impact(event_type, &[], None);
+    assert_eq!(imp0.model_coverage, 0.0);
+    assert_eq!(imp0.total_score, None);
+}
+
+// ---------------------------------------------------------------------------
+// 17. Section 38: Full u128 Persistence & Lossless Round-Trip (No Scientific Notation or f64 Corruption)
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_lossless_u128_max_and_large_cad_storage_roundtrip() {
+    let u128_max = u128::MAX; // 340,282,366,920,938,463,463,374,607,431,768,211,455 (39 digits)
+    let large_cad_val = 50_000_000_000u128 * 365 * 100_000_000; // 50B BTC-days in satoshi-days (26 digits)
+
+    // 1. Rust Domain & String representation test
+    let metric_val_max = MetricValue::U128(u128_max);
+    let str_max = metric_val_max.to_numeric_string();
+    assert_eq!(str_max, "340282366920938463463374607431768211455");
+
+    let parsed_max =
+        MetricValue::from_str_and_metric(&str_max, BaselineMetric::CoinAgeDestroyedSatoshiDays);
+    assert_eq!(parsed_max.as_u128(), Some(u128_max));
+
+    // Simulate PostgreSQL NUMERIC(50, 4) formatting (appends .0000)
+    let pg_formatted_max = format!("{str_max}.0000");
+    let parsed_pg = MetricValue::from_str_and_metric(
+        &pg_formatted_max,
+        BaselineMetric::CoinAgeDestroyedSatoshiDays,
+    );
+    assert_eq!(
+        parsed_pg.as_u128(),
+        Some(u128_max),
+        "NUMERIC(50,4) text must parse u128::MAX without truncation or f64 float conversion"
+    );
+
+    let metric_val_cad = MetricValue::U128(large_cad_val);
+    let pg_formatted_cad = format!("{}.0000", metric_val_cad.to_numeric_string());
+    let parsed_cad = MetricValue::from_str_and_metric(
+        &pg_formatted_cad,
+        BaselineMetric::CoinAgeDestroyedSatoshiDays,
+    );
+    assert_eq!(parsed_cad.as_u128(), Some(large_cad_val));
+
+    // 2. In-Memory Storage persistence round-trip
+    let mem_storage = InMemoryStorage::new_empty(100);
+    let event_id = Uuid::new_v4();
+    let metric_row = obschain_core::EventMetricValue {
+        id: Uuid::new_v4(),
+        event_id,
+        network: "mainnet".to_string(),
+        event_type: EventType::DormantCoinsMoved,
+        metric: BaselineMetric::CoinAgeDestroyedSatoshiDays,
+        metric_definition_version: "coin-age-destroyed-satoshi-days-v1".to_string(),
+        value: metric_val_max,
+        metric_scale: 0,
+        block_height: 840_000,
+        event_time: Utc::now(),
+        created_at: Utc::now(),
+    };
+    mem_storage.save_event_metrics(&[metric_row]).await.unwrap();
+
+    let fetched = mem_storage.get_event_metrics(event_id).await.unwrap();
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[0].value.as_u128(), Some(u128_max));
+
+    // 3. PostgreSQL durable persistence round-trip (if PG reachable)
+    if let Some(pg) = get_test_postgres_storage().await {
+        let storage = Storage::from(pg);
+        let pg_event_id = Uuid::new_v4();
+        let pg_metric_row = obschain_core::EventMetricValue {
+            id: Uuid::new_v4(),
+            event_id: pg_event_id,
+            network: "mainnet".to_string(),
+            event_type: EventType::DormantCoinsMoved,
+            metric: BaselineMetric::CoinAgeDestroyedSatoshiDays,
+            metric_definition_version: "coin-age-destroyed-satoshi-days-v1".to_string(),
+            value: metric_val_max,
+            metric_scale: 0,
+            block_height: 850_000,
+            event_time: Utc::now(),
+            created_at: Utc::now(),
+        };
+        storage.save_event_metrics(&[pg_metric_row]).await.unwrap();
+
+        let pg_fetched = storage.get_event_metrics(pg_event_id).await.unwrap();
+        assert_eq!(pg_fetched.len(), 1);
+        assert_eq!(
+            pg_fetched[0].value.as_u128(),
+            Some(u128_max),
+            "PostgreSQL NUMERIC(50, 4) must round-trip u128::MAX losslessly"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 18. Section 39: Observation Dedup Invariant (1 Canonical Event = 1 Metric Row Set)
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_observation_dedup_metric_table_invariant() {
+    let storage = Storage::from(InMemoryStorage::new_empty(100));
+
+    let txid = format!("dedup_tx_{}", Uuid::new_v4());
+    let mut event = create_large_transfer_event(&txid, 500_000_000, 840_000, "mainnet");
+    event = event.with_deterministic_id();
+    let event_id = event.id;
+    storage.save_event(&event).await.unwrap();
+
+    let source = ObservationSource::bitcoin_core_rpc("http://127.0.0.1:8332");
+    // Simulate 100 observation calls for the same canonical event
+    for i in 0..100 {
+        let obs = EventObservation::live(
+            event_id,
+            source.clone(),
+            EventObservationKind::Confirmed,
+            Utc::now(),
+            Some(Utc::now()),
+            Some(840_000),
+            Some(format!("00000000000000000000000000000000{i:04x}")),
+        );
+        storage.save_event_observation(&obs).await.unwrap();
+    }
+
+    // Metric rows must belong to canonical ChainEvent ONLY, not EventObservations
+    let metrics = storage.get_event_metrics(event_id).await.unwrap();
+    let defs = obschain_core::MetricRegistry::metrics_for_event_type(EventType::LargeTransfer);
+    assert_eq!(
+        metrics.len(),
+        defs.len(),
+        "Expected exactly {} metric rows for canonical event, got {}",
+        defs.len(),
+        metrics.len()
+    );
+
+    // Save event again (replay / idempotent update)
+    storage.save_event(&event).await.unwrap();
+    let metrics_after = storage.get_event_metrics(event_id).await.unwrap();
+    assert_eq!(
+        metrics_after.len(),
+        defs.len(),
+        "Metric rows must remain strictly deduplicated after replay"
+    );
 }

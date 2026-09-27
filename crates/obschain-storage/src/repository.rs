@@ -6,9 +6,10 @@ use std::{
 use chrono::Utc;
 use obschain_core::{
     ActivityStatus, BaselineDistribution, BaselineMetric, BaselineRun, BaselineRunStatus,
-    ChainEvent, ConfidenceLevel, EventObservation, EventObservationKind, EventRarityResult,
-    EventSeverity, EventType, ImpactBreakdown, Incident, IncidentActivity, IncidentAlert,
-    ObservationMode, ReplayCheckpoint, ReplayJob, WatchTarget,
+    ChainEvent, ConfidenceLevel, EventMetricExtractor, EventMetricValue, EventObservation,
+    EventObservationKind, EventRarityResult, EventSeverity, EventType, ImpactBreakdown, Incident,
+    IncidentActivity, IncidentAlert, MetricValue, ObservationMode, RarityDirection,
+    ReplayCheckpoint, ReplayJob, WatchTarget,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -147,6 +148,7 @@ pub trait IncidentAlertRepository: Send + Sync {
     async fn get_alert_by_id(&self, id: Uuid) -> Result<Option<IncidentAlert>, StorageError>;
 }
 
+#[allow(clippy::too_many_arguments)]
 #[async_trait::async_trait]
 pub trait BaselineRepository: Send + Sync {
     async fn create_baseline_run(&self, run: &BaselineRun) -> Result<(), StorageError>;
@@ -211,6 +213,26 @@ pub trait BaselineRepository: Send + Sync {
         start_height: u64,
         end_height: u64,
     ) -> Result<Vec<ChainEvent>, StorageError>;
+
+    async fn save_event_metrics(&self, metrics: &[EventMetricValue]) -> Result<(), StorageError>;
+
+    async fn get_event_metrics(
+        &self,
+        event_id: Uuid,
+    ) -> Result<Vec<EventMetricValue>, StorageError>;
+
+    #[allow(clippy::too_many_arguments)]
+    async fn get_exact_empirical_rank(
+        &self,
+        network: &str,
+        event_type: EventType,
+        metric: BaselineMetric,
+        metric_definition_version: &str,
+        start_height: u64,
+        end_height: u64,
+        query_value: &MetricValue,
+        direction: RarityDirection,
+    ) -> Result<Option<(f64, u64, u64)>, StorageError>;
 }
 
 type EventRarityEntry = (EventRarityResult, Option<ImpactBreakdown>);
@@ -230,6 +252,7 @@ pub struct InMemoryStorage {
     baseline_runs: Arc<RwLock<Vec<BaselineRun>>>,
     baseline_distributions: Arc<RwLock<Vec<BaselineDistribution>>>,
     event_rarity: Arc<RwLock<Vec<EventRarityEntry>>>,
+    event_metrics: Arc<RwLock<Vec<EventMetricValue>>>,
     max_events: usize,
     max_activities: usize,
 }
@@ -269,6 +292,7 @@ impl InMemoryStorage {
             baseline_runs: Arc::new(RwLock::new(Vec::new())),
             baseline_distributions: Arc::new(RwLock::new(Vec::new())),
             event_rarity: Arc::new(RwLock::new(Vec::new())),
+            event_metrics: Arc::new(RwLock::new(Vec::new())),
             max_events,
             max_activities,
         };
@@ -294,6 +318,7 @@ impl InMemoryStorage {
             baseline_runs: Arc::new(RwLock::new(Vec::new())),
             baseline_distributions: Arc::new(RwLock::new(Vec::new())),
             event_rarity: Arc::new(RwLock::new(Vec::new())),
+            event_metrics: Arc::new(RwLock::new(Vec::new())),
             max_events,
             max_activities: Self::DEFAULT_MAX_ACTIVITIES,
         };
@@ -471,33 +496,42 @@ impl InMemoryStorage {
 #[async_trait::async_trait]
 impl EventRepository for InMemoryStorage {
     async fn save_event(&self, event: &ChainEvent) -> Result<(), StorageError> {
-        let mut lock = self
-            .events
-            .write()
-            .map_err(|e| StorageError::Database(e.to_string()))?;
+        {
+            let mut lock = self
+                .events
+                .write()
+                .map_err(|e| StorageError::Database(e.to_string()))?;
 
-        // Idempotent update if event already exists:
-        // Conservative merge rule: update title, description, and metadata if needed.
-        // DO NOT overwrite observation_mode, replay_job_id, or first_observed_at!
-        if let Some(pos) = lock.iter().position(|e| e.id == event.id) {
-            let existing = &mut lock[pos];
-            existing.title = event.title.clone();
-            existing.description = event.description.clone();
-            existing.metadata = event.metadata.clone();
-            return Ok(());
-        }
+            // Idempotent update if event already exists:
+            // Conservative merge rule: update title, description, and metadata if needed.
+            // DO NOT overwrite observation_mode, replay_job_id, or first_observed_at!
+            if let Some(pos) = lock.iter().position(|e| e.id == event.id) {
+                let existing = &mut lock[pos];
+                existing.title = event.title.clone();
+                existing.description = event.description.clone();
+                existing.metadata = event.metadata.clone();
+                return Ok(());
+            }
 
-        // Enforce bounded memory retention
-        if lock.len() >= self.max_events {
-            let popped = lock.pop_front();
-            if let Some(p) = popped {
-                if let Ok(mut obs_lock) = self.event_observations.write() {
-                    obs_lock.retain(|o| o.event_id != p.id);
+            // Enforce bounded memory retention
+            if lock.len() >= self.max_events {
+                let popped = lock.pop_front();
+                if let Some(p) = popped {
+                    if let Ok(mut obs_lock) = self.event_observations.write() {
+                        obs_lock.retain(|o| o.event_id != p.id);
+                    }
                 }
             }
+
+            lock.push_back(event.clone());
         }
 
-        lock.push_back(event.clone());
+        // Deduplicated canonical metric extraction
+        let extracted = EventMetricExtractor::extract_event_metrics(event, None);
+        if !extracted.is_empty() {
+            let _ = self.save_event_metrics(&extracted).await;
+        }
+
         Ok(())
     }
 
@@ -1242,6 +1276,155 @@ impl BaselineRepository for InMemoryStorage {
             .cloned()
             .collect();
         Ok(res)
+    }
+
+    async fn save_event_metrics(&self, metrics: &[EventMetricValue]) -> Result<(), StorageError> {
+        let mut lock = self
+            .event_metrics
+            .write()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        for m in metrics {
+            if let Some(pos) = lock.iter().position(|existing| {
+                existing.event_id == m.event_id
+                    && existing.metric == m.metric
+                    && existing.metric_definition_version == m.metric_definition_version
+            }) {
+                lock[pos] = m.clone();
+            } else {
+                lock.push(m.clone());
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_event_metrics(
+        &self,
+        event_id: Uuid,
+    ) -> Result<Vec<EventMetricValue>, StorageError> {
+        let lock = self
+            .event_metrics
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let res = lock
+            .iter()
+            .filter(|m| m.event_id == event_id)
+            .cloned()
+            .collect();
+        Ok(res)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn get_exact_empirical_rank(
+        &self,
+        network: &str,
+        event_type: EventType,
+        metric: BaselineMetric,
+        metric_definition_version: &str,
+        start_height: u64,
+        end_height: u64,
+        query_value: &MetricValue,
+        direction: RarityDirection,
+    ) -> Result<Option<(f64, u64, u64)>, StorageError> {
+        let matching: Vec<EventMetricValue> = {
+            let lock = self
+                .event_metrics
+                .read()
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+            lock.iter()
+                .filter(|m| {
+                    m.network == network
+                        && m.event_type == event_type
+                        && m.metric == metric
+                        && m.metric_definition_version == metric_definition_version
+                        && m.block_height >= start_height
+                        && m.block_height <= end_height
+                })
+                .cloned()
+                .collect()
+        };
+
+        if matching.is_empty() {
+            // Safe fallback: if raw events are stored in memory without metrics extracted
+            let fallback_events: Vec<ChainEvent> = {
+                let ev_lock = self
+                    .events
+                    .read()
+                    .map_err(|e| StorageError::Database(e.to_string()))?;
+                ev_lock
+                    .iter()
+                    .filter(|e| {
+                        e.event_type == event_type
+                            && e.block_height
+                                .map(|h| h >= start_height && h <= end_height)
+                                .unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect()
+            };
+
+            if !fallback_events.is_empty() {
+                for ev in &fallback_events {
+                    let extracted = EventMetricExtractor::extract_event_metrics(ev, None);
+                    let _ = self.save_event_metrics(&extracted).await;
+                }
+                let matching2: Vec<EventMetricValue> = {
+                    let lock2 = self
+                        .event_metrics
+                        .read()
+                        .map_err(|e| StorageError::Database(e.to_string()))?;
+                    lock2
+                        .iter()
+                        .filter(|m| {
+                            m.network == network
+                                && m.event_type == event_type
+                                && m.metric == metric
+                                && m.metric_definition_version == metric_definition_version
+                                && m.block_height >= start_height
+                                && m.block_height <= end_height
+                        })
+                        .cloned()
+                        .collect()
+                };
+                if !matching2.is_empty() {
+                    let n = matching2.len();
+                    return match direction {
+                        RarityDirection::HigherIsRarer | RarityDirection::TwoSided => {
+                            let count_le =
+                                matching2.iter().filter(|m| &m.value <= query_value).count();
+                            let tail_count =
+                                matching2.iter().filter(|m| &m.value >= query_value).count() as u64;
+                            let percentile = ((count_le as f64) / (n as f64)) * 100.0;
+                            Ok(Some((percentile, tail_count, n as u64)))
+                        }
+                        RarityDirection::LowerIsRarer => {
+                            let count_ge =
+                                matching2.iter().filter(|m| &m.value >= query_value).count();
+                            let tail_count =
+                                matching2.iter().filter(|m| &m.value <= query_value).count() as u64;
+                            let percentile = ((count_ge as f64) / (n as f64)) * 100.0;
+                            Ok(Some((percentile, tail_count, n as u64)))
+                        }
+                    };
+                }
+            }
+            return Ok(None);
+        }
+
+        let n = matching.len();
+        match direction {
+            RarityDirection::HigherIsRarer | RarityDirection::TwoSided => {
+                let count_le = matching.iter().filter(|m| &m.value <= query_value).count();
+                let tail_count = matching.iter().filter(|m| &m.value >= query_value).count() as u64;
+                let percentile = ((count_le as f64) / (n as f64)) * 100.0;
+                Ok(Some((percentile, tail_count, n as u64)))
+            }
+            RarityDirection::LowerIsRarer => {
+                let count_ge = matching.iter().filter(|m| &m.value >= query_value).count();
+                let tail_count = matching.iter().filter(|m| &m.value <= query_value).count() as u64;
+                let percentile = ((count_ge as f64) / (n as f64)) * 100.0;
+                Ok(Some((percentile, tail_count, n as u64)))
+            }
+        }
     }
 }
 

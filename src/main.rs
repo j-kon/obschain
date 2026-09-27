@@ -9,7 +9,7 @@ use obschain::{
     BitcoinCoreStatusResponse, BitcoinCoreZmqStatusResponse, PipelineMetrics, StorageBackendConfig,
     WebSocketBroadcast,
 };
-use obschain_core::baseline::BaselineRunStatus;
+use obschain_core::baseline::{BaselineRunStatus, EventMetricExtractor, MetricRegistry};
 use obschain_core::{ChainEvent, EventType, IncidentActivity, IncidentAlert, Observation};
 use obschain_detectors::{
     ConsolidationDetector, DetectorEngine, DormantCoinDetector, EventDeduplicator,
@@ -1407,10 +1407,39 @@ async fn run_rarity(
 
     let distributions = storage.get_baseline_distributions(baseline_run.id).await?;
 
-    let context = BaselineEngine::evaluate_event_rarity(
+    // Query exact empirical ranks from normalized canonical metric population
+    let mut exact_ranks = std::collections::HashMap::new();
+    let defs = MetricRegistry::metrics_for_event_type(event.event_type);
+    for def in &defs {
+        if let Some(val) = EventMetricExtractor::extract_metric(&event, def.metric) {
+            let version = format!(
+                "{}-{}",
+                def.metric.as_str(),
+                EventMetricExtractor::DEFAULT_METRIC_VERSION
+            );
+            if let Ok(Some((p, tail, pop))) = storage
+                .get_exact_empirical_rank(
+                    &baseline_run.network,
+                    event.event_type,
+                    def.metric,
+                    &version,
+                    baseline_run.start_height,
+                    baseline_run.end_height,
+                    &val,
+                    def.direction,
+                )
+                .await
+            {
+                exact_ranks.insert(def.metric, (p, tail, pop));
+            }
+        }
+    }
+
+    let context = BaselineEngine::evaluate_event_rarity_with_exact_ranks(
         &event,
         &baseline_run,
         &distributions,
+        &exact_ranks,
         config.baseline_min_sample_size,
     );
 
@@ -1451,7 +1480,11 @@ async fn run_rarity(
     println!("Primary Metric:  {:?}", context.primary.metric);
     println!("  Observed:      {}", context.primary.value);
     if let Some(p) = context.primary.percentile {
-        println!("  Percentile:    {:.2}%", p);
+        println!(
+            "  Percentile:    {:.2}% ({})",
+            p,
+            context.primary.percentile_method.as_str()
+        );
     } else {
         println!("  Percentile:    N/A (Insufficient Data)");
     }
@@ -1472,10 +1505,11 @@ async fn run_rarity(
                 .map(|p| format!("{p:.2}%"))
                 .unwrap_or_else(|| "N/A".to_string());
             println!(
-                "  • {:<28} Value: {:<18} Percentile: {:<8} Band: {:<12} Tail: {} / {}",
+                "  • {:<28} Value: {:<18} Percentile: {:<8} ({}) Band: {:<12} Tail: {} / {}",
                 format!("{:?}:", sec.metric),
                 sec.value.to_string(),
                 p_str,
+                sec.percentile_method.as_str(),
                 sec.rarity_band.as_str(),
                 sec.tail_count,
                 sec.population_size,
@@ -1487,14 +1521,14 @@ async fn run_rarity(
         println!("------------------------------------------------------------");
         println!(
             "Explainable Impact Breakdown (Model: {}, Status: {}):",
-            impact.model_version, impact.status
+            impact.model_id, impact.status
         );
         if let Some(score) = impact.total_score {
             println!(
                 "  Composite Impact Score: {:.1} / {:.1} (Coverage: {:.1}%)",
                 score,
                 impact.max_possible_points,
-                impact.coverage_ratio * 100.0
+                impact.model_coverage * 100.0
             );
         } else {
             println!("  Composite Impact Score: UNAVAILABLE (Insufficient sample size or metrics)");

@@ -58,6 +58,25 @@ impl BaselineMetric {
             Self::IntervalSeconds => "interval_seconds",
         }
     }
+
+    pub fn default_definition_version(&self) -> &'static str {
+        match self {
+            Self::ValueSats => "transfer-amount-v1",
+            Self::InputCount => "input-count-v1",
+            Self::OutputCount => "output-count-v1",
+            Self::Vsize => "vsize-v1",
+            Self::DormantValueSats => "dormant-value-v1",
+            Self::OldestInputAgeDays => "oldest-input-age-v1",
+            Self::AverageInputAgeDays => "average-input-age-v1",
+            Self::CoinAgeDestroyedSatoshiDays => "coin-age-destroyed-v1",
+            Self::ConsolidationRatio => "consolidation-ratio-v1",
+            Self::DistributedValueSats => "distributed-value-v1",
+            Self::MedianOutputSats => "median-output-v1",
+            Self::FeeSats => "fee-sats-v1",
+            Self::FeeRateSatVb => "fee-rate-v1",
+            Self::IntervalSeconds => "block-interval-v1",
+        }
+    }
 }
 
 impl std::fmt::Display for BaselineMetric {
@@ -145,6 +164,50 @@ pub enum RarityDirection {
     TwoSided,
 }
 
+/// Method utilized to compute an event rarity percentile rank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PercentileMethod {
+    #[default]
+    ExactEmpiricalCdf,
+    QuantileInterpolationEstimate,
+}
+
+impl PercentileMethod {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ExactEmpiricalCdf => "EXACT_EMPIRICAL_CDF",
+            Self::QuantileInterpolationEstimate => "QUANTILE_INTERPOLATION_ESTIMATE",
+        }
+    }
+
+    pub fn is_exact(&self) -> bool {
+        matches!(self, Self::ExactEmpiricalCdf)
+    }
+
+    pub fn is_estimated(&self) -> bool {
+        matches!(self, Self::QuantileInterpolationEstimate)
+    }
+}
+
+impl std::fmt::Display for PercentileMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl FromStr for PercentileMethod {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_uppercase().as_str() {
+            "EXACT_EMPIRICAL_CDF" => Ok(Self::ExactEmpiricalCdf),
+            "QUANTILE_INTERPOLATION_ESTIMATE" => Ok(Self::QuantileInterpolationEstimate),
+            other => Err(format!("Unknown PercentileMethod: {other}")),
+        }
+    }
+}
+
 /// Definition of a baseline metric for an event type in the registry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BaselineMetricDefinition {
@@ -153,6 +216,7 @@ pub struct BaselineMetricDefinition {
     pub unit: MetricUnit,
     pub direction: RarityDirection,
     pub is_primary: bool,
+    pub metric_definition_version: &'static str,
 }
 
 /// Typed registry of baseline metrics for supported replayable event types.
@@ -181,6 +245,8 @@ impl MetricRegistry {
                     unit: MetricUnit::Satoshis,
                     direction: RarityDirection::HigherIsRarer,
                     is_primary: true,
+                    metric_definition_version: BaselineMetric::ValueSats
+                        .default_definition_version(),
                 },
                 BaselineMetricDefinition {
                     event_type,
@@ -188,6 +254,8 @@ impl MetricRegistry {
                     unit: MetricUnit::Count,
                     direction: RarityDirection::HigherIsRarer,
                     is_primary: false,
+                    metric_definition_version: BaselineMetric::InputCount
+                        .default_definition_version(),
                 },
                 BaselineMetricDefinition {
                     event_type,
@@ -195,6 +263,8 @@ impl MetricRegistry {
                     unit: MetricUnit::Count,
                     direction: RarityDirection::HigherIsRarer,
                     is_primary: false,
+                    metric_definition_version: BaselineMetric::OutputCount
+                        .default_definition_version(),
                 },
                 BaselineMetricDefinition {
                     event_type,
@@ -202,6 +272,7 @@ impl MetricRegistry {
                     unit: MetricUnit::Count,
                     direction: RarityDirection::HigherIsRarer,
                     is_primary: false,
+                    metric_definition_version: BaselineMetric::Vsize.default_definition_version(),
                 },
             ],
             EventType::DormantCoinsMoved => vec![
@@ -211,6 +282,8 @@ impl MetricRegistry {
                     unit: MetricUnit::Satoshis,
                     direction: RarityDirection::HigherIsRarer,
                     is_primary: true,
+                    metric_definition_version: BaselineMetric::DormantValueSats
+                        .default_definition_version(),
                 },
                 BaselineMetricDefinition {
                     event_type,
@@ -218,6 +291,8 @@ impl MetricRegistry {
                     unit: MetricUnit::Days,
                     direction: RarityDirection::HigherIsRarer,
                     is_primary: false,
+                    metric_definition_version: BaselineMetric::OldestInputAgeDays
+                        .default_definition_version(),
                 },
                 BaselineMetricDefinition {
                     event_type,
@@ -225,6 +300,8 @@ impl MetricRegistry {
                     unit: MetricUnit::SatoshiDays,
                     direction: RarityDirection::HigherIsRarer,
                     is_primary: false,
+                    metric_definition_version: BaselineMetric::CoinAgeDestroyedSatoshiDays
+                        .default_definition_version(),
                 },
                 BaselineMetricDefinition {
                     event_type,
@@ -232,6 +309,8 @@ impl MetricRegistry {
                     unit: MetricUnit::Count,
                     direction: RarityDirection::HigherIsRarer,
                     is_primary: false,
+                    metric_definition_version: BaselineMetric::InputCount
+                        .default_definition_version(),
                 },
             ],
             EventType::Consolidation => vec![
@@ -241,6 +320,8 @@ impl MetricRegistry {
                     unit: MetricUnit::Count,
                     direction: RarityDirection::HigherIsRarer,
                     is_primary: true,
+                    metric_definition_version: BaselineMetric::InputCount
+                        .default_definition_version(),
                 },
                 BaselineMetricDefinition {
                     event_type,
@@ -248,6 +329,8 @@ impl MetricRegistry {
                     unit: MetricUnit::Count,
                     direction: RarityDirection::LowerIsRarer,
                     is_primary: false,
+                    metric_definition_version: BaselineMetric::OutputCount
+                        .default_definition_version(),
                 },
                 BaselineMetricDefinition {
                     event_type,
@@ -255,6 +338,8 @@ impl MetricRegistry {
                     unit: MetricUnit::Satoshis,
                     direction: RarityDirection::HigherIsRarer,
                     is_primary: false,
+                    metric_definition_version: BaselineMetric::ValueSats
+                        .default_definition_version(),
                 },
                 BaselineMetricDefinition {
                     event_type,
@@ -262,6 +347,8 @@ impl MetricRegistry {
                     unit: MetricUnit::Ratio,
                     direction: RarityDirection::HigherIsRarer,
                     is_primary: false,
+                    metric_definition_version: BaselineMetric::ConsolidationRatio
+                        .default_definition_version(),
                 },
             ],
             EventType::FanOut => vec![
@@ -271,6 +358,8 @@ impl MetricRegistry {
                     unit: MetricUnit::Count,
                     direction: RarityDirection::HigherIsRarer,
                     is_primary: true,
+                    metric_definition_version: BaselineMetric::OutputCount
+                        .default_definition_version(),
                 },
                 BaselineMetricDefinition {
                     event_type,
@@ -278,6 +367,8 @@ impl MetricRegistry {
                     unit: MetricUnit::Satoshis,
                     direction: RarityDirection::HigherIsRarer,
                     is_primary: false,
+                    metric_definition_version: BaselineMetric::DistributedValueSats
+                        .default_definition_version(),
                 },
                 BaselineMetricDefinition {
                     event_type,
@@ -285,6 +376,8 @@ impl MetricRegistry {
                     unit: MetricUnit::Satoshis,
                     direction: RarityDirection::HigherIsRarer,
                     is_primary: false,
+                    metric_definition_version: BaselineMetric::MedianOutputSats
+                        .default_definition_version(),
                 },
             ],
             EventType::ExtremeFee => vec![
@@ -294,6 +387,8 @@ impl MetricRegistry {
                     unit: MetricUnit::SatoshisPerVbyte,
                     direction: RarityDirection::HigherIsRarer,
                     is_primary: true,
+                    metric_definition_version: BaselineMetric::FeeRateSatVb
+                        .default_definition_version(),
                 },
                 BaselineMetricDefinition {
                     event_type,
@@ -301,6 +396,7 @@ impl MetricRegistry {
                     unit: MetricUnit::Satoshis,
                     direction: RarityDirection::HigherIsRarer,
                     is_primary: false,
+                    metric_definition_version: BaselineMetric::FeeSats.default_definition_version(),
                 },
             ],
             EventType::LongBlockInterval => vec![BaselineMetricDefinition {
@@ -309,6 +405,8 @@ impl MetricRegistry {
                 unit: MetricUnit::Seconds,
                 direction: RarityDirection::HigherIsRarer,
                 is_primary: true,
+                metric_definition_version: BaselineMetric::IntervalSeconds
+                    .default_definition_version(),
             }],
             _ => Vec::new(),
         }
@@ -346,6 +444,14 @@ pub enum MetricValue {
 }
 
 impl MetricValue {
+    pub fn scale(&self) -> u32 {
+        match self {
+            Self::U64(_) | Self::U128(_) => 0,
+            Self::BasisPoints(_) => 2,
+            Self::DecimalScaled { scale, .. } => *scale,
+        }
+    }
+
     pub fn as_u64(&self) -> Option<u64> {
         match *self {
             Self::U64(v) => Some(v),
@@ -409,18 +515,27 @@ impl MetricValue {
         let clean = s.trim();
         match metric {
             BaselineMetric::CoinAgeDestroyedSatoshiDays => {
-                if let Ok(v) = clean.parse::<u128>() {
+                let int_part = clean.split('.').next().unwrap_or(clean);
+                if let Ok(v) = int_part.parse::<u128>() {
                     Self::U128(v)
-                } else if let Ok(f) = clean.parse::<f64>() {
-                    Self::U128(f.round() as u128)
+                } else if let Ok(v) = clean.parse::<u128>() {
+                    Self::U128(v)
                 } else {
                     Self::U128(0)
                 }
             }
             BaselineMetric::FeeRateSatVb => {
-                if let Ok(f) = clean.parse::<f64>() {
+                if let Some((whole_str, frac_str)) = clean.split_once('.') {
+                    let whole = whole_str.parse::<u64>().unwrap_or(0);
+                    let frac_prefix = &frac_str[..frac_str.len().min(2)];
+                    let frac = format!("{:0<2}", frac_prefix).parse::<u64>().unwrap_or(0);
                     Self::DecimalScaled {
-                        value: (f * 100.0).round() as u64,
+                        value: whole * 100 + frac,
+                        scale: 2,
+                    }
+                } else if let Ok(v) = clean.parse::<u64>() {
+                    Self::DecimalScaled {
+                        value: v * 100,
                         scale: 2,
                     }
                 } else {
@@ -428,21 +543,61 @@ impl MetricValue {
                 }
             }
             BaselineMetric::ConsolidationRatio => {
-                if let Ok(f) = clean.parse::<f64>() {
-                    Self::BasisPoints((f * 100.0).round() as u32)
+                if let Some((whole_str, frac_str)) = clean.split_once('.') {
+                    let whole = whole_str.parse::<u32>().unwrap_or(0);
+                    let frac_prefix = &frac_str[..frac_str.len().min(2)];
+                    let frac = format!("{:0<2}", frac_prefix).parse::<u32>().unwrap_or(0);
+                    Self::BasisPoints(whole * 100 + frac)
+                } else if let Ok(v) = clean.parse::<u32>() {
+                    Self::BasisPoints(v * 100)
                 } else {
                     Self::BasisPoints(0)
                 }
             }
             _ => {
-                if let Ok(v) = clean.parse::<u64>() {
+                let int_part = clean.split('.').next().unwrap_or(clean);
+                if let Ok(v) = int_part.parse::<u64>() {
                     Self::U64(v)
-                } else if let Ok(f) = clean.parse::<f64>() {
-                    Self::U64(f.round() as u64)
+                } else if let Ok(v) = clean.parse::<u64>() {
+                    Self::U64(v)
                 } else {
                     Self::U64(0)
                 }
             }
+        }
+    }
+
+    pub fn from_str_scale_and_metric(s: &str, scale: u32, metric: BaselineMetric) -> Self {
+        let clean = s.trim();
+        if scale == 0 {
+            if metric == BaselineMetric::CoinAgeDestroyedSatoshiDays {
+                let int_part = clean.split('.').next().unwrap_or(clean);
+                Self::U128(int_part.parse::<u128>().unwrap_or(0))
+            } else {
+                let int_part = clean.split('.').next().unwrap_or(clean);
+                Self::U64(int_part.parse::<u64>().unwrap_or(0))
+            }
+        } else if metric == BaselineMetric::ConsolidationRatio && scale == 2 {
+            Self::from_str_and_metric(clean, metric)
+        } else if let Some((whole_str, frac_str)) = clean.split_once('.') {
+            let whole = whole_str.parse::<u64>().unwrap_or(0);
+            let frac_prefix = &frac_str[..frac_str.len().min(scale as usize)];
+            let frac = format!("{:0<width$}", frac_prefix, width = scale as usize)
+                .parse::<u64>()
+                .unwrap_or(0);
+            let multiplier = 10u64.pow(scale);
+            Self::DecimalScaled {
+                value: whole * multiplier + frac,
+                scale,
+            }
+        } else if let Ok(v) = clean.parse::<u64>() {
+            let multiplier = 10u64.pow(scale);
+            Self::DecimalScaled {
+                value: v * multiplier,
+                scale,
+            }
+        } else {
+            Self::DecimalScaled { value: 0, scale }
         }
     }
 }
@@ -679,6 +834,58 @@ impl EventMetricExtractor {
             _ => None,
         }
     }
+
+    pub const DEFAULT_METRIC_VERSION: &'static str = "v1";
+
+    /// Extracts all registered metrics for a canonical ChainEvent into normalized EventMetricValue records.
+    pub fn extract_event_metrics(
+        event: &ChainEvent,
+        version: Option<&str>,
+    ) -> Vec<EventMetricValue> {
+        let version_str = version.unwrap_or(Self::DEFAULT_METRIC_VERSION);
+        let defs = MetricRegistry::metrics_for_event_type(event.event_type);
+        let mut metrics = Vec::new();
+        let height = event.block_height.unwrap_or(0);
+        let event_time = event.event_time;
+        let network = event.network().unwrap_or("mainnet").to_string();
+
+        for def in defs {
+            if let Some(val) = Self::extract_metric(event, def.metric) {
+                let def_version = format!("{}-{}", def.metric.as_str(), version_str);
+                metrics.push(EventMetricValue {
+                    id: Uuid::new_v4(),
+                    event_id: event.id,
+                    network: network.clone(),
+                    event_type: event.event_type,
+                    metric: def.metric,
+                    metric_definition_version: def_version,
+                    value: val,
+                    metric_scale: val.scale(),
+                    block_height: height,
+                    event_time,
+                    created_at: Utc::now(),
+                });
+            }
+        }
+
+        metrics
+    }
+}
+
+/// Normalized metric value record for a canonical event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventMetricValue {
+    pub id: Uuid,
+    pub event_id: Uuid,
+    pub network: String,
+    pub event_type: EventType,
+    pub metric: BaselineMetric,
+    pub metric_definition_version: String,
+    pub value: MetricValue,
+    pub metric_scale: u32,
+    pub block_height: u64,
+    pub event_time: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
 }
 
 /// Historical window defining the population boundaries of a baseline.
@@ -1010,6 +1217,9 @@ pub struct EventRarityResult {
     pub metric: BaselineMetric,
     pub value: MetricValue,
     pub percentile: Option<f64>,
+    pub percentile_method: PercentileMethod,
+    #[serde(default)]
+    pub estimated: bool,
     pub rarity_band: RarityBand,
     pub population_size: u64,
     pub tail_count: u64,
@@ -1030,6 +1240,23 @@ impl EventRarityResult {
     }
 }
 
+/// Definition of a single component within an event-type-specific impact model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImpactComponentDefinition {
+    pub name: &'static str,
+    pub metric: BaselineMetric,
+    pub weight: f64,
+}
+
+/// Definition of an event-type-specific composite impact model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImpactModelDefinition {
+    pub id: &'static str,
+    pub event_type: EventType,
+    pub version: &'static str,
+    pub components: Vec<ImpactComponentDefinition>,
+}
+
 /// Explainable component contributing to composite event impact.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImpactComponent {
@@ -1045,10 +1272,15 @@ pub struct ImpactComponent {
 /// Explainable impact breakdown with visible component contributions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImpactBreakdown {
+    pub model_id: String,
     pub model_version: String,
-    pub status: String,           // "EXPERIMENTAL"
+    pub event_type: EventType,
+    pub status: String, // "EXPERIMENTAL"
+    #[serde(rename = "score", alias = "total_score")]
     pub total_score: Option<f64>, // 0.0 .. 100.0 or None if insufficient data
     pub max_possible_points: f64,
+    pub model_coverage: f64,
+    #[serde(default)]
     pub coverage_ratio: f64,
     pub components: Vec<ImpactComponent>,
 }

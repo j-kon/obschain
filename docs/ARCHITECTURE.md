@@ -522,7 +522,7 @@ Observation records describe provenance, independent witnesses, and lifecycle tr
 
 ---
 
-## 11. Historical Baselines, Rarity & Impact Intelligence (Phase 6B)
+## 11. Historical Baselines, Rarity & Impact Intelligence (Phase 6B & 6B.1)
 
 ObsChain establishes empirical, reproducible statistical context for chain events across Bitcoin history without arbitrary hype scores or black-box machine learning.
 
@@ -535,30 +535,43 @@ Canonical Historical Events (chain_events)
    Typed Metric Extraction (EventMetricExtractor)
                │
                ▼
+   Normalized Metric Storage (event_metric_values)
+   [Unique: (event_id, metric, metric_definition_version)]
+               │
+               ▼
        Baseline Population (Sample Filtering & Deduplication)
                │
                ▼
    Distribution Aggregation (BaselineCalculator: min, max, mean, discrete quantiles)
                │
                ▼
-       Quantiles & Ranks (p50, p75, p90, p95, p99, p99.9 & empirical CDF)
+   Quantile Distributions & Summaries (p50, p75, p90, p95, p99, p99.9)
                │
-               ▼
-    Rarity Classification (Common, Notable, Unusual, Rare, Extreme, InsufficientData)
-               │
-               ▼
- Explainable Impact Breakdown (Normalized Component Weights & Experimental Total)
+               ├─────────────────────────────────────────┐
+               ▼                                         ▼
+   Exact Empirical CDF Rank                  Quantile Interpolation Estimate
+   (ExactEmpiricalCdf, estimated: false)     (QuantileInterpolationEstimate, estimated: true)
+   [Single-pass SQL over canonical values]   [Fast approximation from sparse quantiles]
+               │                                         │
+               └────────────────────┬────────────────────┘
+                                    ▼
+       Rarity Classification (Common, Notable, Unusual, Rare, Extreme, InsufficientData)
+                                    │
+                                    ▼
+       Event-Type-Specific Impact Model (Normalized Component Weights Sum to 100.0)
 ```
 
-### Key Components
+### Key Components & Statistical Hardening
 
-1. **`EventMetricExtractor`**: Centralized numeric extractor mapping structured event metadata to exact, typed `MetricValue` (`U64`, `U128`, `BasisPoints`, `DecimalScaled`) without floating-point distortion.
-2. **`BaselineCalculator`**: Computes discrete quantiles (`percentile_disc`) matching actual observed Bitcoin values, and calculates empirical cumulative distribution function (CDF) percentile ranks with inclusive tie handling:
-   $$\text{percentile}(x) = \left( \frac{\text{count}(s \le x)}{N} \right) \times 100.0$$
-3. **Data Quality & Coverage Accounting**: Transparently tracks sample count, candidate count, missing UTXO lookups, and coverage percentage to categorize `BaselineQuality` (`HIGH`, `MODERATE`, `DEGRADED`, `INSUFFICIENT`).
-4. **Sample-Size Safeguards**: Automatically withholds percentiles and returns `INSUFFICIENT_DATA` when sample count is below the minimum threshold ($N < 100$).
-5. **Explainable Impact Scoring (`ImpactBreakdown`)**: Mathematically maps visible component rarities into a normalized 0–100 scale (`obschain-impact-v1`, marked `EXPERIMENTAL`).
-6. **Non-Blocking Live Rarity Lookup**: Real-time event broadcasting and storage writes are never blocked by statistical calculation; live events query precomputed distributions in O(1) or O(log N).
+1. **`EventMetricExtractor` & Versioned Metrics**: Centralized numeric extractor mapping structured event metadata to exact, typed `MetricValue` (`U64`, `U128`, `BasisPoints`, `DecimalScaled`) with explicit `metric_definition_version` tags (e.g. `dormant-value-v1`, `coin-age-destroyed-v1`, `fee-rate-v1`), preserving long-term research reproducibility.
+2. **Normalized Canonical Metric Storage (`event_metric_values`)**: Deduplicated canonical event metrics table keyed on `(event_id, metric, metric_definition_version)` ensuring $100$ replays of an event produce exactly $1$ metric row.
+3. **Exact Empirical Percentile vs Quantile Interpolation**:
+   - `PercentileMethod::ExactEmpiricalCdf` executes a single-pass parameterized query (`COUNT(*) FILTER ...`) directly against canonical metric populations in `event_metric_values` with inclusive tie handling:
+     $$\text{percentile}(x) = \left( \frac{\text{count}(s \le x)}{N} \right) \times 100.0, \quad \text{tail\_count}(x) = \text{count}(s \ge x)$$
+   - `PercentileMethod::QuantileInterpolationEstimate` provides fast linear interpolation across discrete quantiles for visualization or lightweight inspection, explicitly tagged with `estimated: true`.
+4. **PostgreSQL Numeric Domain Safety (`NUMERIC(50, 4)`)**: Upgraded from `NUMERIC(38, 4)` to `NUMERIC(50, 4)` in `0007_statistical_correctness.sql`. Rust's `u128::MAX` requires 39 integer digits; `NUMERIC(50, 4)` reserves 46 integer digits, providing 100% lossless storage for all Rust `u128` integers and Coin Age Destroyed satoshi-days without floating-point conversion. Mean is stored as `NUMERIC(50, 4)` to eliminate floating-point precision loss across large sample totals; std_dev is documented as an approximate descriptive float aggregate.
+5. **Event-Type-Specific Impact Models**: Replaced the previous 135-weight universal model with 6 dedicated models (`LargeTransfer`, `DormantCoinsMoved`, `LongBlockInterval`, `Consolidation`, `FanOut`, `ExtremeFee`) whose component weights sum to **exactly 100.0** by construction. Structural clamping (`score.min(100.0)`) is removed.
+6. **Model Coverage & Sample Safeguards**: Requires `model_coverage >= 50%` and sample size $N \ge 100$ to emit a composite score; otherwise the score is suppressed (`None`). Rarity is primary; impact is secondary.
 
 See [docs/HISTORICAL_BASELINES.md](HISTORICAL_BASELINES.md) for full statistical formulations, PostgreSQL schema, CLI operations, and research APIs.
 

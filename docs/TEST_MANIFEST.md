@@ -1,19 +1,19 @@
 # ObsChain Automated Test Manifest & Baseline Verification
 
-This document provides the authoritative record of ObsChain automated test suites, test counts, and suite inventory as of **Phase 6B: Historical Baselines, Rarity & Impact Intelligence**.
+This document provides the authoritative record of ObsChain automated test suites, test counts, and suite inventory as of **Phase 6B.1: Statistical Correctness Hardening**.
 
 ---
 
-## 1. Authoritative Test Inventory (Phase 6B Baseline)
+## 1. Authoritative Test Inventory (Phase 6B.1 Baseline)
 
-Total Automated Tests: **202 passed, 0 failed, 0 ignored** across 16 test binaries.
+Total Automated Tests: **208 passed, 0 failed, 0 ignored** across 16 test binaries.
 
 | Test Binary / Suite | Source Path | Test Count | Status | Notes |
 |---|---|---|---|---|
 | `obschain` (unit) | `src/lib.rs` | 3 | Passing | Pipeline metrics & configuration tests |
 | `obschain` (main) | `src/main.rs` | 0 | Passing | Executable harness |
 | `api_tests` (integration) | `tests/api_tests.rs` | 14 | Passing | REST and WebSocket API endpoints |
-| `baseline_tests` (integration) | `tests/baseline_tests.rs` | 12 | Passing | Phase 6B baselines, discrete quantiles, ties, dedup invariant, API |
+| `baseline_tests` (integration) | `tests/baseline_tests.rs` | 18 | Passing | Phase 6B & 6B.1 baselines, exact eCDF, interpolation, saturation, coverage, u128 |
 | `bitcoin_core_regtest_tests` (integration) | `tests/bitcoin_core_regtest_tests.rs` | 8 | Passing | Live bitcoind regtest RPC & ZMQ integration |
 | `historical_replay_tests` (integration) | `tests/historical_replay_tests.rs` | 8 | Passing | Historical block replay & time-semantics |
 | `incident_watch_tests` (integration) | `tests/incident_watch_tests.rs` | 1 | Passing | Incident watch telemetry & alerts |
@@ -25,8 +25,8 @@ Total Automated Tests: **202 passed, 0 failed, 0 ignored** across 16 test binari
 | `obschain-ingest` (unit) | `crates/obschain-ingest/src/lib.rs` | 49 | Passing | Bitcoin RPC, ZMQ sequence/rawtx, mempool REST/WS, UTXO cache |
 | `obschain-intelligence` (unit) | `crates/obschain-intelligence/src/lib.rs` | 10 | Passing | Clustering, watch engine, baseline distributions & impact calculator |
 | `obschain-storage` (unit) | `crates/obschain-storage/src/lib.rs` | 4 | Passing | In-memory repository & bounded retention |
-| `postgres_integration_tests` (integration) | `crates/obschain-storage/tests/postgres_integration_tests.rs` | 10 | Passing | PostgreSQL schema, migrations 0001-0006, transactions |
-| **TOTAL** | | **202** | **202 Passed** | **0 Failed, 0 Ignored** |
+| `postgres_integration_tests` (integration) | `crates/obschain-storage/tests/postgres_integration_tests.rs` | 10 | Passing | PostgreSQL schema, migrations 0001-0007, transactions |
+| **TOTAL** | | **208** | **208 Passed** | **0 Failed, 0 Ignored** |
 
 ---
 
