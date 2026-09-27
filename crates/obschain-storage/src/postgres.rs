@@ -3214,11 +3214,11 @@ impl BaselineRepository for PostgresStorage {
         .bind(rarity.percentile)
         .bind(band_str)
         .bind(u64_to_i64_checked(rarity.population_size)?)
-        .bind(u64_to_i64_checked(rarity.tail_count)?)
+        .bind(rarity.tail_count.map(u64_to_i64_checked).transpose()?)
         .bind(mode_str)
         .bind(impact_score)
         .bind(impact_json)
-        .bind(rarity.percentile_method.as_str())
+        .bind(rarity.percentile_method.map(|pm| pm.as_str()))
         .bind(rarity.estimated)
         .execute(&self.pool)
         .await
@@ -3236,7 +3236,8 @@ impl BaselineRepository for PostgresStorage {
             r#"
             SELECT id, event_id, baseline_run_id, event_type, metric,
                    value_numeric::TEXT as value_numeric, value_text, percentile,
-                   rarity_band, population_size, tail_count, evaluation_mode
+                   rarity_band, population_size, tail_count, evaluation_mode,
+                   percentile_method, estimated
             FROM event_rarity
             WHERE event_id = $1
               AND ($2::UUID IS NULL OR baseline_run_id = $2)
@@ -3268,13 +3269,11 @@ impl BaselineRepository for PostgresStorage {
                 .unwrap_or(EvaluationMode::Retrospective);
 
             let pop_size_i64: i64 = row.get("population_size");
-            let tail_count_i64: i64 = row.get("tail_count");
-            let method_str: String = row
-                .try_get("percentile_method")
-                .unwrap_or_else(|_| "EXACT_EMPIRICAL_CDF".to_string());
-            let percentile_method: PercentileMethod = method_str
-                .parse()
-                .unwrap_or(PercentileMethod::ExactEmpiricalCdf);
+            let tail_count_i64: Option<i64> = row.try_get("tail_count").ok().flatten();
+            let tail_count = tail_count_i64.map(i64_to_u64_checked).transpose()?;
+            let method_str_opt: Option<String> = row.try_get("percentile_method").ok().flatten();
+            let percentile_method: Option<PercentileMethod> =
+                method_str_opt.and_then(|s| s.parse().ok());
             let estimated: bool = row.try_get("estimated").unwrap_or(false);
 
             results.push(EventRarityResult {
@@ -3286,10 +3285,11 @@ impl BaselineRepository for PostgresStorage {
                 percentile: row.get("percentile"),
                 rarity_band,
                 population_size: i64_to_u64_checked(pop_size_i64)?,
-                tail_count: i64_to_u64_checked(tail_count_i64)?,
+                tail_count,
                 evaluation_mode,
                 percentile_method,
                 estimated,
+                baseline_quality: None,
             });
         }
 
@@ -3402,6 +3402,13 @@ impl BaselineRepository for PostgresStorage {
 
     async fn save_event_metrics(&self, metrics: &[EventMetricValue]) -> Result<(), StorageError> {
         for m in metrics {
+            if m.value.scale() > obschain_core::MAX_SUPPORTED_DECIMAL_SCALE {
+                return Err(StorageError::InvalidData(format!(
+                    "Metric value scale {} exceeds maximum supported scale {}",
+                    m.value.scale(),
+                    obschain_core::MAX_SUPPORTED_DECIMAL_SCALE
+                )));
+            }
             let event_type_str = serde_json::to_string(&m.event_type)
                 .map_err(StorageError::Serialization)?
                 .trim_matches('"')

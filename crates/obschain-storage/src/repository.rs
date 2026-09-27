@@ -24,6 +24,9 @@ pub enum StorageError {
 
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    #[error("Invalid data: {0}")]
+    InvalidData(String),
 }
 
 /// Safely convert Rust u64 satoshis / block heights to PostgreSQL signed BIGINT (i64).
@@ -1284,6 +1287,13 @@ impl BaselineRepository for InMemoryStorage {
             .write()
             .map_err(|e| StorageError::Database(e.to_string()))?;
         for m in metrics {
+            if m.value.scale() > obschain_core::MAX_SUPPORTED_DECIMAL_SCALE {
+                return Err(StorageError::InvalidData(format!(
+                    "Metric value scale {} exceeds maximum supported scale {}",
+                    m.value.scale(),
+                    obschain_core::MAX_SUPPORTED_DECIMAL_SCALE
+                )));
+            }
             if let Some(pos) = lock.iter().position(|existing| {
                 existing.event_id == m.event_id
                     && existing.metric == m.metric

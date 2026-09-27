@@ -1480,16 +1480,22 @@ async fn run_rarity(
     println!("Primary Metric:  {:?}", context.primary.metric);
     println!("  Observed:      {}", context.primary.value);
     if let Some(p) = context.primary.percentile {
-        println!(
-            "  Percentile:    {:.2}% ({})",
-            p,
-            context.primary.percentile_method.as_str()
-        );
+        let method_str = context
+            .primary
+            .percentile_method
+            .map(|m| m.as_str())
+            .unwrap_or("N/A");
+        println!("  Percentile:    {:.2}% ({})", p, method_str);
     } else {
         println!("  Percentile:    N/A (Insufficient Data)");
     }
     println!("  Population:    {}", context.primary.population_size);
-    println!("  Tail Count:    {}", context.primary.tail_count);
+    let tail_str = context
+        .primary
+        .tail_count
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| "N/A".to_string());
+    println!("  Tail Count:    {}", tail_str);
     println!(
         "  Frequency:     {}",
         context.primary.frequency_description()
@@ -1504,14 +1510,19 @@ async fn run_rarity(
                 .percentile
                 .map(|p| format!("{p:.2}%"))
                 .unwrap_or_else(|| "N/A".to_string());
+            let method_str = sec.percentile_method.map(|m| m.as_str()).unwrap_or("N/A");
+            let sec_tail_str = sec
+                .tail_count
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "N/A".to_string());
             println!(
                 "  • {:<28} Value: {:<18} Percentile: {:<8} ({}) Band: {:<12} Tail: {} / {}",
                 format!("{:?}:", sec.metric),
                 sec.value.to_string(),
                 p_str,
-                sec.percentile_method.as_str(),
+                method_str,
                 sec.rarity_band.as_str(),
-                sec.tail_count,
+                sec_tail_str,
                 sec.population_size,
             );
         }
@@ -1531,7 +1542,15 @@ async fn run_rarity(
                 impact.model_coverage * 100.0
             );
         } else {
-            println!("  Composite Impact Score: UNAVAILABLE (Insufficient sample size or metrics)");
+            let reason = impact
+                .unavailable_reason
+                .map(|r| r.as_str())
+                .unwrap_or("UNAVAILABLE");
+            println!(
+                "  Composite Impact Score: UNAVAILABLE ({}) (Coverage: {:.1}%)",
+                reason,
+                impact.model_coverage * 100.0
+            );
         }
         println!("  Component Contributions:");
         for comp in &impact.components {

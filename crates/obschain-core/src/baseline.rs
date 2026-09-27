@@ -208,6 +208,74 @@ impl FromStr for PercentileMethod {
     }
 }
 
+/// Centralized decision determining whether an event metric's percentile should be evaluated
+/// exactly, estimated via quantile interpolation, or marked as insufficient data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PercentileEvaluationDecision {
+    Exact,
+    Estimated,
+    InsufficientData,
+}
+
+impl PercentileEvaluationDecision {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Exact => "EXACT",
+            Self::Estimated => "ESTIMATED",
+            Self::InsufficientData => "INSUFFICIENT_DATA",
+        }
+    }
+
+    /// Evaluates the centralized fallback rule:
+    /// 1. Exact evaluation is permitted only when exact_rank exists with population >= min_sample_size,
+    ///    and baseline quality is not Insufficient.
+    /// 2. If exact population < min_sample_size, it strictly yields InsufficientData (no manufactured estimates).
+    /// 3. Estimated fallback is permitted only when exact lookup is unavailable, a compatible distribution
+    ///    exists with sample_count >= min_sample_size, and baseline quality is not Insufficient.
+    /// 4. If baseline quality is Degraded but sample_count >= min_sample_size, estimation is permitted
+    ///    with estimated = true and quality = DEGRADED.
+    /// 5. Otherwise, yields InsufficientData.
+    pub fn decide(
+        exact_rank: Option<(f64, u64, u64)>,
+        distribution: Option<&BaselineDistribution>,
+        min_sample_size: u64,
+    ) -> Self {
+        // 1. If baseline distribution exists and is explicitly marked Insufficient quality:
+        if let Some(dist) = distribution {
+            if dist.quality == BaselineQuality::Insufficient {
+                return Self::InsufficientData;
+            }
+        }
+
+        // 2. Check if valid exact empirical rank exists with sufficient population:
+        if let Some((_, _, pop)) = exact_rank {
+            let dist_samples = distribution.map(|d| d.sample_count).unwrap_or(0);
+            if pop >= min_sample_size && (dist_samples == 0 || pop >= dist_samples) {
+                if let Some(dist) = distribution {
+                    if dist.quality == BaselineQuality::Degraded {
+                        return Self::Estimated;
+                    }
+                }
+                return Self::Exact;
+            }
+        }
+
+        // 3. Exact rank is unavailable or insufficient. Fall back to distribution estimation if eligible:
+        if let Some(dist) = distribution {
+            if dist.sample_count < min_sample_size {
+                return Self::InsufficientData;
+            }
+            if dist.quality == BaselineQuality::Insufficient {
+                return Self::InsufficientData;
+            }
+            Self::Estimated
+        } else {
+            Self::InsufficientData
+        }
+    }
+}
+
 /// Definition of a baseline metric for an event type in the registry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BaselineMetricDefinition {
@@ -433,6 +501,18 @@ impl MetricRegistry {
     }
 }
 
+/// Maximum decimal scale supported by PostgreSQL NUMERIC(50, 4) storage.
+pub const MAX_SUPPORTED_DECIMAL_SCALE: u32 = 4;
+
+/// Error returned when working with MetricValue values.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MetricValueError {
+    #[error("Unsupported decimal scale {scale}: maximum supported scale is {max_supported}")]
+    UnsupportedScale { scale: u32, max_supported: u32 },
+    #[error("Invalid numeric string format: {0}")]
+    InvalidFormat(String),
+}
+
 /// Representation of extracted metric values preserving exact numeric precision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value")]
@@ -444,6 +524,16 @@ pub enum MetricValue {
 }
 
 impl MetricValue {
+    /// Creates a DecimalScaled metric value, enforcing the supported scale domain (scale <= 4).
+    pub fn decimal_scaled(value: u64, scale: u32) -> Result<Self, MetricValueError> {
+        if scale > MAX_SUPPORTED_DECIMAL_SCALE {
+            return Err(MetricValueError::UnsupportedScale {
+                scale,
+                max_supported: MAX_SUPPORTED_DECIMAL_SCALE,
+            });
+        }
+        Ok(Self::DecimalScaled { value, scale })
+    }
     pub fn scale(&self) -> u32 {
         match self {
             Self::U64(_) | Self::U128(_) => 0,
@@ -568,6 +658,12 @@ impl MetricValue {
     }
 
     pub fn from_str_scale_and_metric(s: &str, scale: u32, metric: BaselineMetric) -> Self {
+        assert!(
+            scale <= MAX_SUPPORTED_DECIMAL_SCALE,
+            "Decimal scale {} exceeds maximum supported scale {}",
+            scale,
+            MAX_SUPPORTED_DECIMAL_SCALE
+        );
         let clean = s.trim();
         if scale == 0 {
             if metric == BaselineMetric::CoinAgeDestroyedSatoshiDays {
@@ -599,6 +695,21 @@ impl MetricValue {
         } else {
             Self::DecimalScaled { value: 0, scale }
         }
+    }
+
+    /// Tries to parse a string into a MetricValue at a given scale, rejecting scale > MAX_SUPPORTED_DECIMAL_SCALE.
+    pub fn try_from_str_scale_and_metric(
+        s: &str,
+        scale: u32,
+        metric: BaselineMetric,
+    ) -> Result<Self, MetricValueError> {
+        if scale > MAX_SUPPORTED_DECIMAL_SCALE {
+            return Err(MetricValueError::UnsupportedScale {
+                scale,
+                max_supported: MAX_SUPPORTED_DECIMAL_SCALE,
+            });
+        }
+        Ok(Self::from_str_scale_and_metric(s, scale, metric))
     }
 }
 
@@ -1217,26 +1328,36 @@ pub struct EventRarityResult {
     pub metric: BaselineMetric,
     pub value: MetricValue,
     pub percentile: Option<f64>,
-    pub percentile_method: PercentileMethod,
+    pub percentile_method: Option<PercentileMethod>,
     #[serde(default)]
     pub estimated: bool,
     pub rarity_band: RarityBand,
     pub population_size: u64,
-    pub tail_count: u64,
+    pub tail_count: Option<u64>,
     pub evaluation_mode: EvaluationMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_quality: Option<BaselineQuality>,
 }
 
 impl EventRarityResult {
     /// Descriptive frequency string e.g. "11 comparable-or-greater events across 18,421 qualifying events (1 in 1,674)".
     pub fn frequency_description(&self) -> String {
-        let one_in = self
-            .population_size
-            .checked_div(self.tail_count)
-            .unwrap_or(self.population_size);
-        format!(
-            "{} comparable-or-rarer events across {} qualifying events (approx. 1 in {})",
-            self.tail_count, self.population_size, one_in
-        )
+        match self.tail_count {
+            Some(tail) => {
+                let one_in = self
+                    .population_size
+                    .checked_div(tail)
+                    .unwrap_or(self.population_size);
+                format!(
+                    "{} comparable-or-rarer events across {} qualifying events (approx. 1 in {})",
+                    tail, self.population_size, one_in
+                )
+            }
+            None => format!(
+                "Insufficient sample size ({} events observed, minimum required is {})",
+                self.population_size, 100
+            ),
+        }
     }
 }
 
@@ -1269,6 +1390,31 @@ pub struct ImpactComponent {
     pub population_size: u64,
 }
 
+/// Machine-readable reason when an impact score cannot be calculated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ImpactUnavailableReason {
+    InsufficientBaseline,
+    InsufficientComponentCoverage,
+    RarityUnavailable,
+}
+
+impl ImpactUnavailableReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::InsufficientBaseline => "INSUFFICIENT_BASELINE",
+            Self::InsufficientComponentCoverage => "INSUFFICIENT_COMPONENT_COVERAGE",
+            Self::RarityUnavailable => "RARITY_UNAVAILABLE",
+        }
+    }
+}
+
+impl std::fmt::Display for ImpactUnavailableReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 /// Explainable impact breakdown with visible component contributions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImpactBreakdown {
@@ -1282,6 +1428,8 @@ pub struct ImpactBreakdown {
     pub model_coverage: f64,
     #[serde(default)]
     pub coverage_ratio: f64,
+    #[serde(default)]
+    pub unavailable_reason: Option<ImpactUnavailableReason>,
     pub components: Vec<ImpactComponent>,
 }
 

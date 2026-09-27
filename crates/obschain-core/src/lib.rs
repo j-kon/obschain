@@ -17,8 +17,9 @@ pub use baseline::{
     BaselineDistribution, BaselineMetric, BaselineMetricDefinition, BaselineQuality, BaselineRun,
     BaselineRunStatus, BaselineWindow, EvaluationMode, EventMetricExtractor, EventMetricValue,
     EventRarityContext, EventRarityResult, HalvingEpoch, ImpactBreakdown, ImpactComponent,
-    ImpactComponentDefinition, ImpactModelDefinition, MetricRegistry, MetricUnit, MetricValue,
-    PercentileMethod, QuantileDistribution, RarityBand, RarityDirection,
+    ImpactComponentDefinition, ImpactModelDefinition, ImpactUnavailableReason, MetricRegistry,
+    MetricUnit, MetricValue, MetricValueError, PercentileEvaluationDecision, PercentileMethod,
+    QuantileDistribution, RarityBand, RarityDirection, MAX_SUPPORTED_DECIMAL_SCALE,
 };
 
 pub use error::CoreError;

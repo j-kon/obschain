@@ -3,8 +3,9 @@ use obschain_core::{
     BaselineDistribution, BaselineMetric, BaselineQuality, BaselineRun, BaselineRunStatus,
     EvaluationMode, EventMetricExtractor, EventRarityContext, EventRarityResult, EventType,
     HalvingEpoch, ImpactBreakdown, ImpactComponent, ImpactComponentDefinition,
-    ImpactModelDefinition, MetricRegistry, MetricValue, PercentileMethod, QuantileDistribution,
-    RarityBand, RarityDirection,
+    ImpactModelDefinition, ImpactUnavailableReason, MetricRegistry, MetricValue,
+    PercentileEvaluationDecision, PercentileMethod, QuantileDistribution, RarityBand,
+    RarityDirection,
 };
 use uuid::Uuid;
 
@@ -364,7 +365,7 @@ impl ImpactCalculator {
         for comp_def in &model.components {
             if let Some(res) = rarity_results.iter().find(|r| r.metric == comp_def.metric) {
                 available_count += 1;
-                if res.population_size < DEFAULT_MIN_SAMPLE_SIZE {
+                if res.population_size < DEFAULT_MIN_SAMPLE_SIZE || res.percentile.is_none() {
                     has_insufficient_samples = true;
                 }
 
@@ -398,20 +399,26 @@ impl ImpactCalculator {
         };
 
         // Score is available only if coverage >= 50% and sample size >= minimum and available_count > 0
-        let total_score =
-            if has_insufficient_samples || available_count == 0 || model_coverage < 0.50 {
-                None
+        let (total_score, unavailable_reason) = if available_count == 0 {
+            (None, Some(ImpactUnavailableReason::RarityUnavailable))
+        } else if has_insufficient_samples {
+            (None, Some(ImpactUnavailableReason::InsufficientBaseline))
+        } else if model_coverage < 0.50 {
+            (
+                None,
+                Some(ImpactUnavailableReason::InsufficientComponentCoverage),
+            )
+        } else {
+            let raw_points: f64 = components.iter().map(|c| c.points_awarded).sum();
+            // Mathematical proof: each points_awarded <= weight, and sum of weights == 100.0.
+            // Therefore, raw_points <= 100.0 by construction without structural clamping.
+            let clamped = if raw_points > 100.00000001 {
+                100.0
             } else {
-                let raw_points: f64 = components.iter().map(|c| c.points_awarded).sum();
-                // Mathematical proof: each points_awarded <= weight, and sum of weights == 100.0.
-                // Therefore, raw_points <= 100.0 by construction without structural clamping.
-                let clamped = if raw_points > 100.00000001 {
-                    100.0
-                } else {
-                    raw_points
-                };
-                Some((clamped * 100.0).round() / 100.0)
+                raw_points
             };
+            (Some((clamped * 100.0).round() / 100.0), None)
+        };
 
         ImpactBreakdown {
             model_id: model.id.to_string(),
@@ -422,6 +429,7 @@ impl ImpactCalculator {
             max_possible_points: 100.0,
             model_coverage,
             coverage_ratio: model_coverage,
+            unavailable_reason,
             components,
         }
     }
@@ -542,54 +550,65 @@ impl BaselineEngine {
                 continue;
             };
 
-            let (percentile_opt, method, estimated, tail_count, pop_size, band) =
-                if let Some(&(p, tail, pop)) = exact_ranks
-                    .get(&def.metric)
-                    .filter(|(_, _, pop)| *pop >= min_sample_size)
-                {
-                    let b = RarityBand::from_percentile(p, pop, min_sample_size);
-                    let p_opt = if b == RarityBand::InsufficientData {
-                        None
-                    } else {
-                        Some(p)
-                    };
-                    (
-                        p_opt,
-                        PercentileMethod::ExactEmpiricalCdf,
-                        false,
-                        tail,
-                        pop,
-                        b,
-                    )
-                } else if let Some(dist) = distributions
-                    .iter()
-                    .find(|d| d.event_type == event.event_type && d.metric == def.metric)
-                {
-                    let (p, tail) =
-                        BaselineCalculator::rank_from_distribution(dist, val, def.direction);
-                    let b = RarityBand::from_percentile(p, dist.sample_count, min_sample_size);
-                    let p_opt = if b == RarityBand::InsufficientData {
-                        None
-                    } else {
-                        Some(p)
-                    };
-                    (
-                        p_opt,
-                        PercentileMethod::QuantileInterpolationEstimate,
-                        true,
-                        tail,
-                        dist.sample_count,
-                        b,
-                    )
-                } else {
-                    (
-                        None,
-                        PercentileMethod::QuantileInterpolationEstimate,
-                        true,
-                        0,
-                        0,
-                        RarityBand::InsufficientData,
-                    )
+            let exact_rank = exact_ranks.get(&def.metric).copied();
+            let dist_opt = distributions
+                .iter()
+                .find(|d| d.event_type == event.event_type && d.metric == def.metric);
+
+            let decision =
+                PercentileEvaluationDecision::decide(exact_rank, dist_opt, min_sample_size);
+
+            let (percentile_opt, method, estimated, tail_count, pop_size, band, quality) =
+                match decision {
+                    PercentileEvaluationDecision::Exact => {
+                        let (p, tail, pop) = exact_rank.expect("decision Exact implies exact_rank");
+                        let b = RarityBand::from_percentile(p, pop, min_sample_size);
+                        let qual = dist_opt
+                            .map(|d| d.quality)
+                            .unwrap_or_else(|| BaselineQuality::evaluate(pop, 1.0));
+                        (
+                            Some(p),
+                            Some(PercentileMethod::ExactEmpiricalCdf),
+                            false,
+                            Some(tail),
+                            pop,
+                            b,
+                            Some(qual),
+                        )
+                    }
+                    PercentileEvaluationDecision::Estimated => {
+                        let dist = dist_opt.expect("decision Estimated implies distribution");
+                        let (p, tail) =
+                            BaselineCalculator::rank_from_distribution(dist, val, def.direction);
+                        let b = RarityBand::from_percentile(p, dist.sample_count, min_sample_size);
+                        (
+                            Some(p),
+                            Some(PercentileMethod::QuantileInterpolationEstimate),
+                            true,
+                            Some(tail),
+                            dist.sample_count,
+                            b,
+                            Some(dist.quality),
+                        )
+                    }
+                    PercentileEvaluationDecision::InsufficientData => {
+                        let pop = exact_rank
+                            .map(|(_, _, pop)| pop)
+                            .or_else(|| dist_opt.map(|d| d.sample_count))
+                            .unwrap_or(0);
+                        let qual = dist_opt
+                            .map(|d| d.quality)
+                            .unwrap_or(BaselineQuality::Insufficient);
+                        (
+                            None,
+                            None,
+                            false,
+                            None,
+                            pop,
+                            RarityBand::InsufficientData,
+                            Some(qual),
+                        )
+                    }
                 };
 
             results.push((
@@ -607,6 +626,7 @@ impl BaselineEngine {
                     population_size: pop_size,
                     tail_count,
                     evaluation_mode,
+                    baseline_quality: quality,
                 },
             ));
         }
@@ -627,12 +647,13 @@ impl BaselineEngine {
                     metric: fallback_metric,
                     value: MetricValue::U64(0),
                     percentile: None,
-                    percentile_method: PercentileMethod::ExactEmpiricalCdf,
+                    percentile_method: None,
                     estimated: false,
                     rarity_band: RarityBand::InsufficientData,
                     population_size: 0,
-                    tail_count: 0,
+                    tail_count: None,
                     evaluation_mode,
+                    baseline_quality: Some(BaselineQuality::Insufficient),
                 }
             });
 
@@ -792,12 +813,13 @@ mod tests {
             metric: BaselineMetric::ValueSats,
             value: MetricValue::U64(10_000_000_000),
             percentile: Some(99.94),
-            percentile_method: PercentileMethod::ExactEmpiricalCdf,
+            percentile_method: Some(PercentileMethod::ExactEmpiricalCdf),
             estimated: false,
             rarity_band: RarityBand::Extreme,
             population_size: 18421,
-            tail_count: 11,
+            tail_count: Some(11),
             evaluation_mode: EvaluationMode::Retrospective,
+            baseline_quality: Some(BaselineQuality::High),
         };
 
         let secondary_rarity = EventRarityResult {
@@ -807,12 +829,13 @@ mod tests {
             metric: BaselineMetric::OutputCount,
             value: MetricValue::U64(50),
             percentile: Some(95.0),
-            percentile_method: PercentileMethod::ExactEmpiricalCdf,
+            percentile_method: Some(PercentileMethod::ExactEmpiricalCdf),
             estimated: false,
             rarity_band: RarityBand::Unusual,
             population_size: 18421,
-            tail_count: 920,
+            tail_count: Some(920),
             evaluation_mode: EvaluationMode::Retrospective,
+            baseline_quality: Some(BaselineQuality::High),
         };
 
         let breakdown = ImpactCalculator::calculate_impact(

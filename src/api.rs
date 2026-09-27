@@ -15,7 +15,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use obschain_core::baseline::{
-    BaselineMetric, BaselineRunStatus, EventMetricExtractor, MetricRegistry,
+    BaselineMetric, BaselineRunStatus, EventMetricExtractor, EventRarityResult, MetricRegistry,
 };
 use obschain_core::{
     ActivityStatus, ChainEvent, EventSeverity, EventType, IncidentActivity, IncidentAlert,
@@ -790,27 +790,40 @@ async fn get_event_handler(
                             &exact_ranks,
                             state.baseline_min_sample_size,
                         );
+                        let quality = dists
+                            .iter()
+                            .find(|d| {
+                                d.event_type == event.event_type
+                                    && d.metric == rarity_ctx.primary.metric
+                            })
+                            .map(|d| d.quality.as_str())
+                            .unwrap_or("INSUFFICIENT");
+
                         val["rarity"] = serde_json::json!({
                             "baseline_id": baseline.id,
                             "primary": {
                                 "metric": rarity_ctx.primary.metric.as_str(),
                                 "value": rarity_ctx.primary.value.to_numeric_string(),
                                 "percentile": rarity_ctx.primary.percentile,
-                                "percentile_method": rarity_ctx.primary.percentile_method.as_str(),
+                                "percentile_method": rarity_ctx.primary.percentile_method.map(|m| m.as_str()),
                                 "estimated": rarity_ctx.primary.estimated,
+                                "rarity_band": rarity_ctx.primary.rarity_band.as_str(),
                                 "band": rarity_ctx.primary.rarity_band.as_str(),
                                 "population_size": rarity_ctx.primary.population_size,
                                 "tail_count": rarity_ctx.primary.tail_count,
+                                "baseline_quality": rarity_ctx.primary.baseline_quality.map(|q| q.as_str()).unwrap_or(quality),
                             },
                             "secondary": rarity_ctx.secondary.iter().map(|s| serde_json::json!({
                                 "metric": s.metric.as_str(),
                                 "value": s.value.to_numeric_string(),
                                 "percentile": s.percentile,
-                                "percentile_method": s.percentile_method.as_str(),
+                                "percentile_method": s.percentile_method.map(|m| m.as_str()),
                                 "estimated": s.estimated,
+                                "rarity_band": s.rarity_band.as_str(),
                                 "band": s.rarity_band.as_str(),
                                 "population_size": s.population_size,
                                 "tail_count": s.tail_count,
+                                "baseline_quality": s.baseline_quality.map(|q| q.as_str()).unwrap_or(quality),
                             })).collect::<Vec<_>>(),
                         });
                     }
@@ -1646,7 +1659,7 @@ async fn get_event_rarity_handler(
                 def.metric.as_str(),
                 EventMetricExtractor::DEFAULT_METRIC_VERSION
             );
-            if let Ok(Some((p, tail, pop))) = state
+            match state
                 .storage
                 .get_exact_empirical_rank(
                     &baseline_run.network,
@@ -1660,7 +1673,13 @@ async fn get_event_rarity_handler(
                 )
                 .await
             {
-                exact_ranks.insert(def.metric, (p, tail, pop));
+                Ok(Some((p, tail, pop))) => {
+                    exact_ranks.insert(def.metric, (p, tail, pop));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(map_storage_error(e));
+                }
             }
         }
     }
@@ -1685,69 +1704,60 @@ async fn get_event_rarity_handler(
             .await;
     }
 
-    // Build rich, clean response matching Section 65 / Section 42 / Section 40
-    let mut all_metrics = vec![serde_json::json!({
-        "metric": rarity_context.primary.metric.as_str(),
-        "value": rarity_context.primary.value.to_numeric_string(),
-        "value_display": rarity_context.primary.value.to_string(),
-        "percentile": rarity_context.primary.percentile,
-        "percentile_method": rarity_context.primary.percentile_method.as_str(),
-        "estimated": rarity_context.primary.estimated,
-        "tail_count": rarity_context.primary.tail_count,
-        "population_size": rarity_context.primary.population_size,
-        "rarity": rarity_context.primary.rarity_band.as_str(),
-        "frequency": rarity_context.primary.frequency_description(),
-        "is_primary": true,
-    })];
-
-    for sec in &rarity_context.secondary {
-        all_metrics.push(serde_json::json!({
-            "metric": sec.metric.as_str(),
-            "value": sec.value.to_numeric_string(),
-            "value_display": sec.value.to_string(),
-            "percentile": sec.percentile,
-            "percentile_method": sec.percentile_method.as_str(),
-            "estimated": sec.estimated,
-            "tail_count": sec.tail_count,
-            "population_size": sec.population_size,
-            "rarity": sec.rarity_band.as_str(),
-            "frequency": sec.frequency_description(),
-            "is_primary": false,
-        }));
-    }
-
     let quality = distributions
         .iter()
         .find(|d| d.event_type == event.event_type && d.metric == rarity_context.primary.metric)
         .map(|d| d.quality.as_str())
         .unwrap_or("INSUFFICIENT");
 
+    let format_rarity_metric = |res: &EventRarityResult, is_primary: bool| {
+        let qual_str = res.baseline_quality.map(|q| q.as_str()).unwrap_or(quality);
+        serde_json::json!({
+            "metric": res.metric.as_str(),
+            "value": res.value.to_numeric_string(),
+            "value_display": res.value.to_string(),
+            "percentile": res.percentile,
+            "percentile_method": res.percentile_method.map(|m| m.as_str()),
+            "estimated": res.estimated,
+            "rarity_band": res.rarity_band.as_str(),
+            "band": res.rarity_band.as_str(),
+            "rarity": res.rarity_band.as_str(),
+            "population_size": res.population_size,
+            "tail_count": res.tail_count,
+            "baseline_quality": qual_str,
+            "frequency": res.frequency_description(),
+            "is_primary": is_primary,
+        })
+    };
+
+    let primary_json = format_rarity_metric(&rarity_context.primary, true);
+    let secondary_json: Vec<_> = rarity_context
+        .secondary
+        .iter()
+        .map(|sec| format_rarity_metric(sec, false))
+        .collect();
+
+    let mut all_metrics = vec![primary_json.clone()];
+    all_metrics.extend(secondary_json.clone());
+
     Ok(Json(serde_json::json!({
         "event_id": event.id,
         "event_type": event.event_type,
         "baseline": {
             "id": baseline_run.id,
-            "algorithm_version": baseline_run.algorithm_version,
-            "network": baseline_run.network,
+            "baseline_id": baseline_run.id,
+            "algorithm_version": &baseline_run.algorithm_version,
+            "metric_definition_version": EventMetricExtractor::DEFAULT_METRIC_VERSION,
+            "network": &baseline_run.network,
             "start_height": baseline_run.start_height,
             "end_height": baseline_run.end_height,
+            "sample_count": baseline_run.canonical_event_count,
             "population_size": baseline_run.canonical_event_count,
             "quality": quality,
             "evaluation_mode": rarity_context.evaluation_mode.as_str(),
         },
-        "primary": {
-            "metric": rarity_context.primary.metric.as_str(),
-            "value": rarity_context.primary.value.to_numeric_string(),
-            "percentile": rarity_context.primary.percentile,
-            "percentile_method": rarity_context.primary.percentile_method.as_str(),
-            "estimated": rarity_context.primary.estimated,
-            "tail_count": rarity_context.primary.tail_count,
-            "population_size": rarity_context.primary.population_size,
-            "band": rarity_context.primary.rarity_band.as_str(),
-            "rarity": rarity_context.primary.rarity_band.as_str(),
-            "rarity_band": rarity_context.primary.rarity_band.as_str(),
-        },
-        "secondary": rarity_context.secondary,
+        "primary": primary_json,
+        "secondary": secondary_json,
         "metrics": all_metrics,
         "impact": rarity_context.impact,
     })))

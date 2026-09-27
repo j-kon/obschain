@@ -1,32 +1,32 @@
 # ObsChain Automated Test Manifest & Baseline Verification
 
-This document provides the authoritative record of ObsChain automated test suites, test counts, and suite inventory as of **Phase 6B.1: Statistical Correctness Hardening**.
+This document provides the authoritative record of ObsChain automated test suites, test counts, and suite inventory as of **Phase 6B.2: Statistical Guardrails & Backend Contract Freeze**.
 
 ---
 
-## 1. Authoritative Test Inventory (Phase 6B.1 Baseline)
+## 1. Authoritative Test Inventory (Phase 6B.2 Baseline)
 
-Total Automated Tests: **208 passed, 0 failed, 0 ignored** across 16 test binaries.
+Total Automated Tests: **212 passed, 0 failed, 0 ignored** across 16 test binaries.
 
 | Test Binary / Suite | Source Path | Test Count | Status | Notes |
 |---|---|---|---|---|
 | `obschain` (unit) | `src/lib.rs` | 3 | Passing | Pipeline metrics & configuration tests |
 | `obschain` (main) | `src/main.rs` | 0 | Passing | Executable harness |
 | `api_tests` (integration) | `tests/api_tests.rs` | 14 | Passing | REST and WebSocket API endpoints |
-| `baseline_tests` (integration) | `tests/baseline_tests.rs` | 18 | Passing | Phase 6B & 6B.1 baselines, exact eCDF, interpolation, saturation, coverage, u128 |
+| `baseline_tests` (integration) | `tests/baseline_tests.rs` | 22 | Passing | Phase 6B, 6B.1, & 6B.2 statistical guardrails, scale boundary, insufficient-sample invariant, fallback decision matrix, frozen contract fixture |
 | `bitcoin_core_regtest_tests` (integration) | `tests/bitcoin_core_regtest_tests.rs` | 8 | Passing | Live bitcoind regtest RPC & ZMQ integration |
 | `historical_replay_tests` (integration) | `tests/historical_replay_tests.rs` | 8 | Passing | Historical block replay & time-semantics |
 | `incident_watch_tests` (integration) | `tests/incident_watch_tests.rs` | 1 | Passing | Incident watch telemetry & alerts |
 | `provenance_tests` (integration) | `tests/provenance_tests.rs` | 14 | Passing | Event vs observation separation & lifecycle transitions |
-| `obschain-core` (unit) | `crates/obschain-core/src/lib.rs` | 13 | Passing | Domain models, deterministic UUIDv5, observations, metric registry |
+| `obschain-core` (unit) | `crates/obschain-core/src/lib.rs` | 13 | Passing | Domain models, deterministic UUIDv5, observations, metric registry, scale constraint |
 | `obschain-detectors` (unit) | `crates/obschain-detectors/src/lib.rs` | 40 | Passing | Anomaly detectors (large tx, intervals, fees, RBF, reorg) |
 | `obschain-incidents` (unit) | `crates/obschain-incidents/src/lib.rs` | 2 | Passing | Incident seed invariants & JSON fixture validation |
 | `incident_intelligence_tests` (integration) | `crates/obschain-incidents/tests/incident_intelligence_tests.rs` | 14 | Passing | Graph modeling, evidence hierarchy, fund arithmetic |
 | `obschain-ingest` (unit) | `crates/obschain-ingest/src/lib.rs` | 49 | Passing | Bitcoin RPC, ZMQ sequence/rawtx, mempool REST/WS, UTXO cache |
-| `obschain-intelligence` (unit) | `crates/obschain-intelligence/src/lib.rs` | 10 | Passing | Clustering, watch engine, baseline distributions & impact calculator |
+| `obschain-intelligence` (unit) | `crates/obschain-intelligence/src/lib.rs` | 10 | Passing | Clustering, watch engine, baseline distributions, fallback decision, impact calculator |
 | `obschain-storage` (unit) | `crates/obschain-storage/src/lib.rs` | 4 | Passing | In-memory repository & bounded retention |
-| `postgres_integration_tests` (integration) | `crates/obschain-storage/tests/postgres_integration_tests.rs` | 10 | Passing | PostgreSQL schema, migrations 0001-0007, transactions |
-| **TOTAL** | | **208** | **208 Passed** | **0 Failed, 0 Ignored** |
+| `postgres_integration_tests` (integration) | `crates/obschain-storage/tests/postgres_integration_tests.rs` | 10 | Passing | PostgreSQL schema, migrations 0001-0008, transactions |
+| **TOTAL** | | **212** | **212 Passed** | **0 Failed, 0 Ignored** |
 
 ---
 

@@ -8,8 +8,9 @@ use obschain::api::AppState;
 use obschain::create_router;
 use obschain_core::baseline::{
     BaselineDistribution, BaselineMetric, BaselineQuality, BaselineRunStatus, EvaluationMode,
-    EventRarityResult, HalvingEpoch, MetricUnit, MetricValue, PercentileMethod, RarityBand,
-    RarityDirection,
+    EventMetricValue, EventRarityResult, HalvingEpoch, ImpactBreakdown, ImpactUnavailableReason,
+    MetricUnit, MetricValue, MetricValueError, PercentileEvaluationDecision, PercentileMethod,
+    RarityBand, RarityDirection, MAX_SUPPORTED_DECIMAL_SCALE,
 };
 use obschain_core::{
     ChainEvent, ConfidenceLevel, EventObservation, EventObservationKind, EventSeverity, EventType,
@@ -421,12 +422,13 @@ fn test_explainable_impact_breakdown_formula() {
         metric: BaselineMetric::ValueSats,
         value: MetricValue::U64(1_000_000_000_000),
         percentile: Some(99.0),
-        percentile_method: PercentileMethod::ExactEmpiricalCdf,
+        percentile_method: Some(PercentileMethod::ExactEmpiricalCdf),
         estimated: false,
         rarity_band: RarityBand::Rare,
         population_size: 10_000,
-        tail_count: 100,
+        tail_count: Some(100),
         evaluation_mode: EvaluationMode::Retrospective,
+        baseline_quality: Some(BaselineQuality::High),
     };
     let secondary = EventRarityResult {
         event_id: primary.event_id,
@@ -435,12 +437,13 @@ fn test_explainable_impact_breakdown_formula() {
         metric: BaselineMetric::OutputCount,
         value: MetricValue::U64(50),
         percentile: Some(95.0),
-        percentile_method: PercentileMethod::ExactEmpiricalCdf,
+        percentile_method: Some(PercentileMethod::ExactEmpiricalCdf),
         estimated: false,
         rarity_band: RarityBand::Unusual,
         population_size: 10_000,
-        tail_count: 500,
+        tail_count: Some(500),
         evaluation_mode: EvaluationMode::Retrospective,
+        baseline_quality: Some(BaselineQuality::High),
     };
 
     let impact =
@@ -766,7 +769,7 @@ fn test_exact_empirical_cdf_vs_quantile_interpolation_skewed() {
     );
     assert_eq!(
         ctx_exact.primary.percentile_method,
-        PercentileMethod::ExactEmpiricalCdf
+        Some(PercentileMethod::ExactEmpiricalCdf)
     );
     assert!(!ctx_exact.primary.estimated);
     assert_eq!(ctx_exact.primary.percentile, Some(99.0));
@@ -782,7 +785,7 @@ fn test_exact_empirical_cdf_vs_quantile_interpolation_skewed() {
     );
     assert_eq!(
         ctx_est.primary.percentile_method,
-        PercentileMethod::QuantileInterpolationEstimate
+        Some(PercentileMethod::QuantileInterpolationEstimate)
     );
     assert!(ctx_est.primary.estimated);
     assert!((ctx_est.primary.percentile.unwrap() - 99.897).abs() < 0.05);
@@ -808,12 +811,13 @@ fn test_impact_weight_saturation_never_exceeds_100_by_construction() {
                 metric: def.metric,
                 value: MetricValue::U64(1_000_000),
                 percentile: Some(100.0),
-                percentile_method: PercentileMethod::ExactEmpiricalCdf,
+                percentile_method: Some(PercentileMethod::ExactEmpiricalCdf),
                 estimated: false,
                 rarity_band: RarityBand::Extreme,
                 population_size: 50_000,
-                tail_count: 1,
+                tail_count: Some(1),
                 evaluation_mode: EvaluationMode::Retrospective,
+                baseline_quality: Some(BaselineQuality::High),
             })
             .collect();
 
@@ -855,12 +859,13 @@ fn test_event_specific_impact_models_no_irrelevant_components() {
             metric: BaselineMetric::IntervalSeconds,
             value: MetricValue::U64(7200),
             percentile: Some(99.5),
-            percentile_method: PercentileMethod::ExactEmpiricalCdf,
+            percentile_method: Some(PercentileMethod::ExactEmpiricalCdf),
             estimated: false,
             rarity_band: RarityBand::Rare,
             population_size: 20_000,
-            tail_count: 100,
+            tail_count: Some(100),
             evaluation_mode: EvaluationMode::Retrospective,
+            baseline_quality: Some(BaselineQuality::High),
         },
         // Injected irrelevant metrics from other event types:
         EventRarityResult {
@@ -870,12 +875,13 @@ fn test_event_specific_impact_models_no_irrelevant_components() {
             metric: BaselineMetric::ValueSats,
             value: MetricValue::U64(10_000_000_000),
             percentile: Some(99.9),
-            percentile_method: PercentileMethod::ExactEmpiricalCdf,
+            percentile_method: Some(PercentileMethod::ExactEmpiricalCdf),
             estimated: false,
             rarity_band: RarityBand::Extreme,
             population_size: 20_000,
-            tail_count: 2,
+            tail_count: Some(2),
             evaluation_mode: EvaluationMode::Retrospective,
+            baseline_quality: Some(BaselineQuality::High),
         },
     ];
 
@@ -911,12 +917,13 @@ fn test_event_specific_impact_models_no_irrelevant_components() {
                 scale: 2,
             },
             percentile: Some(98.0),
-            percentile_method: PercentileMethod::ExactEmpiricalCdf,
+            percentile_method: Some(PercentileMethod::ExactEmpiricalCdf),
             estimated: false,
             rarity_band: RarityBand::Rare,
             population_size: 5_000,
-            tail_count: 100,
+            tail_count: Some(100),
             evaluation_mode: EvaluationMode::Retrospective,
+            baseline_quality: Some(BaselineQuality::High),
         },
         EventRarityResult {
             event_id: Uuid::new_v4(),
@@ -925,12 +932,13 @@ fn test_event_specific_impact_models_no_irrelevant_components() {
             metric: BaselineMetric::FeeSats,
             value: MetricValue::U64(50_000_000),
             percentile: Some(95.0),
-            percentile_method: PercentileMethod::ExactEmpiricalCdf,
+            percentile_method: Some(PercentileMethod::ExactEmpiricalCdf),
             estimated: false,
             rarity_band: RarityBand::Unusual,
             population_size: 5_000,
-            tail_count: 250,
+            tail_count: Some(250),
             evaluation_mode: EvaluationMode::Retrospective,
+            baseline_quality: Some(BaselineQuality::High),
         },
     ];
     let fee_impact = ImpactCalculator::calculate_impact(EventType::ExtremeFee, &fee_rarities, None);
@@ -955,12 +963,13 @@ fn test_impact_model_coverage_thresholds() {
         metric,
         value: MetricValue::U64(1_000),
         percentile: Some(90.0),
-        percentile_method: PercentileMethod::ExactEmpiricalCdf,
+        percentile_method: Some(PercentileMethod::ExactEmpiricalCdf),
         estimated: false,
         rarity_band: RarityBand::Unusual,
         population_size: 10_000,
-        tail_count: 1_000,
+        tail_count: Some(1_000),
         evaluation_mode: EvaluationMode::Retrospective,
+        baseline_quality: Some(BaselineQuality::High),
     };
 
     // 100% coverage (4 of 4)
@@ -1142,5 +1151,536 @@ async fn test_observation_dedup_metric_table_invariant() {
         metrics_after.len(),
         defs.len(),
         "Metric rows must remain strictly deduplicated after replay"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 19. Section 8 & 7: MetricValue Persistence Audit and Scale Boundary Tests
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_metric_value_roundtrip_and_scale_constraint() {
+    // 1. Validate scale constraints on DecimalScaled
+    assert_eq!(MAX_SUPPORTED_DECIMAL_SCALE, 4);
+
+    let valid_scale_4 = MetricValue::decimal_scaled(12345, 4).expect("valid scale 4");
+    assert_eq!(valid_scale_4.scale(), 4);
+    assert_eq!(valid_scale_4.to_numeric_string(), "1.2345");
+
+    let invalid_scale_5 = MetricValue::decimal_scaled(12345, 5);
+    assert_eq!(
+        invalid_scale_5,
+        Err(MetricValueError::UnsupportedScale {
+            scale: 5,
+            max_supported: 4
+        })
+    );
+
+    let try_parsed =
+        MetricValue::try_from_str_scale_and_metric("12.34567", 5, BaselineMetric::FeeRateSatVb);
+    assert_eq!(
+        try_parsed,
+        Err(MetricValueError::UnsupportedScale {
+            scale: 5,
+            max_supported: 4
+        })
+    );
+
+    // 2. Test round-trip across all 4 MetricValue variants
+    let variants = vec![
+        MetricValue::U64(2_100_000_000_000_000),
+        MetricValue::U128(u128::MAX),
+        MetricValue::BasisPoints(2500),
+        MetricValue::DecimalScaled {
+            value: 7142,
+            scale: 4,
+        },
+    ];
+
+    for val in &variants {
+        let num_str = val.to_numeric_string();
+        let metric = match val {
+            MetricValue::U64(_) => BaselineMetric::ValueSats,
+            MetricValue::U128(_) => BaselineMetric::CoinAgeDestroyedSatoshiDays,
+            MetricValue::BasisPoints(_) => BaselineMetric::ConsolidationRatio,
+            MetricValue::DecimalScaled { scale, .. } => {
+                assert!(*scale <= 4);
+                BaselineMetric::FeeRateSatVb
+            }
+        };
+
+        let parsed = match val {
+            MetricValue::DecimalScaled { scale, .. } => {
+                MetricValue::try_from_str_scale_and_metric(&num_str, *scale, metric).unwrap()
+            }
+            _ => MetricValue::from_str_and_metric(&num_str, metric),
+        };
+        assert_eq!(
+            val, &parsed,
+            "In-memory string round-trip must match exactly"
+        );
+    }
+
+    // 3. PostgreSQL persistence roundtrip test (if PG available)
+    if let Some(pg) = get_test_postgres_storage().await {
+        let storage = Storage::from(pg);
+        let ev = create_large_transfer_event("tx_roundtrip_all", 100_000_000, 850_000, "mainnet");
+        storage.save_event(&ev).await.unwrap();
+
+        let metrics_to_save: Vec<EventMetricValue> = variants
+            .iter()
+            .enumerate()
+            .map(|(i, v)| EventMetricValue {
+                id: Uuid::new_v4(),
+                event_id: ev.id,
+                network: "mainnet".to_string(),
+                event_type: EventType::LargeTransfer,
+                metric: match v {
+                    MetricValue::U64(_) => BaselineMetric::ValueSats,
+                    MetricValue::U128(_) => BaselineMetric::CoinAgeDestroyedSatoshiDays,
+                    MetricValue::BasisPoints(_) => BaselineMetric::ConsolidationRatio,
+                    MetricValue::DecimalScaled { .. } => BaselineMetric::FeeRateSatVb,
+                },
+                metric_definition_version: format!("v1-test-{i}"),
+                value: *v,
+                metric_scale: v.scale(),
+                block_height: 850_000,
+                event_time: Utc::now(),
+                created_at: Utc::now(),
+            })
+            .collect();
+
+        storage.save_event_metrics(&metrics_to_save).await.unwrap();
+        let fetched = storage.get_event_metrics(ev.id).await.unwrap();
+        assert_eq!(fetched.len(), 4);
+
+        for original in &metrics_to_save {
+            let matching = fetched
+                .iter()
+                .find(|f| {
+                    f.metric == original.metric
+                        && f.metric_definition_version == original.metric_definition_version
+                })
+                .expect("Saved metric must be found in PG storage");
+            assert_eq!(
+                matching.value, original.value,
+                "PostgreSQL round-trip must be lossless"
+            );
+        }
+
+        // Verify rejection of scale 5 at persistence boundary
+        let invalid_metric = EventMetricValue {
+            id: Uuid::new_v4(),
+            event_id: ev.id,
+            network: "mainnet".to_string(),
+            event_type: EventType::LargeTransfer,
+            metric: BaselineMetric::FeeRateSatVb,
+            metric_definition_version: "v1-invalid-scale-5".to_string(),
+            value: MetricValue::DecimalScaled {
+                value: 12345,
+                scale: 5,
+            },
+            metric_scale: 5,
+            block_height: 850_000,
+            event_time: Utc::now(),
+            created_at: Utc::now(),
+        };
+        let save_err = storage.save_event_metrics(&[invalid_metric]).await;
+        assert!(save_err.is_err(), "Storage must reject scale > 4");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 20. Section 9: Insufficient-Data Invariant Tests (N = 0, 1, 37, 99 -> INSUFFICIENT_DATA; N = 100 -> Eligible)
+// ---------------------------------------------------------------------------
+#[test]
+fn test_insufficient_data_invariant_sample_sizes() {
+    let min_sample_size = 100u64;
+    let insufficient_sizes = [0u64, 1, 37, 99];
+
+    for &n in &insufficient_sizes {
+        let baseline_run =
+            BaselineEngine::create_run_record("mainnet", 840_000, 850_000, "obschain-baseline-v1");
+        let ev = create_large_transfer_event("tx_insufficient", 500_000_000, 845_000, "mainnet");
+
+        // 1. Test when exact population has size N
+        let mut exact_ranks = std::collections::HashMap::new();
+        if n > 0 {
+            exact_ranks.insert(BaselineMetric::ValueSats, (99.0, 1, n));
+        }
+
+        let dist = if n > 0 {
+            Some(BaselineDistribution {
+                id: Uuid::new_v4(),
+                baseline_run_id: baseline_run.id,
+                event_type: EventType::LargeTransfer,
+                metric: BaselineMetric::ValueSats,
+                unit: MetricUnit::Satoshis,
+                sample_count: n,
+                candidate_count: n,
+                missing_count: 0,
+                coverage_ratio: 1.0,
+                quality: BaselineQuality::Insufficient,
+                minimum: MetricValue::U64(10_000),
+                maximum: MetricValue::U64(1_000_000),
+                mean: 500_000.0,
+                p50: MetricValue::U64(500_000),
+                p75: MetricValue::U64(750_000),
+                p90: MetricValue::U64(900_000),
+                p95: MetricValue::U64(950_000),
+                p99: MetricValue::U64(990_000),
+                p999: MetricValue::U64(999_000),
+                samples_json: None,
+                created_at: Utc::now(),
+            })
+        } else {
+            None
+        };
+
+        let dists: Vec<BaselineDistribution> = dist.into_iter().collect();
+        let ctx = BaselineEngine::evaluate_event_rarity_with_exact_ranks(
+            &ev,
+            &baseline_run,
+            &dists,
+            &exact_ranks,
+            min_sample_size,
+        );
+
+        // Required invariant: sample_count < baseline_min_sample_size
+        // MUST produce rarity_band = INSUFFICIENT_DATA, percentile = None, impact_score = None
+        assert_eq!(
+            ctx.primary.rarity_band,
+            RarityBand::InsufficientData,
+            "N = {n} must yield INSUFFICIENT_DATA"
+        );
+        assert_eq!(
+            ctx.primary.percentile, None,
+            "N = {n} must have percentile = None"
+        );
+        assert_eq!(
+            ctx.primary.tail_count, None,
+            "N = {n} must have tail_count = None"
+        );
+        assert_eq!(
+            ctx.primary.percentile_method, None,
+            "N = {n} must have percentile_method = None"
+        );
+        assert!(
+            !ctx.primary.estimated,
+            "N = {n} must not be marked estimated"
+        );
+        assert_eq!(ctx.primary.population_size, n);
+        assert_eq!(
+            ctx.primary.baseline_quality,
+            Some(BaselineQuality::Insufficient)
+        );
+
+        let impact = ctx.impact.expect("Impact breakdown must be present");
+        assert_eq!(
+            impact.total_score, None,
+            "N = {n} must yield impact total_score = None"
+        );
+        assert_eq!(
+            impact.unavailable_reason,
+            Some(ImpactUnavailableReason::InsufficientBaseline),
+            "N = {n} must expose INSUFFICIENT_BASELINE"
+        );
+    }
+
+    // Now test N = 100: becomes eligible according to baseline quality rules
+    let n = 100u64;
+    let baseline_run =
+        BaselineEngine::create_run_record("mainnet", 840_000, 850_000, "obschain-baseline-v1");
+    let ev = create_large_transfer_event("tx_eligible_100", 500_000_000, 845_000, "mainnet");
+
+    let dist = BaselineDistribution {
+        id: Uuid::new_v4(),
+        baseline_run_id: baseline_run.id,
+        event_type: EventType::LargeTransfer,
+        metric: BaselineMetric::ValueSats,
+        unit: MetricUnit::Satoshis,
+        sample_count: n,
+        candidate_count: n,
+        missing_count: 0,
+        coverage_ratio: 0.90,
+        quality: BaselineQuality::Moderate,
+        minimum: MetricValue::U64(10_000),
+        maximum: MetricValue::U64(1_000_000_000),
+        mean: 50_000_000.0,
+        p50: MetricValue::U64(20_000_000),
+        p75: MetricValue::U64(50_000_000),
+        p90: MetricValue::U64(100_000_000),
+        p95: MetricValue::U64(250_000_000),
+        p99: MetricValue::U64(800_000_000),
+        p999: MetricValue::U64(950_000_000),
+        samples_json: None,
+        created_at: Utc::now(),
+    };
+
+    let mut exact_ranks = std::collections::HashMap::new();
+    exact_ranks.insert(BaselineMetric::ValueSats, (98.0, 2, n));
+
+    let ctx_100 = BaselineEngine::evaluate_event_rarity_with_exact_ranks(
+        &ev,
+        &baseline_run,
+        &[dist],
+        &exact_ranks,
+        min_sample_size,
+    );
+
+    assert_eq!(ctx_100.primary.rarity_band, RarityBand::Unusual);
+    assert_eq!(ctx_100.primary.percentile, Some(98.0));
+    assert_eq!(ctx_100.primary.tail_count, Some(2));
+    assert_eq!(
+        ctx_100.primary.percentile_method,
+        Some(PercentileMethod::ExactEmpiricalCdf)
+    );
+    assert_eq!(ctx_100.primary.population_size, 100);
+}
+
+// ---------------------------------------------------------------------------
+// 21. Section 10 & 5: Approximation Fallback Tests & Baseline Quality Guards
+// ---------------------------------------------------------------------------
+#[test]
+fn test_approximation_fallback_rules_and_quality_guards() {
+    let min_sample_size = 100u64;
+
+    let ev = create_large_transfer_event("tx_fallback_test", 850_000_000_000, 845_000, "mainnet");
+    let baseline_run =
+        BaselineEngine::create_run_record("mainnet", 840_000, 850_000, "obschain-baseline-v1");
+
+    let dist_10k = BaselineDistribution {
+        id: Uuid::new_v4(),
+        baseline_run_id: baseline_run.id,
+        event_type: EventType::LargeTransfer,
+        metric: BaselineMetric::ValueSats,
+        unit: MetricUnit::Satoshis,
+        sample_count: 10_000,
+        candidate_count: 10_000,
+        missing_count: 0,
+        coverage_ratio: 0.99,
+        quality: BaselineQuality::High,
+        minimum: MetricValue::U64(10_000_000),
+        maximum: MetricValue::U64(1_000_000_000_000),
+        mean: 50_000_000_000.0,
+        p50: MetricValue::U64(20_000_000_000),
+        p75: MetricValue::U64(50_000_000_000),
+        p90: MetricValue::U64(100_000_000_000),
+        p95: MetricValue::U64(250_000_000_000),
+        p99: MetricValue::U64(800_000_000_000),
+        p999: MetricValue::U64(950_000_000_000),
+        samples_json: None,
+        created_at: Utc::now(),
+    };
+
+    // Direct assertions on PercentileEvaluationDecision::decide rule matrix
+    let mut dist_dummy = dist_10k.clone();
+    dist_dummy.sample_count = 50;
+    dist_dummy.quality = BaselineQuality::Insufficient;
+    assert_eq!(
+        PercentileEvaluationDecision::decide(
+            Some((99.0, 1, 50)),
+            Some(&dist_dummy),
+            min_sample_size,
+        ),
+        PercentileEvaluationDecision::InsufficientData
+    );
+
+    dist_dummy.quality = BaselineQuality::High;
+    assert_eq!(
+        PercentileEvaluationDecision::decide(
+            Some((99.0, 1, 50)),
+            Some(&dist_dummy),
+            min_sample_size,
+        ),
+        PercentileEvaluationDecision::InsufficientData
+    );
+
+    assert_eq!(
+        PercentileEvaluationDecision::decide(
+            Some((99.0, 10, 10_000)),
+            Some(&dist_10k),
+            min_sample_size,
+        ),
+        PercentileEvaluationDecision::Exact
+    );
+
+    assert_eq!(
+        PercentileEvaluationDecision::decide(None, Some(&dist_10k), min_sample_size,),
+        PercentileEvaluationDecision::Estimated
+    );
+
+    let mut dist_deg = dist_10k.clone();
+    dist_deg.quality = BaselineQuality::Degraded;
+    assert_eq!(
+        PercentileEvaluationDecision::decide(
+            Some((99.0, 10, 10_000)),
+            Some(&dist_deg),
+            min_sample_size,
+        ),
+        PercentileEvaluationDecision::Estimated
+    );
+
+    // Case 1: N = 10,000, exact population available -> EXACT_EMPIRICAL_CDF
+    let mut exact_10k = std::collections::HashMap::new();
+    exact_10k.insert(BaselineMetric::ValueSats, (99.5, 50, 10_000));
+    let ctx_exact = BaselineEngine::evaluate_event_rarity_with_exact_ranks(
+        &ev,
+        &baseline_run,
+        std::slice::from_ref(&dist_10k),
+        &exact_10k,
+        min_sample_size,
+    );
+    assert_eq!(
+        ctx_exact.primary.percentile_method,
+        Some(PercentileMethod::ExactEmpiricalCdf)
+    );
+    assert!(!ctx_exact.primary.estimated);
+    assert_eq!(ctx_exact.primary.percentile, Some(99.5));
+
+    // Case 2: N = 10,000, exact lookup intentionally unavailable, compatible distribution available
+    // -> QUANTILE_INTERPOLATION_ESTIMATE
+    let empty_exact = std::collections::HashMap::new();
+    let ctx_est = BaselineEngine::evaluate_event_rarity_with_exact_ranks(
+        &ev,
+        &baseline_run,
+        std::slice::from_ref(&dist_10k),
+        &empty_exact,
+        min_sample_size,
+    );
+    assert_eq!(
+        ctx_est.primary.percentile_method,
+        Some(PercentileMethod::QuantileInterpolationEstimate)
+    );
+    assert!(ctx_est.primary.estimated);
+    assert!(ctx_est.primary.percentile.is_some());
+
+    // Case 3 (Mandatory): N = 50, exact lookup unavailable, distribution exists -> INSUFFICIENT_DATA
+    let mut dist_50 = dist_10k.clone();
+    dist_50.sample_count = 50;
+    dist_50.candidate_count = 50;
+    dist_50.quality = BaselineQuality::Degraded;
+    let ctx_50 = BaselineEngine::evaluate_event_rarity_with_exact_ranks(
+        &ev,
+        &baseline_run,
+        &[dist_50],
+        &empty_exact,
+        min_sample_size,
+    );
+    assert_eq!(ctx_50.primary.rarity_band, RarityBand::InsufficientData);
+    assert_eq!(ctx_50.primary.percentile, None);
+    assert_eq!(ctx_50.primary.tail_count, None);
+    assert_eq!(ctx_50.primary.percentile_method, None);
+
+    // Case 4: Baseline quality DEGRADED (sample_count >= 100) -> permits estimate with estimated = true and quality = DEGRADED
+    let mut dist_degraded = dist_10k.clone();
+    dist_degraded.quality = BaselineQuality::Degraded;
+    let ctx_degraded = BaselineEngine::evaluate_event_rarity_with_exact_ranks(
+        &ev,
+        &baseline_run,
+        &[dist_degraded],
+        &exact_10k,
+        min_sample_size,
+    );
+    assert!(
+        ctx_degraded.primary.estimated,
+        "DEGRADED quality baseline must be stamped estimated = true"
+    );
+    assert_eq!(
+        ctx_degraded.primary.baseline_quality,
+        Some(BaselineQuality::Degraded)
+    );
+    assert_eq!(
+        ctx_degraded.primary.percentile_method,
+        Some(PercentileMethod::QuantileInterpolationEstimate)
+    );
+
+    // Case 5: Baseline quality INSUFFICIENT -> strictly INSUFFICIENT_DATA
+    let mut dist_insufficient = dist_10k.clone();
+    dist_insufficient.quality = BaselineQuality::Insufficient;
+    let ctx_insufficient = BaselineEngine::evaluate_event_rarity_with_exact_ranks(
+        &ev,
+        &baseline_run,
+        &[dist_insufficient],
+        &exact_10k,
+        min_sample_size,
+    );
+    assert_eq!(
+        ctx_insufficient.primary.rarity_band,
+        RarityBand::InsufficientData
+    );
+    assert_eq!(ctx_insufficient.primary.percentile, None);
+}
+
+// ---------------------------------------------------------------------------
+// 22. Section 15: Frontend Contract Frozen Fixture Validation Test
+// ---------------------------------------------------------------------------
+#[test]
+fn test_rarity_contract_frozen_fixture() {
+    let fixture_str = include_str!("fixtures/rarity_contract.json");
+    let fixture: serde_json::Value = serde_json::from_str(fixture_str).expect("Valid JSON fixture");
+
+    let contracts = &fixture["contracts"];
+    assert!(contracts.is_object());
+
+    // 1. Exact Rarity Contract
+    let exact = &contracts["exact_rarity"];
+    assert_eq!(exact["metric"], "value_sats");
+    assert_eq!(exact["value"], "10000000000");
+    assert_eq!(exact["percentile"], 99.94);
+    assert_eq!(exact["percentile_method"], "EXACT_EMPIRICAL_CDF");
+    assert_eq!(exact["estimated"], false);
+    assert_eq!(exact["rarity_band"], "EXTREME");
+    assert_eq!(exact["population_size"], 18421);
+    assert_eq!(exact["tail_count"], 11);
+    assert_eq!(exact["baseline_quality"], "HIGH");
+
+    // 2. Estimated Rarity Contract
+    let estimated = &contracts["estimated_rarity"];
+    assert_eq!(
+        estimated["percentile_method"],
+        "QUANTILE_INTERPOLATION_ESTIMATE"
+    );
+    assert_eq!(estimated["estimated"], true);
+    assert_eq!(estimated["population_size"], 18421);
+    assert_eq!(estimated["tail_count"], 11);
+    assert_eq!(estimated["baseline_quality"], "HIGH");
+
+    // 3. Insufficient Data Contract
+    let insufficient = &contracts["insufficient_data"];
+    assert!(insufficient["percentile"].is_null());
+    assert!(insufficient["percentile_method"].is_null());
+    assert_eq!(insufficient["estimated"], false);
+    assert_eq!(insufficient["rarity_band"], "INSUFFICIENT_DATA");
+    assert_eq!(insufficient["population_size"], 37);
+    assert!(insufficient["tail_count"].is_null());
+    assert_eq!(insufficient["baseline_quality"], "INSUFFICIENT");
+
+    // 4. Full Impact Score Contract
+    let full_impact: ImpactBreakdown = serde_json::from_value(contracts["full_impact"].clone())
+        .expect("Deserializes into ImpactBreakdown");
+    assert_eq!(full_impact.status, "EXPERIMENTAL");
+    assert_eq!(full_impact.model_id, "obschain-impact-large-transfer-v1");
+    assert_eq!(full_impact.total_score, Some(85.0));
+    assert_eq!(full_impact.model_coverage, 1.0);
+    assert_eq!(full_impact.unavailable_reason, None);
+    assert_eq!(full_impact.components.len(), 4);
+
+    // 5. Partial Coverage Impact Score Contract
+    let partial_impact: ImpactBreakdown =
+        serde_json::from_value(contracts["partial_coverage_impact"].clone())
+            .expect("Deserializes into ImpactBreakdown");
+    assert_eq!(partial_impact.total_score, Some(42.5));
+    assert_eq!(partial_impact.model_coverage, 0.50);
+    assert_eq!(partial_impact.unavailable_reason, None);
+    assert_eq!(partial_impact.components.len(), 2);
+
+    // 6. Unavailable Impact Score Contract
+    let unavail_impact: ImpactBreakdown =
+        serde_json::from_value(contracts["unavailable_impact"].clone())
+            .expect("Deserializes into ImpactBreakdown");
+    assert_eq!(unavail_impact.total_score, None);
+    assert_eq!(
+        unavail_impact.unavailable_reason,
+        Some(ImpactUnavailableReason::InsufficientBaseline)
     );
 }

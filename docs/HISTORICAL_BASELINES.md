@@ -519,3 +519,142 @@ Composite Impact (EXPERIMENTAL):
 1. **Active-Chain Only**: Replay baselines reflect verified, confirmed blocks on the active chain. Unconfirmed mempool dynamics (e.g. historical mempool depth) are not represented.
 2. **Era Non-Stationarity**: Bitcoin fee markets and transaction volume changed dramatically between 2011 and 2026. A 500 BTC transfer in Epoch 0 (2010) represents a different network context than in Epoch 4 (2024). Baselines disclose their height range and epoch boundaries to avoid naive cross-era conflation.
 3. **UTXO Incompleteness**: If a node operator runs in pruned mode without `txindex` or historical UTXO snapshots, historical coin-age metrics will have degraded coverage. ObsChain explicitly reports this coverage percentage.
+
+---
+
+## 15. Statistical Guardrails & Fallback Decision Model (Phase 6B.2)
+
+### 15.1 Fallback Decision Model (`PercentileEvaluationDecision`)
+The statistical evaluation rules are centralized in `PercentileEvaluationDecision::decide`:
+```rust
+pub enum PercentileEvaluationDecision {
+    Exact,
+    Estimated,
+    InsufficientData,
+}
+```
+
+1. **Exact Empirical CDF (`Exact`)**:
+   - Allowed only when an exact empirical rank query succeeds, the population $N \ge \text{min\_sample\_size}$ (default 100), and baseline quality is not `INSUFFICIENT` or `DEGRADED`.
+2. **Quantile Interpolation Estimate (`Estimated`)**:
+   - Allowed only when exact empirical population is intentionally unavailable, but a compatible distribution exists with `sample_count` $N \ge \text{min\_sample\_size}$, and baseline quality is not `INSUFFICIENT`.
+   - When baseline quality is `DEGRADED` (and $N \ge \text{min\_sample\_size}$), estimation is permitted, stamped with `quality = "DEGRADED"` and `estimated = true`.
+3. **Insufficient Data (`InsufficientData`)**:
+   - Triggered unconditionally when $N < \text{min\_sample\_size}$ or baseline quality is `INSUFFICIENT`.
+   - Produces `rarity_band = "INSUFFICIENT_DATA"`, `percentile = null`, `percentile_method = null`, `tail_count = null`, `impact_score = null`, and `unavailable_reason = "INSUFFICIENT_BASELINE"`.
+
+### 15.2 Strict Error Handling (No Silent Fallback)
+If exact empirical rank lookup fails due to a database timeout, query error, or connection failure, ObsChain **does not silently degrade** to quantile estimation. Instead, the storage error is propagated immediately (HTTP 503 Service Unavailable), isolating database outages from statistical estimation.
+
+### 15.3 DecimalScaled Domain Constraint (`MAX_SUPPORTED_DECIMAL_SCALE = 4`)
+To maintain complete numeric fidelity with PostgreSQL's `NUMERIC(50,4)` metric columns, `MetricValue::DecimalScaled` strictly limits scales to $\le 4$:
+- Scales $\le 4$ roundtrip losslessly between Rust and PostgreSQL.
+- Scales $> 4$ are rejected at the domain and storage boundaries with `MetricValueError::UnsupportedScale { scale, max_supported: 4 }`.
+
+---
+
+## 16. Frozen Rarity & Impact Response Contract for `obschain-web`
+
+The REST endpoints `GET /api/v1/events/:id/rarity` and `GET /api/v1/events/:id` adhere to a frozen JSON contract verified against `tests/fixtures/rarity_contract.json`.
+
+### 16.1 Metric Rarity Object Contract
+
+#### Standard Exact Evaluation
+```json
+{
+  "metric": "VALUE_SATS",
+  "value": "85000000000",
+  "percentile": 99.94,
+  "percentile_method": "EXACT_EMPIRICAL_CDF",
+  "estimated": false,
+  "rarity_band": "EXTREME",
+  "population_size": 18421,
+  "tail_count": 11,
+  "baseline_quality": "HIGH"
+}
+```
+
+#### Degraded Baseline Evaluation (Warning Stamped)
+```json
+{
+  "metric": "VALUE_SATS",
+  "value": "85000000000",
+  "percentile": 99.85,
+  "percentile_method": "QUANTILE_INTERPOLATION_ESTIMATE",
+  "estimated": true,
+  "rarity_band": "EXTREME",
+  "population_size": 10000,
+  "tail_count": null,
+  "baseline_quality": "DEGRADED"
+}
+```
+
+#### Insufficient Data Contract (Explicit Nulls)
+```json
+{
+  "metric": "VALUE_SATS",
+  "value": "500000000",
+  "percentile": null,
+  "percentile_method": null,
+  "estimated": false,
+  "rarity_band": "INSUFFICIENT_DATA",
+  "population_size": 37,
+  "tail_count": null,
+  "baseline_quality": "INSUFFICIENT"
+}
+```
+
+### 16.2 Impact Scoring Contract
+Every impact object exposes:
+```json
+{
+  "status": "EVALUATED",
+  "model_id": "impact-large-transfer-v1",
+  "event_type": "LARGE_TRANSFER",
+  "score": 87.5,
+  "model_coverage": 1.0,
+  "components": [],
+  "unavailable_reason": null
+}
+```
+
+When impact cannot be calculated, `score = null` and a machine-readable `unavailable_reason` is supplied:
+- `INSUFFICIENT_BASELINE`: Baseline sample count $< 100$ or baseline quality `INSUFFICIENT`.
+- `INSUFFICIENT_COMPONENT_COVERAGE`: Less than 50% of the model's component weights could be evaluated.
+- `RARITY_UNAVAILABLE`: Primary metric rarity could not be evaluated.
+
+```json
+{
+  "status": "INSUFFICIENT_DATA",
+  "model_id": "impact-large-transfer-v1",
+  "event_type": "LARGE_TRANSFER",
+  "score": null,
+  "model_coverage": 0.0,
+  "components": [],
+  "unavailable_reason": "INSUFFICIENT_BASELINE"
+}
+```
+
+### 16.3 Baseline Identity Metadata
+Every rarity response includes full provenance for calculation explainability:
+```json
+{
+  "baseline_id": "018f4a32-7c5b-7b00-8432-123456789abc",
+  "algorithm_version": "obschain-baseline-v1",
+  "metric_definition_version": "canonical-metrics-v1",
+  "network": "mainnet",
+  "start_height": 840000,
+  "end_height": 850000,
+  "sample_count": 18421,
+  "population_size": 18421,
+  "quality": "HIGH",
+  "evaluation_mode": "CANONICAL_EVENTS"
+}
+```
+
+### 16.4 Event-Type Comparability Warning
+> [!WARNING]
+> **Impact scores are event-type-specific anomaly indexes.**
+> An impact score of `90` on a `DormantCoinsMoved` event is calibrated against dormant transaction distributions and is **not** directly comparable to an impact score of `85` on a `LongBlockInterval` event.
+> Frontend consumers must always display the associated `model_id` and should never rank events of heterogeneous types by raw impact score without qualifying context.
+

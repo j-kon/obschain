@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ObsChain Rarity and Impact Contract Fixture",
+  "version": "1.0.0",
+  "description": "Frozen contract response fixtures for obschain-web consumption covering all 6 rarity and impact states.",
+  "contracts": {
+    "exact_rarity": {
+      "metric": "value_sats",
+      "value": "10000000000",
+      "value_display": "100.00000000 BTC",
+      "percentile": 99.94,
+      "percentile_method": "EXACT_EMPIRICAL_CDF",
+      "estimated": false,
+      "rarity_band": "EXTREME",
+      "band": "EXTREME",
+      "rarity": "EXTREME",
+      "population_size": 18421,
+      "tail_count": 11,
+      "baseline_quality": "HIGH",
+      "frequency": "11 comparable-or-rarer events across 18421 qualifying events (approx. 1 in 1674)",
+      "is_primary": true
+    },
+    "estimated_rarity": {
+      "metric": "value_sats",
+      "value": "10000000000",
+      "value_display": "100.00000000 BTC",
+      "percentile": 99.94,
+      "percentile_method": "QUANTILE_INTERPOLATION_ESTIMATE",
+      "estimated": true,
+      "rarity_band": "EXTREME",
+      "band": "EXTREME",
+      "rarity": "EXTREME",
+      "population_size": 18421,
+      "tail_count": 11,
+      "baseline_quality": "HIGH",
+      "frequency": "11 comparable-or-rarer events across 18421 qualifying events (approx. 1 in 1674)",
+      "is_primary": true
+    },
+    "insufficient_data": {
+      "metric": "value_sats",
+      "value": "10000000000",
+      "value_display": "100.00000000 BTC",
+      "percentile": null,
+      "percentile_method": null,
+      "estimated": false,
+      "rarity_band": "INSUFFICIENT_DATA",
+      "band": "INSUFFICIENT_DATA",
+      "rarity": "INSUFFICIENT_DATA",
+      "population_size": 37,
+      "tail_count": null,
+      "baseline_quality": "INSUFFICIENT",
+      "frequency": "Insufficient sample size (37 events observed, minimum required is 100)",
+      "is_primary": true
+    },
+    "full_impact": {
+      "status": "EXPERIMENTAL",
+      "model_id": "obschain-impact-large-transfer-v1",
+      "model_version": "v1",
+      "event_type": "LARGE_TRANSFER",
+      "score": 85.0,
+      "max_possible_points": 100.0,
+      "model_coverage": 1.0,
+      "coverage_ratio": 1.0,
+      "unavailable_reason": null,
+      "components": [
+        {
+          "component_name": "Value rarity",
+          "metric": "value_sats",
+          "raw_value": "10000000000",
+          "percentile": 99.94,
+          "weight": 60.0,
+          "points_awarded": 59.93,
+          "population_size": 18421
+        },
+        {
+          "component_name": "Input count structure",
+          "metric": "input_count",
+          "raw_value": "5",
+          "percentile": 80.0,
+          "weight": 15.0,
+          "points_awarded": 9.0,
+          "population_size": 18421
+        },
+        {
+          "component_name": "Output count structure",
+          "metric": "output_count",
+          "raw_value": "2",
+          "percentile": 75.0,
+          "weight": 15.0,
+          "points_awarded": 7.5,
+          "population_size": 18421
+        },
+        {
+          "component_name": "Transaction size anomaly",
+          "metric": "vsize",
+          "raw_value": "350",
+          "percentile": 92.0,
+          "weight": 10.0,
+          "points_awarded": 8.4,
+          "population_size": 18421
+        }
+      ]
+    },
+    "partial_coverage_impact": {
+      "status": "EXPERIMENTAL",
+      "model_id": "obschain-impact-large-transfer-v1",
+      "model_version": "v1",
+      "event_type": "LARGE_TRANSFER",
+      "score": 42.5,
+      "max_possible_points": 100.0,
+      "model_coverage": 0.5,
+      "coverage_ratio": 0.5,
+      "unavailable_reason": null,
+      "components": [
+        {
+          "component_name": "Value rarity",
+          "metric": "value_sats",
+          "raw_value": "5000000000",
+          "percentile": 90.0,
+          "weight": 60.0,
+          "points_awarded": 48.0,
+          "population_size": 18421
+        },
+        {
+          "component_name": "Input count structure",
+          "metric": "input_count",
+          "raw_value": "1",
+          "percentile": 50.0,
+          "weight": 15.0,
+          "points_awarded": 0.0,
+          "population_size": 18421
+        }
+      ]
+    },
+    "unavailable_impact": {
+      "status": "EXPERIMENTAL",
+      "model_id": "obschain-impact-large-transfer-v1",
+      "model_version": "v1",
+      "event_type": "LARGE_TRANSFER",
+      "score": null,
+      "max_possible_points": 100.0,
+      "model_coverage": 0.25,
+      "coverage_ratio": 0.25,
+      "unavailable_reason": "INSUFFICIENT_BASELINE",
+      "components": [
+        {
+          "component_name": "Value rarity",
+          "metric": "value_sats",
+          "raw_value": "10000000000",
+          "percentile": null,
+          "weight": 60.0,
+          "points_awarded": 0.0,
+          "population_size": 37
+        }
+      ]
+    }
+  }
+}
